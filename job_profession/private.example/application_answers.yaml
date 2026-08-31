@@ -1,0 +1,11 @@
+schema_version: 1
+profile_kind: application_answer_library
+
+answers:
+  concise_introduction:
+    status: approved
+    autofill_allowed: true
+    text: "I am a mid-level implementation-focused backend developer with experience in APIs, databases, testing, and feature delivery."
+
+# Keep location, authorization, sponsorship, compensation, availability, EEO,
+# and screening answers as needs_confirmation. Never guess them.

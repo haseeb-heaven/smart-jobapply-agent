@@ -1,0 +1,7 @@
+# Private candidate facts, contact details, compensation, and reusable answers.
+private/
+
+# Local runtime state and generated review artifacts.
+data/*.sqlite3
+data/logs/
+output/*.xlsx

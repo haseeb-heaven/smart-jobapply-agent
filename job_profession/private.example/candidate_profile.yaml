@@ -1,0 +1,27 @@
+schema_version: 1
+profile_kind: candidate_profile
+
+# Replace this example with your local, ignored private/candidate_profile.yaml.
+positioning:
+  headline: "Mid-Level Backend Developer"
+  level: mid
+  focus:
+    - Python and FastAPI APIs
+    - database work and testing
+    - maintenance, scoped features, background jobs, and integrations
+
+roles:
+  include: [Backend Developer, Python Developer, FastAPI Developer]
+  exclude_title_terms: [senior, staff, principal, lead, architect, manager]
+
+hard_exclusions:
+  mandatory_requirements:
+    - production GenAI ownership
+    - advanced system-design ownership
+
+skills:
+  professional:
+    backend: [Python, FastAPI, REST APIs, databases, testing]
+  personal_open_source:
+    ai: [LLM, RAG, agents]
+  learning_or_exposure: [Docker, AWS]

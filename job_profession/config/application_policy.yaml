@@ -1,0 +1,30 @@
+schema_version: 1
+application_policy:
+  purpose: "Local, review-only preparation. It is not a browser or form automation tool."
+  allowed_automation:
+    - compose_truthful_job_specific_drafts
+    - prepare_local_field_suggestions
+    - record_missing_answer_prompts
+    - track_human_review_state
+  prohibited_automation:
+    - browse_or_navigate_to_application_sites
+    - depend_on_or_inspect_a_browser_session
+    - inspect_browser_credentials
+    - upload_a_resume_or_attachment
+    - type_personal_data_or_field_values
+    - click_apply
+    - click_submit
+    - accept_attestations
+    - answer_unspecified_screening_questions
+    - complete_captcha
+    - answer_eeo_or_sensitive_demographic_questions
+  human_review_required_for:
+    - company_name
+    - job_title
+    - every_claim
+    - current_location
+    - work_authorization
+    - sponsorship
+    - salary_or_compensation
+    - notice_period_or_availability
+    - all_screening_and_eeo_questions

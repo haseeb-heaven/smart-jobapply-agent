@@ -1,0 +1,17 @@
+schema_version: 1
+# Search URL definitions only.  These are never credentials, cookies, or browser
+# automation instructions.  Results must be supplied by a visible-page adapter.
+minimum_profile_fit_score: 85
+profiles:
+  - platform: linkedin
+    keywords: "Python Backend Developer"
+  - platform: linkedin
+    keywords: "FastAPI Developer"
+  - platform: linkedin
+    keywords: "API Integration Developer"
+  - platform: indeed
+    keywords: "Python Backend Developer"
+  - platform: indeed
+    keywords: "FastAPI Developer"
+  - platform: indeed
+    keywords: "API Integration Developer"

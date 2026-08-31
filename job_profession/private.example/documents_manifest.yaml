@@ -1,0 +1,11 @@
+schema_version: 1
+profile_kind: documents_manifest
+
+documents:
+  - id: backend_resume
+    path: /path/to/resume.pdf
+    type: resume
+    status: needs_review_per_application
+    eligible_for: [Backend Developer, Python Developer, FastAPI Developer]
+
+# Do not attach a document automatically. The candidate chooses and reviews it.

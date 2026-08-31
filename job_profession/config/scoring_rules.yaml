@@ -1,0 +1,39 @@
+# Deterministic profile-fit rules. A score is never a probability of being hired.
+score_interpretation: "Profile fit only; does not predict hiring odds."
+weights:
+  title_level_fit: 30
+  verified_professional_skill_fit: 30
+  responsibility_fit: 20
+  location_and_work_mode_fit: 10
+  salary_and_recency_fit: 5
+  evidence_quality: 5
+thresholds:
+  recommended: 85
+  review: 70
+  reject: 0
+hard_reject_title_terms:
+  - senior
+  - staff
+  - principal
+  - lead
+  - architect
+  - manager
+  - head
+  - director
+hard_reject_terms:
+  - system architecture ownership
+  - technical strategy ownership
+  - people management
+  - production GenAI ownership required
+full_stack_terms:
+  - full stack
+  - full-stack
+backend_responsibilities:
+  - maintain APIs
+  - extend APIs
+  - FastAPI
+  - Python
+  - database work
+  - background jobs
+  - unit testing
+  - integrations
