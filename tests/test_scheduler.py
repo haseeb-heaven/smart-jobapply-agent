@@ -4,6 +4,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -27,6 +28,29 @@ from job_profession.sources import MappingVisiblePageAdapter, SearchProfile, bui
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
+CRON_WRAPPER = PROJECT_ROOT / "job_profession" / "scripts" / "cron_wrapper.sh"
+
+
+def _command_path(tmp_path: Path, *, include_python3: bool = False) -> Path:
+    """Create a PATH containing only the commands needed by cron_wrapper.sh."""
+
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir(parents=True)
+    commands = ("bash", "dirname", "mkdir", "readlink")
+    for command in commands:
+        resolved = shutil.which(command)
+        if resolved is None:
+            pytest.skip(f"{command} is required for the cron wrapper subprocess test")
+        try:
+            (command_dir / command).symlink_to(resolved)
+        except OSError as exc:
+            pytest.skip(f"symlink setup is unavailable: {exc}")
+    if include_python3:
+        try:
+            (command_dir / "python3").symlink_to(sys.executable)
+        except OSError as exc:
+            pytest.skip(f"symlink setup is unavailable: {exc}")
+    return command_dir
 
 
 def profile() -> CandidateProfile:
@@ -847,6 +871,124 @@ def test_cron_wrapper_runs_despite_abandoned_legacy_directory_lock(tmp_path: Pat
     first_output_line = next(line for line in completed.stdout.splitlines() if line.startswith("{"))
     assert json.loads(first_output_line)["application_actions"] == 0
     assert "application_actions=0" in completed.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="cron_wrapper.sh requires a POSIX shell and symlinks")
+def test_cron_wrapper_resolves_symlink_before_locating_project_files(tmp_path: Path):
+    """Launching through a relative symlink must still run the repository script."""
+
+    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+
+    output_dir = tmp_path / "scheduled-output"
+    intake_path = tmp_path / "synthetic-intake.json"
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": {"candidate_confirmed": True},
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    intake_path.write_text(json.dumps(activate_candidate_profile(draft, actor="user")), encoding="utf-8")
+
+    link_path = tmp_path / "launcher dir" / "cron-wrapper.sh"
+    link_path.parent.mkdir()
+    link_path.symlink_to(os.path.relpath(CRON_WRAPPER, link_path.parent))
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    environment = {
+        "PATH": str(_command_path(tmp_path / "tools")),
+        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
+        "JOB_PROFESSION_PYTHON": sys.executable,
+        "JOB_PROFESSION_CANDIDATE_INTAKE": str(intake_path),
+    }
+
+    completed = subprocess.run(
+        [str(link_path)],
+        cwd=caller_dir,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (output_dir / "discovery_runs.jsonl").exists()
+    assert (output_dir / "Current_Profile_Recommended_Queue.csv").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="cron_wrapper.sh requires a POSIX shell")
+def test_cron_wrapper_rejects_unavailable_python_interpreter_without_running_discovery(tmp_path: Path):
+    output_dir = tmp_path / "scheduled-output"
+    missing_python = tmp_path / "missing-python"
+    environment = {
+        "PATH": str(_command_path(tmp_path / "tools")),
+        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
+        "JOB_PROFESSION_PYTHON": str(missing_python),
+        "JOB_PROFESSION_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
+    }
+
+    completed = subprocess.run(
+        [str(CRON_WRAPPER)],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 127
+    assert completed.stdout == ""
+    assert completed.stderr == (
+        "Discovery did not run: no executable Python interpreter found; "
+        "set JOB_PROFESSION_PYTHON to Python >= 3.11\n"
+    )
+    assert not (output_dir / "discovery_runs.jsonl").exists()
+    assert not (output_dir / "Current_Profile_Recommended_Queue.csv").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="cron_wrapper.sh requires a POSIX shell")
+def test_cron_wrapper_rejects_unsupported_python_interpreter_without_running_discovery(tmp_path: Path):
+    output_dir = tmp_path / "scheduled-output"
+    unsupported_python = tmp_path / "unsupported-python"
+    unsupported_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "  printf '3.10\\n'\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    unsupported_python.chmod(0o700)
+    environment = {
+        "PATH": str(_command_path(tmp_path / "tools")),
+        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
+        "JOB_PROFESSION_PYTHON": str(unsupported_python),
+        "JOB_PROFESSION_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
+    }
+
+    completed = subprocess.run(
+        [str(CRON_WRAPPER)],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == (
+        f"Discovery did not run: Python >= 3.11 is required; found Python 3.10 at {unsupported_python}\n"
+    )
+    assert not (output_dir / "discovery_runs.jsonl").exists()
+    assert not (output_dir / "Current_Profile_Recommended_Queue.csv").exists()
 
 
 def test_generated_launchd_bootstrap_has_no_legacy_directory_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
