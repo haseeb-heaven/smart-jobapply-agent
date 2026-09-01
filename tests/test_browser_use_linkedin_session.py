@@ -15,6 +15,7 @@ _SPEC.loader.exec_module(_MODULE)
 select_linkedin_profile = _MODULE.select_linkedin_profile
 BrowserUseCredentials = _MODULE.BrowserUseCredentials
 start_read_only_discovery = _MODULE.start_read_only_discovery
+BrowserUseAPIError = _MODULE.BrowserUseAPIError
 
 
 def test_selects_only_profile_with_linkedin_cookie_domain():
@@ -31,6 +32,31 @@ def test_does_not_select_profile_without_linkedin_domain():
 
 def test_does_not_select_lookalike_linkedin_cookie_domain():
     assert select_linkedin_profile({"items": [{"id": "evil", "cookieDomains": ["evil-linkedin.com"]}]}) is None
+
+
+def test_profile_lookup_failure_keeps_http_status_machine_readable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(_MODULE, "_request", lambda *args, **kwargs: (402, None))
+
+    with pytest.raises(BrowserUseAPIError) as raised:
+        start_read_only_discovery(
+            BrowserUseCredentials("https://api.browser-use.com/api/v3", "bu_allowed-key_123"),
+            maximum_cost_usd=0.10,
+        )
+
+    assert raised.value.http_status == 402
+
+
+def test_session_creation_failure_keeps_http_status_machine_readable(monkeypatch: pytest.MonkeyPatch):
+    responses = iter(((200, {"items": [{"id": "linkedin-profile", "cookieDomains": ["linkedin.com"]}]}), (402, None)))
+    monkeypatch.setattr(_MODULE, "_request", lambda *args, **kwargs: next(responses))
+
+    with pytest.raises(BrowserUseAPIError) as raised:
+        start_read_only_discovery(
+            BrowserUseCredentials("https://api.browser-use.com/api/v3", "bu_allowed-key_123"),
+            maximum_cost_usd=0.10,
+        )
+
+    assert raised.value.http_status == 402
 
 
 @pytest.mark.parametrize("maximum_cost_usd", (0.0, -1.0, math.inf, -math.inf, math.nan))

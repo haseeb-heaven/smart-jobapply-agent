@@ -24,6 +24,18 @@ The loader extracts only values from the `Browser Use:` section, keeps the selec
 
 Therefore, the current reliable live path is connected Chrome. Browser Use becomes a fallback after the account with the LinkedIn profile has credit, or after the other account is funded and a user signs into LinkedIn once in its dedicated persistent profile.
 
+## Fast Easy Apply mode
+
+For a live Easy Apply form, use the connected Chrome tab and batch DOM actions:
+
+1. Confirm the exact employer, platform, and fields that will be transmitted.
+2. Take one structured page snapshot per step; fill compatible fields in one batch.
+3. Upload the selected resume once and verify its filename.
+4. Advance only through clearly labelled Next/Review controls.
+5. Stop at the final review page; the candidate clicks Submit manually.
+
+This is faster and more deterministic than a screenshot-driven cloud agent because Playwright-style locators auto-wait for the target and retry the action. Browser Use remains useful for bounded discovery, but its natural-language cloud task is not the activation authority for a live submission.
+
 ## Read-only Browser Use smoke test
 
 After credit is available, run the bounded discovery test:
@@ -57,6 +69,9 @@ It selects only a Browser Use profile whose metadata reports a LinkedIn cookie d
 - The Browser Use credential loader now has a bounded credential-file read timeout
   (`--file-read-timeout`, default 10 seconds). A cloud-backed credential file that
   stalls produces a redacted `TimeoutError` result instead of hanging the workflow.
+- Browser Use session-creation failures now expose only the HTTP status in the
+  redacted CLI result. A 402 therefore points directly to missing credit/billing,
+  while no key, profile ID, URL, or transcript is printed.
 - `pytest tests -q` passed after this reliability change. These checks are local
   or read-only; they did not create an application, upload a resume, or transmit
   candidate data.

@@ -47,6 +47,14 @@ class ReadOnlySession:
     maximum_cost_usd: float
 
 
+class BrowserUseAPIError(RuntimeError):
+    """A redacted, machine-readable Browser Use API failure."""
+
+    def __init__(self, message: str, *, http_status: int) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
 def _request(credentials: BrowserUseCredentials, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, object]:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = Request(
@@ -92,6 +100,8 @@ def start_read_only_discovery(credentials: BrowserUseCredentials, *, maximum_cos
     if not math.isfinite(maximum_cost_usd) or maximum_cost_usd <= 0:
         raise ValueError("maximum_cost_usd must be finite positive")
     status, profiles = _request(credentials, "GET", "/profiles?page_size=100")
+    if status != 200:
+        raise BrowserUseAPIError("Browser Use profile lookup failed", http_status=status)
     profile_id = select_linkedin_profile(profiles) if status == 200 else None
     if profile_id is None:
         raise RuntimeError("No persistent Browser Use profile with LinkedIn login state is available")
@@ -108,7 +118,7 @@ def start_read_only_discovery(credentials: BrowserUseCredentials, *, maximum_cos
         },
     )
     if status not in {200, 201} or not isinstance(response, dict):
-        raise RuntimeError(f"Browser Use did not create a read-only session (HTTP {status})")
+        raise BrowserUseAPIError("Browser Use session creation failed", http_status=status)
     session_id = response.get("id")
     session_status = response.get("status")
     if not isinstance(session_id, str) or not isinstance(session_status, str):
@@ -158,6 +168,9 @@ def main() -> int:
             return 0
         print(json.dumps(session_status(credentials, args.session_id), sort_keys=True))
         return 0
+    except BrowserUseAPIError as error:
+        print(json.dumps({"ok": False, "error": type(error).__name__, "http_status": error.http_status}, sort_keys=True))
+        return 1
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "error": type(error).__name__}, sort_keys=True))
         return 1
