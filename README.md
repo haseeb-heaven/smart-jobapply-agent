@@ -21,7 +21,7 @@ stop here, load `AGENTS.md`, and then resume its ordered read set. Do not invent
 missing candidate facts, weaken a hard rejection, or execute commands before
 the bootstrap and repository-state checks are complete.
 
-## SYSTEM CONTRACT
+## AGENT-ASSISTED SMART JOB APPLY
 
 Produce an auditable, evidence-grounded review queue from candidate-approved
 facts and already-visible LinkedIn/Indeed listing payloads. Use the deterministic
@@ -53,6 +53,23 @@ Compared to nearby alternatives:
 - `vaibhavarora14/job-application-agent` and `mattohan567/job-application-agent`
   include broader application lifecycle surfaces; this repo keeps that surface
   minimal and candidate-led.
+
+### Top-three reference comparison
+
+The table below compares this project with the three highest-ranked references
+from the project brief. GitHub star counts change over time and are popularity
+signals, not safety or correctness scores.
+
+| Project | Primary surface | Application boundary | Tracking model | What is unique here by comparison |
+| --- | --- | --- | --- | --- |
+| **Smart JobApply Agent** | Bring your own agent, browser, and tools | The agent never fills or submits; the candidate applies manually | Exactly five reserved listing tabs, append-only history, and user-confirmed outcomes replenish open slots | A fixed-slot live browser queue makes the candidate’s current tabs the work queue while deterministic eligibility and evidence ranking remain in the core package |
+| [JobHuntBot](https://github.com/DanielPan12/JobHuntBot) | Any capable coding agent plus a local progress dashboard | Broader application workflow with a pause before final submission | Dashboard and local application lifecycle tracking | This project is narrower: no dashboard, no form workflow, and no agent-led application interaction |
+| [Job Apply Plugin](https://github.com/neonwatty/job-apply-plugin) | Claude Code/Codex plugin for supported job boards | Form-oriented assistance for LinkedIn, Greenhouse, Ashby, and Workday | Plugin answer memory and application-flow state | This project is board-agnostic at the core and limits browser authority to approved listing URLs only |
+| [CareerForge / AI Job Search](https://github.com/suraj-davariya/ai-job-search) | Claude Code search/apply commands, document generation, and a local dashboard | Prepares tailored application materials but does not submit | Local dashboard tracks applications and generated artifacts | This project optimizes the live five-tab decision queue rather than document generation or dashboard management |
+
+The differentiator is therefore the **Smart Job Queue**: an agent-managed,
+candidate-controlled set of five evidence-ranked listing tabs that is refilled
+only after the candidate confirms an outcome and a tab is actually vacated.
 
 ### What is distinctive in this repo
 
@@ -229,7 +246,7 @@ tools also guarantee local processing. A cloud LLM may receive the specific
 context supplied to it; never promise a stronger privacy boundary than the
 actual runtime provides.
 
-## INPUT CONTRACT
+## REQUIRED CANDIDATE INPUTS
 
 Read candidate facts only from approved fields in ignored local manifests:
 
