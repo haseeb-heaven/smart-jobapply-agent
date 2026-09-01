@@ -11,7 +11,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from job_profession.tracker import WorkbookDependencyError, export_tracker  # noqa: E402
+from jobapply_agent.tracker import WorkbookDependencyError, export_tracker  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

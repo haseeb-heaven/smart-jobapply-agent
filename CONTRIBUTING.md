@@ -10,8 +10,8 @@ resumes, local application notes, or generated tracker databases.
 
 ```bash
 python -m pytest
-python -m compileall -q job_profession/src job_profession/scripts
-ruff check job_profession/src job_profession/scripts tests
+python -m compileall -q jobapply_agent/src jobapply_agent/scripts
+ruff check jobapply_agent/src jobapply_agent/scripts tests
 ```
 
 Every change to matching, source validation, scheduling, or review transitions

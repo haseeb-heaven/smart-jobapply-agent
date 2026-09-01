@@ -1,7 +1,7 @@
 # Security policy
 
 Smart JobApply Agent handles sensitive candidate information. Keep
-`job_profession/private/` local-only and never commit it. Treat browser
+`jobapply_agent/private/` local-only and never commit it. Treat browser
 sessions, cookies, API keys, resumes, compensation, visa details, and screening
 answers as secrets.
 

@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.matcher import load_scoring_rules, score_job
-from job_profession.models import CandidateProfile, JobListing, JobRequirement
+from jobapply_agent.matcher import load_scoring_rules, score_job
+from jobapply_agent.models import CandidateProfile, JobListing, JobRequirement
 
 
 def profile() -> CandidateProfile:

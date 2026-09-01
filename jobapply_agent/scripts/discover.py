@@ -19,23 +19,23 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if (SCRIPT_DIR / "src" / "job_profession").exists():
+if (SCRIPT_DIR / "src" / "jobapply_agent").exists():
     PROJECT_ROOT = SCRIPT_DIR
-elif (SCRIPT_DIR.parent / "src" / "job_profession").exists():
+elif (SCRIPT_DIR.parent / "src" / "jobapply_agent").exists():
     PROJECT_ROOT = SCRIPT_DIR.parent
 else:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from job_profession.models import CandidateProfile  # noqa: E402
-from job_profession.intake import validate_active_candidate_profile  # noqa: E402
-from job_profession.intake import (  # noqa: E402
+from jobapply_agent.models import CandidateProfile  # noqa: E402
+from jobapply_agent.intake import validate_active_candidate_profile  # noqa: E402
+from jobapply_agent.intake import (  # noqa: E402
     completion_questions,
     pending_verification_batch,
     validate_candidate_intake,
 )
-from job_profession.scheduler import current_profile_recommendations, run_discovery  # noqa: E402
-from job_profession.sources import MappingVisiblePageAdapter, load_search_profiles  # noqa: E402
+from jobapply_agent.scheduler import current_profile_recommendations, run_discovery  # noqa: E402
+from jobapply_agent.sources import MappingVisiblePageAdapter, load_search_profiles  # noqa: E402
 
 
 DEFAULT_CANDIDATE_PROFILE_PATH = PROJECT_ROOT / "private" / "candidate_profile.yaml"

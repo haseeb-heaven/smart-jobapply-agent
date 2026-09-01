@@ -13,22 +13,22 @@ from pathlib import Path
 
 import pytest
 
-from job_profession.intake import activate_candidate_profile, validate_candidate_intake
-from job_profession.listing_extraction import (
+from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+from jobapply_agent.listing_extraction import (
     listing_from_validated_extraction,
     validate_listing_extraction,
 )
-from job_profession.matcher import score_job
-from job_profession.models import JobListing
-from job_profession.smart_queue import QueueCandidate, SmartJobQueue
-from job_profession.tracker_lifecycle import LifecycleTracker
+from jobapply_agent.matcher import score_job
+from jobapply_agent.models import JobListing
+from jobapply_agent.smart_queue import QueueCandidate, SmartJobQueue
+from jobapply_agent.tracker_lifecycle import LifecycleTracker
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
 def _load_discover_module():
-    script_path = PROJECT_ROOT / "job_profession" / "scripts" / "discover.py"
+    script_path = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
     spec = importlib.util.spec_from_file_location("discover_for_workflow_integration", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

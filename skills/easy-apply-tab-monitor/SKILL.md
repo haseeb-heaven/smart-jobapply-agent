@@ -53,7 +53,7 @@ only missing listing URLs and writes one counts-only, redacted JSON status line
 per cycle; exact approved/browser URLs remain internal to reconciliation and are
 never included in CLI status output.
 It never applies, fills, uploads, or submits. A monitor manifest remains local in
-`job_profession/private/` and can include an `active_url_prefixes` list for an
+`jobapply_agent/private/` and can include an `active_url_prefixes` list for an
 expected in-progress route such as Indeed Smart Apply; this prevents a duplicate
 listing tab while the candidate is applying.
 

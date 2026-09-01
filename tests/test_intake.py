@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from job_profession.intake import (
+from jobapply_agent.intake import (
     activate_candidate_profile,
     completion_questions,
     pending_verification_batch,

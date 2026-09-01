@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import Any, Mapping
 from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,11 +18,12 @@ PLIST_NAME = "com.haseeb.smart-jobapply-agent.plist"
 SOURCE_PLIST = PROJECT_ROOT / "launchd" / PLIST_NAME
 RUNTIME_ROOT = Path.home() / "Library" / "Caches" / "smart_jobapply_agent_runtime"
 RUNTIME_BOOTSTRAP = RUNTIME_ROOT / "launchd_discover_bootstrap.sh"
-RUNTIME_SRC = RUNTIME_ROOT / "src" / "job_profession"
+RUNTIME_SRC = RUNTIME_ROOT / "src" / "jobapply_agent"
 RUNTIME_DISCOVER_SCRIPT = RUNTIME_ROOT / "discover.py"
 RUNTIME_CONFIG = RUNTIME_ROOT / "config"
 RUNTIME_PRIVATE = RUNTIME_ROOT / "private"
-SOURCE_CANDIDATE_PROFILE = PROJECT_ROOT / "private" / "candidate_profile.yaml"
+RUNTIME_CANDIDATE_INTAKE = RUNTIME_PRIVATE / "candidate_intake.json"
+SOURCE_CANDIDATE_INTAKE = PROJECT_ROOT / "private" / "candidate_intake.json"
 
 
 def _write_runtime_bootstrap() -> None:
@@ -42,9 +44,10 @@ def _write_runtime_bootstrap() -> None:
             OUTPUT_DIR=$2
             CURRENT_RECOMMENDATION_QUEUE="${OUTPUT_DIR}/Current_Profile_Recommended_Queue.csv"
             RUNTIME_ROOT="${HOME}/Library/Caches/smart_jobapply_agent_runtime"
-            RUNTIME_SRC="${RUNTIME_ROOT}/src/job_profession"
+            RUNTIME_SRC="${RUNTIME_ROOT}/src/jobapply_agent"
             RUNTIME_CONFIG="${RUNTIME_ROOT}/config"
             RUNTIME_SCRIPT="${RUNTIME_ROOT}/discover.py"
+            RUNTIME_CANDIDATE_INTAKE="${RUNTIME_ROOT}/private/candidate_intake.json"
 
             mkdir -p "${RUNTIME_ROOT}" "${RUNTIME_CONFIG}" "${RUNTIME_ROOT}/src" "$(dirname "${OUTPUT_DIR}")"
             mkdir -p "${OUTPUT_DIR}"
@@ -58,11 +61,11 @@ def _write_runtime_bootstrap() -> None:
             fi
 
             PAYLOAD_ARGS=()
-            if [[ -n "${JOB_PROFESSION_VISIBLE_PAYLOADS:-}" ]]; then
-              PAYLOAD_ARGS+=(--visible-payloads "${JOB_PROFESSION_VISIBLE_PAYLOADS}")
+            if [[ -n "${JOBAPPLY_AGENT_VISIBLE_PAYLOADS:-}" ]]; then
+              PAYLOAD_ARGS+=(--visible-payloads "${JOBAPPLY_AGENT_VISIBLE_PAYLOADS}")
             fi
-            "${PYTHON_BIN}" "${RUNTIME_SCRIPT}" --output-dir "${OUTPUT_DIR}" "${PAYLOAD_ARGS[@]}"
-            "${PYTHON_BIN}" "${RUNTIME_SCRIPT}" --output-dir "${OUTPUT_DIR}" --export-current-recommendations "${CURRENT_RECOMMENDATION_QUEUE}"
+            "${PYTHON_BIN}" "${RUNTIME_SCRIPT}" --candidate-intake "${RUNTIME_CANDIDATE_INTAKE}" --output-dir "${OUTPUT_DIR}" "${PAYLOAD_ARGS[@]}"
+            "${PYTHON_BIN}" "${RUNTIME_SCRIPT}" --candidate-intake "${RUNTIME_CANDIDATE_INTAKE}" --output-dir "${OUTPUT_DIR}" --export-current-recommendations "${CURRENT_RECOMMENDATION_QUEUE}"
             """
         ).rstrip()
         + "\n",
@@ -71,52 +74,87 @@ def _write_runtime_bootstrap() -> None:
     RUNTIME_BOOTSTRAP.chmod(0o700)
 
 
-def _approved_profile_mapping_for_runtime() -> dict[str, object]:
-    """Load only the evidence projection exposed by the discovery script."""
+def _discover_module_for_runtime() -> Any:
+    """Load the local discovery validation/projection boundary."""
 
     discover_path = PROJECT_ROOT / "scripts" / "discover.py"
-    spec = importlib.util.spec_from_file_location("job_profession_discover_profile_projection", discover_path)
+    spec = importlib.util.spec_from_file_location("jobapply_agent_discover_runtime_projection", discover_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load profile projection helper from {discover_path}")
+        raise RuntimeError(f"Could not load discovery runtime helpers from {discover_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module._approved_profile_mapping(SOURCE_CANDIDATE_PROFILE)
+    return module
 
 
-def _write_runtime_candidate_profile() -> None:
-    """Write a runtime profile containing only evidence, roles, and exclusions.
+def _prune_empty_matching_facts(value: object) -> object | None:
+    """Remove absent matcher fields without substituting candidate facts."""
+
+    if isinstance(value, Mapping):
+        projected = {
+            key: nested
+            for key, raw_nested in value.items()
+            if isinstance(key, str)
+            and (nested := _prune_empty_matching_facts(raw_nested)) is not None
+        }
+        return projected or None
+    if isinstance(value, list):
+        return list(value) or None
+    return value
+
+
+def _project_active_intake_for_runtime() -> dict[str, object]:
+    """Create a verified, matcher-only active-intake cache projection."""
+
+    if not SOURCE_CANDIDATE_INTAKE.exists():
+        raise ValueError(f"Active candidate intake is missing: {SOURCE_CANDIDATE_INTAKE}")
+    raw_intake = json.loads(SOURCE_CANDIDATE_INTAKE.read_text(encoding="utf-8"))
+    if not isinstance(raw_intake, Mapping):
+        raise ValueError("Active candidate intake JSON must be an object")
+
+    discover = _discover_module_for_runtime()
+    from jobapply_agent.intake import _activation_revision
+
+    active_intake = discover.validate_active_candidate_profile(raw_intake)
+    matching_facts = _prune_empty_matching_facts(
+        discover._active_intake_profile_mapping(active_intake)
+    )
+    if not isinstance(matching_facts, Mapping):
+        raise ValueError("Active candidate intake has no matcher-approved facts")
+    projection_draft = discover.validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": dict(matching_facts),
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    projection = {
+        **projection_draft,
+        "state": "active",
+        "activated_by": active_intake["activated_by"],
+        "confirmed_at": active_intake["confirmed_at"],
+        "revision_hash": _activation_revision(projection_draft),
+    }
+    return discover.validate_active_candidate_profile(projection)
+
+
+def _write_runtime_candidate_intake() -> None:
+    """Write the validated matcher-only active intake needed by discovery.
 
     The cached launchd runtime must not contain contacts, compensation,
-    confirmation-gated preferences, source status, or autofill values.
+    source status, documents, or autofill values.
     """
 
-    mapping = _approved_profile_mapping_for_runtime()
-    roles = mapping["roles"]
-    hard_exclusions = mapping["hard_exclusions"]
-    skills = mapping["skills"]
-    if not isinstance(roles, dict) or not isinstance(hard_exclusions, dict) or not isinstance(skills, dict):
-        raise ValueError("Approved candidate profile projection has an invalid shape")
+    projection = _project_active_intake_for_runtime()
     RUNTIME_PRIVATE.mkdir(parents=True, exist_ok=True)
     RUNTIME_PRIVATE.chmod(0o700)
-    runtime_profile = RUNTIME_PRIVATE / "candidate_profile.yaml"
-    runtime_profile.write_text(
-        "\n".join(
-            (
-                "roles:",
-                f"  include: {json.dumps(roles.get('include', []))}",
-                f"  exclude_title_terms: {json.dumps(roles.get('exclude_title_terms', []))}",
-                "hard_exclusions:",
-                f"  mandatory_requirements: {json.dumps(hard_exclusions.get('mandatory_requirements', []))}",
-                "skills:",
-                f"  professional: {json.dumps(skills.get('professional', []))}",
-                f"  personal_open_source: {json.dumps(skills.get('personal_open_source', []))}",
-                f"  learning_or_exposure: {json.dumps(skills.get('learning_or_exposure', []))}",
-                "",
-            )
-        ),
+    RUNTIME_CANDIDATE_INTAKE.write_text(
+        json.dumps(projection, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    runtime_profile.chmod(0o600)
+    RUNTIME_CANDIDATE_INTAKE.chmod(0o600)
 
 
 def _sync_runtime_snapshot() -> None:
@@ -128,12 +166,14 @@ def _sync_runtime_snapshot() -> None:
         shutil.rmtree(RUNTIME_SRC, ignore_errors=True)
     if (RUNTIME_ROOT / "config").exists():
         shutil.rmtree(RUNTIME_ROOT / "config", ignore_errors=True)
+    if RUNTIME_PRIVATE.exists():
+        shutil.rmtree(RUNTIME_PRIVATE, ignore_errors=True)
     RUNTIME_CONFIG.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(PROJECT_ROOT / "src" / "job_profession", RUNTIME_SRC, dirs_exist_ok=True)
+    shutil.copytree(PROJECT_ROOT / "src" / "jobapply_agent", RUNTIME_SRC, dirs_exist_ok=True)
     shutil.copy2(PROJECT_ROOT / "scripts" / "discover.py", RUNTIME_DISCOVER_SCRIPT)
     shutil.copy2(PROJECT_ROOT / "config" / "search_profiles.yaml", RUNTIME_CONFIG / "search_profiles.yaml")
     shutil.copy2(PROJECT_ROOT / "config" / "scoring_rules.yaml", RUNTIME_CONFIG / "scoring_rules.yaml")
-    _write_runtime_candidate_profile()
+    _write_runtime_candidate_intake()
     RUNTIME_DISCOVER_SCRIPT.chmod(0o700)
 
 

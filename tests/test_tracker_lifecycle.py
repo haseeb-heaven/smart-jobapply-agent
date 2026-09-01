@@ -5,12 +5,12 @@ import sqlite3
 
 import pytest
 
-from job_profession.tracker_lifecycle import (
+from jobapply_agent.tracker_lifecycle import (
     InvalidLifecycleTransition,
     LifecycleTracker,
     RoundLimitExceeded,
 )
-from job_profession.smart_queue import QueueCandidate, SmartJobQueue
+from jobapply_agent.smart_queue import QueueCandidate, SmartJobQueue
 
 
 def _advance_to_opened(tracker: LifecycleTracker, job_id: str) -> None:

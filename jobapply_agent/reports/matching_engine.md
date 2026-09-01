@@ -2,9 +2,9 @@
 
 ## Changed files
 
-- `src/job_profession/models.py`: dependency-free listing, minimal candidate-profile, and auditable result models.
-- `src/job_profession/normalize.py`: visible-field normalization, canonical URL handling, and SHA-256 listing fingerprints.
-- `src/job_profession/matcher.py`: YAML-configured deterministic scoring and hard rejections.
+- `src/jobapply_agent/models.py`: dependency-free listing, minimal candidate-profile, and auditable result models.
+- `src/jobapply_agent/normalize.py`: visible-field normalization, canonical URL handling, and SHA-256 listing fingerprints.
+- `src/jobapply_agent/matcher.py`: YAML-configured deterministic scoring and hard rejections.
 - `config/scoring_rules.yaml`: explicit weights, thresholds, and rejection terms.
 - `tests/test_normalize.py` and `tests/test_matcher.py`: fixture-free behavior tests.
 

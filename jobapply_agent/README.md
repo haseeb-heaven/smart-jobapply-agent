@@ -15,7 +15,7 @@ attestation, or submit. Suggested wording is local reference material only; it
 is never eligible for pre-fill. The candidate manually reviews and performs
 every application action.
 
-Private inputs belong only under ignored `job_profession/private/`. Never copy
+Private inputs belong only under ignored `jobapply_agent/private/`. Never copy
 them into source, tests, logs, issues, commits, examples, or shared agent
 reports. Unknown and unresolved facts remain explicit; do not infer sensitive
 answers or convert them into approved profile evidence.

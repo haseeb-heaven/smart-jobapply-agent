@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.workflow import ApplicationRecord, prepare_application, transition_application
+from jobapply_agent.workflow import ApplicationRecord, prepare_application, transition_application
 
 
 def test_missing_answer_stops_preparation_and_leaves_field_without_suggestion():

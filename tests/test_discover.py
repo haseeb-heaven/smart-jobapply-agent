@@ -3,14 +3,16 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
 
 def load_discover_module():
-    script_path = PROJECT_ROOT / "job_profession" / "scripts" / "discover.py"
+    script_path = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
     spec = importlib.util.spec_from_file_location("discover_for_test", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -19,7 +21,7 @@ def load_discover_module():
 
 
 def load_installer_module():
-    script_path = PROJECT_ROOT / "job_profession" / "scripts" / "install_launch_agent.py"
+    script_path = PROJECT_ROOT / "jobapply_agent" / "scripts" / "install_launch_agent.py"
     spec = importlib.util.spec_from_file_location("install_launch_agent_for_discover_test", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -61,7 +63,7 @@ autofill_policy:
 
 
 def write_active_candidate_intake(path: Path) -> None:
-    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 
     professional = ["Python", "FastAPI", "REST APIs", "PostgreSQL", "unit testing"]
     draft = validate_candidate_intake(
@@ -92,8 +94,8 @@ def write_active_candidate_intake(path: Path) -> None:
 
 def test_profile_loader_reloads_approved_skill_revisions_for_matching(tmp_path: Path):
     discover = load_discover_module()
-    from job_profession.matcher import score_job
-    from job_profession.models import JobListing
+    from jobapply_agent.matcher import score_job
+    from jobapply_agent.models import JobListing
 
     profile_path = tmp_path / "private" / "candidate_profile.yaml"
     job = JobListing(
@@ -174,8 +176,8 @@ source_status:
 
 def test_profile_loader_enforces_approved_mandatory_ml_exclusion(tmp_path: Path):
     discover = load_discover_module()
-    from job_profession.matcher import score_job
-    from job_profession.models import JobListing
+    from jobapply_agent.matcher import score_job
+    from jobapply_agent.models import JobListing
 
     profile_path = tmp_path / "private" / "candidate_profile.yaml"
     write_candidate_profile(profile_path, "Python, FastAPI, REST APIs, PostgreSQL, unit testing")
@@ -199,7 +201,7 @@ def test_repository_profile_exposes_classified_evidence_without_confirmation_fie
     discover = load_discover_module()
 
     profile = discover.approved_candidate_profile(
-        PROJECT_ROOT / "job_profession" / "private.example" / "candidate_profile.yaml"
+        PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_profile.yaml"
     )
 
     assert "python" in {skill.casefold() for skill in profile.professional_skills}
@@ -209,28 +211,73 @@ def test_repository_profile_exposes_classified_evidence_without_confirmation_fie
     assert profile.work_mode_preferences == ()
 
 
-def test_runtime_profile_projection_keeps_only_evidence_fields(tmp_path: Path, monkeypatch):
+def test_generated_runtime_bootstrap_uses_safe_active_intake_projection(tmp_path: Path, monkeypatch):
+    from jobapply_agent.intake import activate_candidate_profile
+
     discover = load_discover_module()
     installer = load_installer_module()
-    source_profile = tmp_path / "source" / "candidate_profile.yaml"
-    write_candidate_profile(source_profile, "Python, FastAPI")
-    runtime_private = tmp_path / "runtime" / "private"
-    monkeypatch.setattr(installer, "SOURCE_CANDIDATE_PROFILE", source_profile)
-    monkeypatch.setattr(installer, "RUNTIME_PRIVATE", runtime_private)
+    home = tmp_path / "home"
+    runtime_root = home / "Library" / "Caches" / "smart_jobapply_agent_runtime"
+    source_intake = tmp_path / "source" / "candidate_intake.json"
+    secrets = (
+        "candidate@example.invalid",
+        "22000 AED",
+        "source-status-private",
+        "resume-private.pdf",
+        "never-autofill-this",
+    )
+    draft = discover.validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [{"document_id": "resume", "path": "resume-private.pdf", "sha256": "0" * 64, "media_type": "application/pdf", "review_state": "untrusted"}],
+            "approved_facts": {
+                "identity": {"contact": "candidate@example.invalid"},
+                "compensation": "22000 AED",
+                "source_status": "source-status-private",
+                "autofill_policy": "never-autofill-this",
+                "experience": {"total_years": 3},
+                "roles": {"include": ["Python Backend Developer"]},
+                "skills": {"professional": ["Python", "FastAPI"], "personal_open_source": ["OpenAI"], "learning_or_exposure": ["Docker"], "evidence_by_skill": {"Python": "professional", "FastAPI": "professional", "OpenAI": "personal_open_source", "Docker": "learning_or_exposure"}},
+            },
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    active = activate_candidate_profile(draft, actor="user")
+    source_intake.parent.mkdir(parents=True)
+    source_intake.write_text(json.dumps(active), encoding="utf-8")
 
-    installer._write_runtime_candidate_profile()
+    monkeypatch.setattr(installer, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(installer, "RUNTIME_BOOTSTRAP", runtime_root / "launchd_discover_bootstrap.sh")
+    monkeypatch.setattr(installer, "RUNTIME_SRC", runtime_root / "src" / "jobapply_agent")
+    monkeypatch.setattr(installer, "RUNTIME_DISCOVER_SCRIPT", runtime_root / "discover.py")
+    monkeypatch.setattr(installer, "RUNTIME_CONFIG", runtime_root / "config")
+    monkeypatch.setattr(installer, "RUNTIME_PRIVATE", runtime_root / "private")
+    monkeypatch.setattr(installer, "RUNTIME_CANDIDATE_INTAKE", runtime_root / "private" / "candidate_intake.json")
+    monkeypatch.setattr(installer, "SOURCE_CANDIDATE_INTAKE", source_intake)
+    installer._sync_runtime_snapshot()
+    installer._write_runtime_bootstrap()
 
-    runtime_profile_path = runtime_private / "candidate_profile.yaml"
-    runtime_profile = discover.approved_candidate_profile(runtime_profile_path)
-    runtime_text = runtime_profile_path.read_text(encoding="utf-8")
-    assert "Python" in runtime_profile.professional_skills
-    assert "OpenAI" in runtime_profile.personal_open_source_skills
-    assert "Docker" in runtime_profile.learning_or_exposure_skills
-    assert runtime_profile.mandatory_excluded_requirements == ("ML model training or deployment ownership",)
-    assert "ML model training or deployment ownership" in runtime_text
-    assert "+971000000000" not in runtime_text
-    assert "22000 AED" not in runtime_text
-    assert "never-import-this" not in runtime_text
+    output_dir = tmp_path / "runtime-output"
+    completed = subprocess.run(
+        ["/bin/zsh", str(installer.RUNTIME_BOOTSTRAP), str(PROJECT_ROOT), str(output_dir)],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.splitlines()[0])["application_actions"] == 0
+    assert discover.active_candidate_profile(installer.RUNTIME_CANDIDATE_INTAKE).professional_skills == ("Python", "FastAPI")
+    assert json.loads(source_intake.read_text(encoding="utf-8"))["revision_hash"] == active["revision_hash"]
+    assert (output_dir / "Current_Profile_Recommended_Queue.csv").exists()
+    for runtime_file in runtime_root.rglob("*"):
+        if runtime_file.is_file():
+            runtime_bytes = runtime_file.read_bytes()
+            assert all(secret.encode("utf-8") not in runtime_bytes for secret in secrets)
 
 
 def test_launchd_template_renders_local_paths_without_publishing_machine_details(tmp_path: Path, monkeypatch):
@@ -251,8 +298,8 @@ def test_launchd_template_renders_local_paths_without_publishing_machine_details
 
 def test_current_profile_queue_cli_exports_only_active_safe_recommendations(tmp_path: Path, capsys):
     discover = load_discover_module()
-    from job_profession.matcher import matcher_policy_revision
-    from job_profession.scheduler import candidate_profile_revision
+    from jobapply_agent.matcher import matcher_policy_revision
+    from jobapply_agent.scheduler import candidate_profile_revision
 
     intake_path = tmp_path / "private" / "candidate_intake.json"
     write_active_candidate_intake(intake_path)
@@ -317,7 +364,7 @@ def test_discovery_refuses_to_consume_an_unconfirmed_candidate_intake(
     tmp_path: Path, capsys,
 ):
     discover = load_discover_module()
-    from job_profession.intake import validate_candidate_intake
+    from jobapply_agent.intake import validate_candidate_intake
 
     intake_path = tmp_path / "private" / "candidate_intake.json"
     intake_path.parent.mkdir()
@@ -350,7 +397,7 @@ def test_discover_intake_questions_mode_lists_all_pending_questions(
     tmp_path: Path, capsys
 ):
     discover = load_discover_module()
-    from job_profession.intake import validate_candidate_intake
+    from jobapply_agent.intake import validate_candidate_intake
 
     draft = validate_candidate_intake(
         {
@@ -405,7 +452,7 @@ def test_discover_intake_questions_mode_can_emit_json_bundle(
     tmp_path: Path, capsys
 ):
     discover = load_discover_module()
-    from job_profession.intake import validate_candidate_intake
+    from jobapply_agent.intake import validate_candidate_intake
 
     draft = validate_candidate_intake(
         {
@@ -489,7 +536,7 @@ def test_discover_intake_questions_mode_can_emit_ready_json_bundle(
     tmp_path: Path, capsys
 ):
     discover = load_discover_module()
-    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 
     draft = validate_candidate_intake(
         {
@@ -539,7 +586,7 @@ def test_discover_intake_questions_mode_can_parse_state_wrapped_draft(
     capsys,
 ):
     discover = load_discover_module()
-    from job_profession.intake import validate_candidate_intake
+    from jobapply_agent.intake import validate_candidate_intake
 
     draft = validate_candidate_intake(
         {
@@ -586,7 +633,7 @@ def test_discover_onboarding_uses_opaque_references_for_unallowlisted_fields(
     tmp_path: Path, capsys
 ):
     discover = load_discover_module()
-    from job_profession.intake import validate_candidate_intake
+    from jobapply_agent.intake import validate_candidate_intake
 
     draft = validate_candidate_intake(
         {
@@ -677,7 +724,7 @@ def test_active_intake_projects_only_candidate_approved_employment_and_authoriza
     tmp_path: Path,
 ):
     discover = load_discover_module()
-    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 
     draft = validate_candidate_intake(
         {

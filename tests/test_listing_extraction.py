@@ -4,11 +4,11 @@ import copy
 
 import pytest
 
-from job_profession.listing_extraction import (
+from jobapply_agent.listing_extraction import (
     listing_from_validated_extraction,
     validate_listing_extraction,
 )
-from job_profession.sources import listing_from_visible_payload
+from jobapply_agent.sources import listing_from_visible_payload
 
 
 def _valid_payload() -> dict[str, object]:

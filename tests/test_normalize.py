@@ -4,10 +4,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.models import JobListing
-from job_profession.normalize import (
+from jobapply_agent.models import JobListing
+from jobapply_agent.normalize import (
     canonicalize_url,
     listing_fingerprint,
     normalize_date,

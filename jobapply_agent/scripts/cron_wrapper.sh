@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Example crontab: 0 8,17 * * * /absolute/path/to/job_profession/scripts/cron_wrapper.sh
+# Example crontab: 0 8,17 * * * /absolute/path/to/jobapply_agent/scripts/cron_wrapper.sh
 # The wrapper only invokes local discovery/export: no browser, fetching, login,
 # CAPTCHA workaround, application click, form answer, or submission is possible.
 set -eu
@@ -15,27 +15,27 @@ while [[ -h "${SOURCE}" ]]; do
 done
 SCRIPT_DIR="$(CDPATH="" cd -P -- "$(dirname -- "${SOURCE}")" && pwd -P)"
 PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
-OUTPUT_DIR="${JOB_PROFESSION_OUTPUT_DIR:-${PROJECT_ROOT}/data}"
+OUTPUT_DIR="${JOBAPPLY_AGENT_OUTPUT_DIR:-${PROJECT_ROOT}/data}"
 CURRENT_RECOMMENDATION_QUEUE="${OUTPUT_DIR}/Current_Profile_Recommended_Queue.csv"
 mkdir -p "${OUTPUT_DIR}"
 # JobDiscoveryScheduler owns bounded, crash-recoverable cross-process locking
 # for its state, export, and audit artifacts.  Do not add a mkdir lock here:
 # an abandoned directory would suppress every future scheduled run.
 DISCOVERY_ARGS=(--output-dir "${OUTPUT_DIR}")
-if [[ -n "${JOB_PROFESSION_VISIBLE_PAYLOADS:-}" ]]; then
-  DISCOVERY_ARGS+=(--visible-payloads "${JOB_PROFESSION_VISIBLE_PAYLOADS}")
+if [[ -n "${JOBAPPLY_AGENT_VISIBLE_PAYLOADS:-}" ]]; then
+  DISCOVERY_ARGS+=(--visible-payloads "${JOBAPPLY_AGENT_VISIBLE_PAYLOADS}")
 fi
-if [[ -z "${JOB_PROFESSION_CANDIDATE_INTAKE:-}" ]]; then
-  printf '%s\n' "Discovery did not run: JOB_PROFESSION_CANDIDATE_INTAKE is required" >&2
+if [[ -z "${JOBAPPLY_AGENT_CANDIDATE_INTAKE:-}" ]]; then
+  printf '%s\n' "Discovery did not run: JOBAPPLY_AGENT_CANDIDATE_INTAKE is required" >&2
   exit 2
 fi
-CANDIDATE_ARGS=(--candidate-intake "${JOB_PROFESSION_CANDIDATE_INTAKE}")
-PYTHON_BIN="${JOB_PROFESSION_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3}"
+CANDIDATE_ARGS=(--candidate-intake "${JOBAPPLY_AGENT_CANDIDATE_INTAKE}")
+PYTHON_BIN="${JOBAPPLY_AGENT_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3 || true)"
 fi
 if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
-  printf '%s\n' "Discovery did not run: no executable Python interpreter found; set JOB_PROFESSION_PYTHON to Python >= 3.11" >&2
+  printf '%s\n' "Discovery did not run: no executable Python interpreter found; set JOBAPPLY_AGENT_PYTHON to Python >= 3.11" >&2
   exit 127
 fi
 check_python_version() {

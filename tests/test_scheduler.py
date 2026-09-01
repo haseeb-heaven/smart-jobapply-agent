@@ -18,17 +18,17 @@ try:
 except ModuleNotFoundError:  # Windows uses the separately exercised msvcrt backend.
     fcntl = None  # type: ignore[assignment]
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.models import CandidateProfile
-import job_profession.scheduler as scheduler_module
-from job_profession.scheduler import JobDiscoveryScheduler, candidate_profile_revision, current_profile_recommendations
-from job_profession.matcher import matcher_policy_revision
-from job_profession.sources import MappingVisiblePageAdapter, SearchProfile, build_search_url, listing_from_visible_payload
+from jobapply_agent.models import CandidateProfile
+import jobapply_agent.scheduler as scheduler_module
+from jobapply_agent.scheduler import JobDiscoveryScheduler, candidate_profile_revision, current_profile_recommendations
+from jobapply_agent.matcher import matcher_policy_revision
+from jobapply_agent.sources import MappingVisiblePageAdapter, SearchProfile, build_search_url, listing_from_visible_payload
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
-CRON_WRAPPER = PROJECT_ROOT / "job_profession" / "scripts" / "cron_wrapper.sh"
+CRON_WRAPPER = PROJECT_ROOT / "jobapply_agent" / "scripts" / "cron_wrapper.sh"
 
 
 def _command_path(tmp_path: Path, *, include_python3: bool = False) -> Path:
@@ -828,7 +828,7 @@ def test_active_scheduler_lock_times_out_with_a_bounded_wait(tmp_path: Path):
 def test_cron_wrapper_runs_despite_abandoned_legacy_directory_lock(tmp_path: Path):
     """The scheduler flock, not a stale mkdir lock, controls scheduled runs."""
 
-    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 
     output_dir = tmp_path / "scheduled-output"
     output_dir.mkdir()
@@ -849,12 +849,12 @@ def test_cron_wrapper_runs_despite_abandoned_legacy_directory_lock(tmp_path: Pat
         json.dumps(activate_candidate_profile(draft, actor="user")), encoding="utf-8"
     )
     environment = os.environ.copy()
-    environment["JOB_PROFESSION_OUTPUT_DIR"] = str(output_dir)
-    environment["JOB_PROFESSION_PYTHON"] = sys.executable
-    environment["JOB_PROFESSION_CANDIDATE_INTAKE"] = str(intake_path)
+    environment["JOBAPPLY_AGENT_OUTPUT_DIR"] = str(output_dir)
+    environment["JOBAPPLY_AGENT_PYTHON"] = sys.executable
+    environment["JOBAPPLY_AGENT_CANDIDATE_INTAKE"] = str(intake_path)
 
     completed = subprocess.run(
-        [str(PROJECT_ROOT / "job_profession" / "scripts" / "cron_wrapper.sh")],
+        [str(PROJECT_ROOT / "jobapply_agent" / "scripts" / "cron_wrapper.sh")],
         cwd=PROJECT_ROOT,
         env=environment,
         capture_output=True,
@@ -877,7 +877,7 @@ def test_cron_wrapper_runs_despite_abandoned_legacy_directory_lock(tmp_path: Pat
 def test_cron_wrapper_resolves_symlink_before_locating_project_files(tmp_path: Path):
     """Launching through a relative symlink must still run the repository script."""
 
-    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 
     output_dir = tmp_path / "scheduled-output"
     intake_path = tmp_path / "synthetic-intake.json"
@@ -900,9 +900,9 @@ def test_cron_wrapper_resolves_symlink_before_locating_project_files(tmp_path: P
     caller_dir.mkdir()
     environment = {
         "PATH": str(_command_path(tmp_path / "tools")),
-        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
-        "JOB_PROFESSION_PYTHON": sys.executable,
-        "JOB_PROFESSION_CANDIDATE_INTAKE": str(intake_path),
+        "JOBAPPLY_AGENT_OUTPUT_DIR": str(output_dir),
+        "JOBAPPLY_AGENT_PYTHON": sys.executable,
+        "JOBAPPLY_AGENT_CANDIDATE_INTAKE": str(intake_path),
     }
 
     completed = subprocess.run(
@@ -926,9 +926,9 @@ def test_cron_wrapper_rejects_unavailable_python_interpreter_without_running_dis
     missing_python = tmp_path / "missing-python"
     environment = {
         "PATH": str(_command_path(tmp_path / "tools")),
-        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
-        "JOB_PROFESSION_PYTHON": str(missing_python),
-        "JOB_PROFESSION_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
+        "JOBAPPLY_AGENT_OUTPUT_DIR": str(output_dir),
+        "JOBAPPLY_AGENT_PYTHON": str(missing_python),
+        "JOBAPPLY_AGENT_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
     }
 
     completed = subprocess.run(
@@ -945,7 +945,7 @@ def test_cron_wrapper_rejects_unavailable_python_interpreter_without_running_dis
     assert completed.stdout == ""
     assert completed.stderr == (
         "Discovery did not run: no executable Python interpreter found; "
-        "set JOB_PROFESSION_PYTHON to Python >= 3.11\n"
+        "set JOBAPPLY_AGENT_PYTHON to Python >= 3.11\n"
     )
     assert not (output_dir / "discovery_runs.jsonl").exists()
     assert not (output_dir / "Current_Profile_Recommended_Queue.csv").exists()
@@ -967,9 +967,9 @@ def test_cron_wrapper_rejects_unsupported_python_interpreter_without_running_dis
     unsupported_python.chmod(0o700)
     environment = {
         "PATH": str(_command_path(tmp_path / "tools")),
-        "JOB_PROFESSION_OUTPUT_DIR": str(output_dir),
-        "JOB_PROFESSION_PYTHON": str(unsupported_python),
-        "JOB_PROFESSION_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
+        "JOBAPPLY_AGENT_OUTPUT_DIR": str(output_dir),
+        "JOBAPPLY_AGENT_PYTHON": str(unsupported_python),
+        "JOBAPPLY_AGENT_CANDIDATE_INTAKE": str(tmp_path / "synthetic-intake.json"),
     }
 
     completed = subprocess.run(
@@ -992,7 +992,7 @@ def test_cron_wrapper_rejects_unsupported_python_interpreter_without_running_dis
 
 
 def test_generated_launchd_bootstrap_has_no_legacy_directory_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    script_path = PROJECT_ROOT / "job_profession" / "scripts" / "install_launch_agent.py"
+    script_path = PROJECT_ROOT / "jobapply_agent" / "scripts" / "install_launch_agent.py"
     spec = importlib.util.spec_from_file_location("install_launch_agent_for_test", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

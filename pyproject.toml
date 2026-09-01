@@ -17,14 +17,14 @@ test = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0"]
 dev = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0", "ruff==0.8.6"]
 
 [tool.setuptools.packages.find]
-where = ["job_profession/src"]
+where = ["jobapply_agent/src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["job_profession/src"]
+pythonpath = ["jobapply_agent/src"]
 addopts = "-q"
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-exclude = ["job_profession/private", "job_profession/data", "job_profession/output"]
+exclude = ["jobapply_agent/private", "jobapply_agent/data", "jobapply_agent/output"]

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from job_profession.workflow import prepare_application
+from jobapply_agent.workflow import prepare_application
 
 
 def main() -> int:

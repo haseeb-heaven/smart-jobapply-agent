@@ -2,7 +2,7 @@
 
 ## Scope
 
-The profile vault is local-only under `job_profession/private/` and ignored by
+The profile vault is local-only under `jobapply_agent/private/` and ignored by
 Git. It supports a manual, auditable job-review process, not automatic
 submission. The candidate is deliberately positioned as a mid-level,
 implementation-focused backend/software developer: maintenance and feature

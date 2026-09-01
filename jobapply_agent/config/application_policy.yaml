@@ -6,8 +6,8 @@ application_policy:
 
   core_engine_boundary:
     paths:
-      - job_profession/src
-      - job_profession/scripts
+      - jobapply_agent/src
+      - jobapply_agent/scripts
     network_access: prohibited
     browser_access: prohibited
     allowed_automation:

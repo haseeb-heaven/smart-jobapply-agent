@@ -7,6 +7,7 @@ candidate-private file is used.
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -14,12 +15,18 @@ import sys
 
 import pytest
 
-from job_profession.smart_queue import QueueCandidate, QueuePolicyError
-from job_profession.sources import _validate_listing_url
+from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError
+from jobapply_agent.sources import _validate_listing_url
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
-PACKAGE_ROOT = PROJECT_ROOT / "job_profession" / "src"
+PACKAGE_ROOT = PROJECT_ROOT / "jobapply_agent" / "src"
+
+
+def test_public_package_import_resolves_from_renamed_source_tree():
+    package = importlib.import_module("jobapply_agent")
+
+    assert Path(package.__file__).parent == PACKAGE_ROOT / "jobapply_agent"
 
 
 @pytest.mark.parametrize(
@@ -133,9 +140,9 @@ def without_fcntl(name, globals=None, locals=None, fromlist=(), level=0):
 
 builtins.__import__ = without_fcntl
 
-from job_profession.models import CandidateProfile
-from job_profession.scheduler import JobDiscoveryScheduler
-from job_profession.sources import MappingVisiblePageAdapter
+from jobapply_agent.models import CandidateProfile
+from jobapply_agent.scheduler import JobDiscoveryScheduler
+from jobapply_agent.sources import MappingVisiblePageAdapter
 
 scheduler = JobDiscoveryScheduler(
     CandidateProfile(),

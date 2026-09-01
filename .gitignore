@@ -1,12 +1,12 @@
 # Private candidate facts, contact details, compensation, and answers.
-job_profession/private/
+jobapply_agent/private/
 
 # Local runtime state, databases, logs, and generated exports.
-job_profession/data/*
-!job_profession/data/.gitkeep
-job_profession/output/*
-!job_profession/output/.gitkeep
-job_profession/*.log
+jobapply_agent/data/*
+!jobapply_agent/data/.gitkeep
+jobapply_agent/output/*
+!jobapply_agent/output/.gitkeep
+jobapply_agent/*.log
 
 # Local operator configuration and credentials.
 **/config.sh

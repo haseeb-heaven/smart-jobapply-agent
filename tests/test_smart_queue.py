@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from job_profession.smart_queue import (
+from jobapply_agent.smart_queue import (
     QueueAction,
     QueueCandidate,
     QueuePolicyError,

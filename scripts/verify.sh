@@ -22,7 +22,7 @@ echo "[2/8] Python lint"
 # and from newly introduced rule families.  The project can expand this
 # baseline deliberately in a separate reviewed change.
 ruff check --isolated --select E4,E7,E9,F --line-length 120 --target-version py311 \
-  job_profession/src job_profession/scripts tests
+  jobapply_agent/src jobapply_agent/scripts tests
 
 echo "[3/8] bounded watcher line and branch coverage"
 python -m coverage erase
@@ -44,16 +44,16 @@ python -m coverage report \
 
 echo "[5/8] Python bytecode compilation"
 python -m compileall -q \
-  job_profession/src \
-  job_profession/scripts \
+  jobapply_agent/src \
+  jobapply_agent/scripts \
   skills/easy-apply-tab-monitor/scripts
 
 echo "[6/8] shell static analysis"
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck scripts/verify.sh job_profession/scripts/cron_wrapper.sh
+  shellcheck scripts/verify.sh jobapply_agent/scripts/cron_wrapper.sh
 else
   echo "validation note: shellcheck unavailable; running Bash syntax fallback"
-  bash -n scripts/verify.sh job_profession/scripts/cron_wrapper.sh
+  bash -n scripts/verify.sh jobapply_agent/scripts/cron_wrapper.sh
 fi
 
 echo "[7/8] patch whitespace integrity"
@@ -61,7 +61,7 @@ git diff --check
 git diff --cached --check
 
 echo "[8/8] tracked candidate-data boundary"
-tracked_private="$(git ls-files 'job_profession/private/**' 'resumes/**' 'codex-apply-*.*')"
+tracked_private="$(git ls-files 'jobapply_agent/private/**' 'resumes/**' 'codex-apply-*.*')"
 if [[ -n "$tracked_private" ]]; then
   echo "validation error: private candidate paths are tracked" >&2
   echo "$tracked_private" >&2

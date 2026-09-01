@@ -11,8 +11,8 @@ Before task analysis, mutation, or delegation, load in order:
 2. `README.md` completely;
 3. `SECURITY.md` completely;
 4. the nearest task-relevant `SKILL.md` completely;
-5. `job_profession/config/application_policy.yaml`;
-6. `job_profession/config/scoring_rules.yaml` for matching work;
+5. `jobapply_agent/config/application_policy.yaml`;
+6. `jobapply_agent/config/scoring_rules.yaml` for matching work;
 7. applicable ignored manifests only when the task requires their approved data.
 
 Then inspect `git status`, the active branch, the relevant code/tests, and all
@@ -91,7 +91,7 @@ unresolved: [finding ids]
 ```
 
 Persist task-local reports under the ignored
-`job_profession/output/agent-runs/<task_id>/` directory when continuity requires
+`jobapply_agent/output/agent-runs/<task_id>/` directory when continuity requires
 files. Never persist secrets, resumes, candidate facts, browser state, or email
 content in a report.
 

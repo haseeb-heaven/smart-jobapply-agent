@@ -3,10 +3,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.compose import build_draft, lint_claims
-from job_profession.models import CandidateProfile, JobListing
+from jobapply_agent.compose import build_draft, lint_claims
+from jobapply_agent.models import CandidateProfile, JobListing
 
 
 def profile() -> CandidateProfile:

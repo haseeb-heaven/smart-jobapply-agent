@@ -10,7 +10,7 @@ supported_agent_examples: [Codex, Claude_Code, Grok]
 operating_system: any
 browser: any_with_a_conforming_tab_bridge
 execution_mode: evidence_first_candidate_controlled
-internal_python_package: job_profession
+internal_python_package: jobapply_agent
 contribution_record: CONTRIBUTORS.md
 ```
 
@@ -179,7 +179,7 @@ The candidate is the pilot. The agent is a co‑pilot: it never applies, fills,
 uploads, or submits. It only curates evidence, tracks state, and opens the next
 list of exact listing URLs when the queue opens up.
 
-Use `job_profession.smart_queue.SmartJobQueue` as the persistent queue authority.
+Use `jobapply_agent.smart_queue.SmartJobQueue` as the persistent queue authority.
 `record_visible_snapshot` observes only URLs. A missing tab enters
 `awaiting_outcome` and remains a reserved slot until the candidate confirms
 `submitted`, `rejected`, or `skipped`; it never records an application.
@@ -226,7 +226,7 @@ with safe, read-only work.
 
 ### Browser boundary
 
-The core package (`job_profession/src` and `job_profession/scripts`) has zero
+The core package (`jobapply_agent/src` and `jobapply_agent/scripts`) has zero
 browser authority: it cannot navigate, inspect a session, authenticate, or act
 on an application. The separately bounded
 `skills/easy-apply-tab-monitor/SKILL.md` may only list current tab URLs and open
@@ -251,10 +251,10 @@ actual runtime provides.
 Read candidate facts only from approved fields in ignored local manifests:
 
 ```text
-job_profession/private/candidate_profile.yaml
-job_profession/private/candidate_intake.json
-job_profession/private/application_answers.yaml
-job_profession/private/documents_manifest.yaml
+jobapply_agent/private/candidate_profile.yaml
+jobapply_agent/private/candidate_intake.json
+jobapply_agent/private/application_answers.yaml
+jobapply_agent/private/documents_manifest.yaml
 ```
 
 `candidate_intake.json` is the discovery authority. The seeded example is a
@@ -285,8 +285,8 @@ compensation, availability, location, or screening answers.
 Use the onboarding helper before discovery if needed:
 
 ```sh
-python job_profession/scripts/discover.py \
-  --candidate-intake job_profession/private/candidate_intake.json \
+python jobapply_agent/scripts/discover.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
   --show-intake-questions
 ```
 
@@ -306,7 +306,7 @@ visible-page adapter. Unknown values remain `unknown`. Required provenance:
 ```
 
 The committed redacted fixture is
-`job_profession/private.example/visible_listings.json`. Copy it only into the
+`jobapply_agent/private.example/visible_listings.json`. Copy it only into the
 ignored private directory, replace examples with already-visible facts, and do
 not include cookies, headers, tokens, page HTML, contact details, or application
 answers.
@@ -372,32 +372,32 @@ python -m pip install -e '.[dev]'
 Seed ignored manifests only when absent:
 
 ```sh
-mkdir -p job_profession/private
-test -e job_profession/private/candidate_profile.yaml || cp job_profession/private.example/candidate_profile.yaml job_profession/private/candidate_profile.yaml
-test -e job_profession/private/candidate_intake.json || cp job_profession/private.example/candidate_intake.json job_profession/private/candidate_intake.json
-test -e job_profession/private/application_answers.yaml || cp job_profession/private.example/application_answers.yaml job_profession/private/application_answers.yaml
-test -e job_profession/private/documents_manifest.yaml || cp job_profession/private.example/documents_manifest.yaml job_profession/private/documents_manifest.yaml
-test -e job_profession/private/visible_listings.json || cp job_profession/private.example/visible_listings.json job_profession/private/visible_listings.json
-chmod 700 job_profession/private
+mkdir -p jobapply_agent/private
+test -e jobapply_agent/private/candidate_profile.yaml || cp jobapply_agent/private.example/candidate_profile.yaml jobapply_agent/private/candidate_profile.yaml
+test -e jobapply_agent/private/candidate_intake.json || cp jobapply_agent/private.example/candidate_intake.json jobapply_agent/private/candidate_intake.json
+test -e jobapply_agent/private/application_answers.yaml || cp jobapply_agent/private.example/application_answers.yaml jobapply_agent/private/application_answers.yaml
+test -e jobapply_agent/private/documents_manifest.yaml || cp jobapply_agent/private.example/documents_manifest.yaml jobapply_agent/private/documents_manifest.yaml
+test -e jobapply_agent/private/visible_listings.json || cp jobapply_agent/private.example/visible_listings.json jobapply_agent/private/visible_listings.json
+chmod 700 jobapply_agent/private
 ```
 
 Run offline discovery only with the explicit visible payload:
 
 ```sh
-python job_profession/scripts/discover.py \
-  --candidate-intake job_profession/private/candidate_intake.json \
-  --visible-payloads job_profession/private/visible_listings.json \
-  --output-dir job_profession/data
+python jobapply_agent/scripts/discover.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --visible-payloads jobapply_agent/private/visible_listings.json \
+  --output-dir jobapply_agent/data
 ```
 
 Export the active-profile queue from the append-only local results:
 
 ```sh
-python job_profession/scripts/discover.py \
-  --candidate-intake job_profession/private/candidate_intake.json \
-  --output-dir job_profession/data \
+python jobapply_agent/scripts/discover.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --output-dir jobapply_agent/data \
   --export-current-recommendations \
-  job_profession/output/Current_Profile_Recommended_Queue.csv
+  jobapply_agent/output/Current_Profile_Recommended_Queue.csv
 ```
 
 For Smart Job Queue operation, feed the visible tab URLs into
@@ -410,7 +410,7 @@ prefix:
 
 ```sh
 python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \
-  --manifest job_profession/private/easy_apply_tab_monitor.json \
+  --manifest jobapply_agent/private/easy_apply_tab_monitor.json \
   --watch --interval-seconds 60 \
   --adapter external \
   --adapter-command browser-agent-bridge --browser firefox

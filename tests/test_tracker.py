@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "jobapply_agent" / "src"))
 
-from job_profession.models import JobListing, MatchResult
-from job_profession.tracker import (
+from jobapply_agent.models import JobListing, MatchResult
+from jobapply_agent.tracker import (
     ApplicationRecord,
     InvalidTransition,
     Tracker,

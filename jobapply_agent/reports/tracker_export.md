@@ -28,8 +28,8 @@ content with an Excel filename. Consequently,
 Use the supported interim command instead:
 
 ```bash
-python3 job_profession/scripts/export_tracker.py \
-  --output job_profession/output/Job_Application_Tracker.csv
+python3 jobapply_agent/scripts/export_tracker.py \
+  --output jobapply_agent/output/Job_Application_Tracker.csv
 ```
 
 Open that CSV in Google Sheets or Microsoft Excel and save it as an XLSX file
