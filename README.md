@@ -1,132 +1,95 @@
-# Smart Jobs Apply AI
+# Smart Jobs Apply AI — Agent Operating Contract
 
-Evidence-first AI-assisted job matching and human-reviewed application
-preparation for implementation-focused software roles.
+This repository is an operating contract for an AI coding agent, not a human-facing job-search application. Use it through **Codex**, **Claude Code**, **Grok**, or another capable LLM agent. The LLM is the review brain; this repository supplies deterministic matching, evidence boundaries, local state, and validation.
 
-This repository scores **visible LinkedIn and Indeed listing data** against an
-approved candidate profile and produces an auditable review queue. AI-assisted
-recommendations must remain source-grounded and preserve the deterministic
-matcher explanation; a score is profile fit, never hiring probability. It is
-not an application bot. It never logs in, reads browser credentials, uploads a
-resume, answers screening or EEO questions, clicks Apply/Submit, solves
-CAPTCHAs, or accepts attestations.
+## Agent mission
 
-## LLM-assisted workflow
+Turn candidate-approved facts and already-visible job-listing data into a small, explainable review queue. Recommend roles only when the evidence supports the recommendation. A fit score measures profile overlap, never interview, salary, eligibility, or hiring probability.
 
-An interactive coding agent is the review brain for this project. Run the
-workflow through **Codex**, **Claude Code**, or **Grok** (or another capable
-LLM agent) to interpret visible job evidence, use the deterministic matcher,
-surface gaps, and prepare a bounded review queue. The LLM is advisory: it must
-preserve source evidence, expose uncertainty, and defer to the deterministic
-policy whenever the two disagree. It must never invent candidate experience,
-claim a job is guaranteed, bypass a job board, or operate an application form.
+## Non-negotiable safety boundary
 
-Recommended flow: give the agent the private profile only through the local
-ignored manifest, provide visible listing data, review the explainable queue,
-then open the selected tabs for the candidate to apply manually.
+- Never log in, read credentials/cookies, solve CAPTCHAs, bypass a job board, send messages, upload a resume, fill a form, click Apply/Easy Apply/Next/Submit, or accept an attestation.
+- Never fabricate skills, experience, salary, work authorization, location, sponsorship, availability, or screening answers.
+- Never expose private profiles, resumes, email contents, browser state, API keys, compensation, visa details, or local job-search notes in a commit, issue, log, prompt, or response.
+- Preserve the deterministic matcher result and its explanation. If an LLM interpretation conflicts with the policy, mark it uncertain and defer to the deterministic policy.
 
-## What it does
+The candidate owns every application action and the final submission.
 
-- Keeps professional, personal/open-source, and learning evidence separate.
-- Rejects senior, staff, principal, lead, architect, manager, head, director,
-  junior, entry-level, and explicit job-level titles.
-- Rejects architecture/strategy ownership, people management, and mandatory
-  production GenAI ownership outside the approved profile.
-- Scores Python/FastAPI/API, database, testing, maintenance, feature,
-  background-job, and integration responsibilities transparently.
-- Accepts listing payloads only through an explicit visible-page adapter.
-- Deduplicates listings, preserves description snapshots, and tracks profile and
-  matcher-policy revisions.
-- Writes a current-profile CSV queue and an append-only JSONL audit trail.
-- Provides a local SQLite tracker and truthful, review-only application drafts.
-- Includes a review-only Chrome tab watcher that can reopen a bounded local
-  queue; it never interacts with application forms.
-- Includes a macOS `launchd`/cron wrapper for discovery and export only.
+## Required local setup
 
-## Safety model
-
-The core package is dependency-free and has no network or browser capability.
-A browser or API integration, if added later, must supply already-visible data
-through the adapter boundary and must preserve source provenance. Scheduled jobs
-may refresh review data; they must never submit an application.
-
-Scores describe profile fit, not hiring probability. The candidate must verify
-the company, listing, compensation, location, work authorization, sponsorship,
-availability, attachments, and every screening question before applying.
-
-## Quick start
-
-```bash
+```sh
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[test]'
-python -m pytest
+python -m pip install -e '.[dev]'
+cp job_profession/private.example/candidate_profile.yaml job_profession/private/candidate_profile.yaml
+cp job_profession/private.example/application_answers.yaml job_profession/private/application_answers.yaml
+cp job_profession/private.example/documents_manifest.yaml job_profession/private/documents_manifest.yaml
+chmod 700 job_profession/private
 ```
 
-The approved profile is intentionally private and is ignored by Git:
-`job_profession/private/candidate_profile.yaml`. Copy the redacted templates
-from `job_profession/private.example/` before adding local data. Never commit
-private facts or generated databases.
+The `job_profession/private/` directory is intentionally ignored. Keep every candidate-specific value there. `resumes/` and `codex-apply-*.*` are also ignored. Before every push, inspect `git status --short` and the staged diff.
 
-Run a safe discovery heartbeat with no network access:
+## Agent workflow
 
-```bash
+1. Read the private profile only from the local ignored manifests. Treat fields that require confirmation as unavailable.
+2. Accept job data only from an already-visible LinkedIn or Indeed card/listing, via the visible-page adapter. Preserve source URL, date, and description snapshot; do not scrape through login or invent missing details.
+3. Run the deterministic matcher. Reject titles or requirements outside the candidate’s approved evidence before ranking. Surface supporting reasons, gaps, and uncertainty for every result.
+4. Dedupe listings and write the auditable local queue. Keep tracker history append-only.
+5. Open at most five recommended listing tabs for candidate review. A tab may be an external path or Easy Apply, but do not enter either form.
+6. If monitoring is requested, run the review-only watcher from a local manifest. It may reopen only the exact missing listing URLs; it must never replace them with fresh search results or interact with page controls.
+7. Stop and report when credentials, consent, EEO/screening questions, CAPTCHA, unclear evidence, or a final application action is encountered.
+
+## Local commands for agents
+
+```sh
+# Score/refresh a review queue from an explicit visible-data payload.
 python job_profession/scripts/discover.py --output-dir job_profession/data
-python job_profession/scripts/discover.py --output-dir job_profession/data \
+
+# Export current, evidence-based recommendations.
+python job_profession/scripts/discover.py \
+  --output-dir job_profession/data \
   --export-current-recommendations job_profession/output/Current_Profile_Recommended_Queue.csv
+
+# Validate and run the bounded review-only tab watcher.
+python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \
+  --manifest job_profession/private/easy_apply_tab_monitor.json --watch
 ```
 
-To score visible listings, provide an offline JSON mapping of search URLs to
-listing objects. See `job_profession/config/search_profiles.yaml` and the
-tests for the payload shape.
+The watcher requires the candidate’s visible, already-signed-in Chrome session and macOS automation permission. It lists URLs and opens only missing LinkedIn or Indeed listing URLs. It has no form control, upload, or submit capability.
 
-## Repository layout
+## Repository map
 
 ```text
-job_profession/
-  src/job_profession/       Internal Python package: pure models, normalization, matching, scheduling,
-                            tracking, and review-only draft composition.
-  scripts/                  Offline discovery, exports, macOS launchd setup,
-                            and optional read-only browser health checks.
-  config/                   Search profiles, scoring rules, and safety policy.
-  private/                  Local-only candidate details (ignored by Git).
-  reports/                  Design and operational documentation.
-  launchd/                  User-level macOS scheduling template.
-tests/                      Regression and safety tests.
-skills/                     Reusable Smart Test Pipeline and stow skills.
+job_profession/src/job_profession/  deterministic matching, provenance, tracking
+job_profession/config/              approved scoring and discovery policies
+job_profession/scripts/             offline discovery/export and opt-in scheduling
+skills/easy-apply-tab-monitor/      bounded review-only Chrome watcher
+tests/                              matcher, policy, tracker, scheduler, watcher tests
+job_profession/private.example/     redacted local-manifest templates
 ```
 
-## Smart Test Pipeline
+`job_profession` remains the stable internal Python package name. The public repository and distribution name are **smart-jobs-apply-ai**.
 
-`skills/smart-test-pipeline` is adapted from the `smart-test-pipeline` branch of
-the `firstmate-heaven` repository. It provides a guarded PR review → test →
-fix → CI loop. It refuses closed PRs, isolates worktrees, keeps validation
-credential-free, never merges, and supports dry runs. It is optional and
-requires an authenticated GitHub CLI, `jq`, Git, and an explicitly configured
-fix agent. Read its `SKILL.md` before running it.
+## Required verification before a commit or PR
 
-The `skills/stow` skill is also included for local, deliberate session-memory
-maintenance; it never files credentials or silently writes to external systems.
-
-## Development
-
-```bash
+```sh
 python -m pytest
-python -m compileall -q job_profession/src job_profession/scripts
 ruff check job_profession/src job_profession/scripts tests
+python -m coverage run --branch \
+  --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py' \
+  -m pytest tests/test_chrome_tab_watcher.py
+python -m coverage report \
+  --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py' \
+  --fail-under=100
+python -m compileall -q job_profession/src job_profession/scripts skills/easy-apply-tab-monitor/scripts
 ```
 
-Pull requests should use the `feature` branch and include tests for every
-policy or safety change. Do not add any code path that can submit an application.
+CI enforces the test suite, Ruff, watcher branch/line coverage at 100%, Python compilation, and shell linting. For changes affecting matching, add adversarial fixtures for unsupported skills, seniority, ambiguity, duplicate listings, and missing source evidence. For any safety change, add a regression test proving that no application-form action is possible.
 
-## Public repository hygiene
+## LLM response requirements
 
-The project is safe to publish only because candidate facts stay in the ignored
-`job_profession/private/` directory. Resumes and local application notes are
-also ignored. Before pushing, run `git status --short` and review the staged
-diff; never force-add private material.
+When reporting recommendations, provide the exact listing URL, evidence-backed fit rationale, gaps, certainty level, and whether the tab is open/reopened. Never call a role “100%,” “perfect,” or guaranteed merely from a score. Keep claims short, factual, and challengeable by the candidate.
 
-## License
+## Public repository policy
 
-MIT. See [LICENSE](LICENSE). Private candidate files and generated local data
-remain excluded by `.gitignore`.
+This is public source code; it must contain no candidate documents or runtime data. Do not force-add ignored paths. Report security issues privately with a minimal reproduction; see `SECURITY.md`.
