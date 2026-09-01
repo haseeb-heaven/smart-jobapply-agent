@@ -4,7 +4,7 @@ profile_kind: application_answer_library
 answers:
   concise_introduction:
     status: approved
-    autofill_allowed: true
+    suggestion_only: true
     text: "I am a mid-level implementation-focused backend developer with experience in APIs, databases, testing, and feature delivery."
 
 # Keep location, authorization, sponsorship, compensation, availability, EEO,

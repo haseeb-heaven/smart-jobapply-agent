@@ -76,11 +76,28 @@ def test_only_reviewed_job_can_move_to_ready_to_apply_and_submission_needs_user_
     assert tracker.history_for(application.job_id)[-1].actor == "user"
 
 
-def test_pure_transition_refuses_automation_submission_but_records_manual_submission():
+@pytest.mark.parametrize("actor", ["User", " user ", "user "])
+def test_submission_requires_exact_user_actor_in_tracker(tmp_path: Path, actor: str):
+    tracker = Tracker(tmp_path / "jobs.sqlite3")
+    application = tracker.record_listing(_listing(), _match())
+    reviewed = tracker.transition_application(application.job_id, "reviewed", actor="agent")
+    ready = tracker.transition_application(reviewed.job_id, "ready_to_apply", actor="agent")
+
+    with pytest.raises(InvalidTransition, match="user actor"):
+        tracker.transition_application(ready.job_id, "submitted", actor=actor)
+
+
+@pytest.mark.parametrize("actor", ["User", " user ", "user "])
+def test_pure_transition_requires_exact_user_actor(actor: str):
     reviewed = ApplicationRecord(job_id="job-1", status="ready_to_apply")
 
     with pytest.raises(InvalidTransition):
-        transition_application(reviewed, "submitted", actor="automation")
+        transition_application(reviewed, "submitted", actor=actor)
+
+
+def test_pure_transition_records_manual_submission_for_exact_user_actor():
+    reviewed = ApplicationRecord(job_id="job-1", status="ready_to_apply")
+
     submitted = transition_application(reviewed, "submitted", actor="user")
 
     assert submitted.submitted_by == "user"

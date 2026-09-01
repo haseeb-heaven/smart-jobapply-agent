@@ -12,8 +12,9 @@ from dataclasses import dataclass
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
-from urllib.parse import SplitResult, urlencode, urlsplit
+from urllib.parse import parse_qsl, SplitResult, urlencode, urlsplit, urlunsplit
 
+from .listing_extraction import listing_from_validated_extraction
 from .matcher import is_non_mid_level_title
 from .models import JobListing
 
@@ -24,6 +25,11 @@ _PLATFORM_HOSTS = {
     "indeed": frozenset({"indeed.com"}),
 }
 _HIGH_FIT_QUERY = re.compile(r"\b(?:python|fastapi|api)\b", re.IGNORECASE)
+_LINKEDIN_LISTING_PATH = re.compile(r"^/jobs/view/(?P<job_id>[A-Za-z0-9_-]+)/?$")
+_INDEED_JOB_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_TRACKING_QUERY_KEYS = frozenset(
+    {"campaign", "from", "mcid", "ref", "source", "trackingid", "trk"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +124,17 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
     Unknown payload keys, including any cookie/session metadata, are ignored.
     """
 
+    extraction: object | None = payload.get("extraction")
+    if extraction is None and {"schema_version", "source_url", "requirements"} <= set(payload):
+        extraction = payload
+    if extraction is not None:
+        if not isinstance(extraction, Mapping):
+            raise ValueError("Visible listing extraction must be an object")
+        listing = listing_from_validated_extraction(extraction)
+        if listing.platform != platform.casefold().strip():
+            raise ValueError("Validated listing extraction platform does not match the visible source")
+        return listing
+
     title = str(payload.get("title", "")).strip()
     url = str(payload.get("url", payload.get("job_url", ""))).strip()
     if not title or not url:
@@ -130,11 +147,86 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
         description=str(payload.get("description", "")),
         location=str(payload.get("location", "")),
         work_mode=str(payload.get("work_mode", "")),
+        employment_type=str(payload.get("employment_type", "")),
         posted_at=payload.get("posted_at"),
         discovered_at=payload.get("discovered_at"),
         source_job_id=str(payload["source_job_id"]) if payload.get("source_job_id") is not None else None,
         platform=platform,
     )
+
+
+def _is_safe_tracking_key(key: str) -> bool:
+    normalized = key.casefold()
+    return normalized in _SAFE_TRACKING_QUERY_KEYS or normalized.startswith("utm_")
+
+
+def canonical_listing_url(url: str, platform: str | None = None) -> str:
+    """Validate and canonicalize one credential-free board listing identity.
+
+    Only the public listing routes are accepted. Query data is closed to the
+    Indeed ``jk`` identity and harmless tracking keys; credentials, fragments,
+    application/search/login routes, and all other query keys fail closed.
+    """
+
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Visible listing URLs must be non-empty strings")
+    if platform is not None and not isinstance(platform, str):
+        raise ValueError(f"Unsupported listing platform: {platform!r}")
+    normalized_platform = None if platform is None else platform.casefold().strip()
+    if normalized_platform is not None and normalized_platform not in SUPPORTED_PLATFORMS:
+        raise ValueError(f"Unsupported listing platform: {platform!r}")
+    parsed: SplitResult = urlsplit(url.strip())
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Visible listing URL has an invalid authority") from exc
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+    ):
+        raise ValueError("Visible listing URLs must be credential-free HTTPS URLs without fragments")
+
+    detected_platform: str | None = None
+    for candidate, roots in _PLATFORM_HOSTS.items():
+        if any(hostname == root or hostname.endswith("." + root) for root in roots):
+            detected_platform = candidate
+            break
+    if detected_platform is None:
+        if normalized_platform is not None:
+            raise ValueError(f"Visible listing URL host is not an allowed {normalized_platform} host")
+        raise ValueError("Visible listing URL host is not an allowed LinkedIn or Indeed host")
+
+    normalized_platform = detected_platform if normalized_platform is None else normalized_platform
+    if detected_platform != normalized_platform:
+        raise ValueError(f"Visible listing URL host is not an allowed {normalized_platform} host")
+
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if parsed.query and not query:
+        raise ValueError("Visible listing URL query is invalid")
+    if any(not key or (key.casefold() != "jk" and not _is_safe_tracking_key(key)) for key, _value in query):
+        raise ValueError("Visible listing URL contains an unsupported query key")
+
+    if normalized_platform == "linkedin":
+        match = _LINKEDIN_LISTING_PATH.fullmatch(parsed.path)
+        if match is None or any(key.casefold() == "jk" for key, _value in query):
+            raise ValueError("Visible listing URL must use the canonical LinkedIn listing route")
+        canonical_path = f"/jobs/view/{match.group('job_id')}"
+        canonical_query: list[tuple[str, str]] = []
+    else:
+        if parsed.path.rstrip("/") != "/viewjob":
+            raise ValueError("Visible listing URL must use the canonical Indeed listing route")
+        job_ids = [value for key, value in query if key.casefold() == "jk"]
+        if len(job_ids) != 1 or _INDEED_JOB_ID.fullmatch(job_ids[0]) is None:
+            raise ValueError("Visible Indeed listing URL must contain one canonical jk identity")
+        canonical_path = "/viewjob"
+        canonical_query = [("jk", job_ids[0])]
+
+    return urlunsplit(("https", hostname, canonical_path, urlencode(canonical_query), ""))
 
 
 def _validate_listing_url(url: str, platform: str) -> None:
@@ -147,16 +239,7 @@ def _validate_listing_url(url: str, platform: str) -> None:
     still agree with the declared source.
     """
 
-    normalized_platform = platform.casefold().strip()
-    if normalized_platform not in SUPPORTED_PLATFORMS:
-        raise ValueError(f"Unsupported listing platform: {platform!r}")
-    parsed: SplitResult = urlsplit(url)
-    hostname = (parsed.hostname or "").casefold().rstrip(".")
-    allowed_roots = _PLATFORM_HOSTS[normalized_platform]
-    if parsed.scheme.casefold() != "https" or not hostname:
-        raise ValueError("Visible listing URLs must use HTTPS")
-    if not any(hostname == root or hostname.endswith("." + root) for root in allowed_roots):
-        raise ValueError(f"Visible listing URL host is not an allowed {normalized_platform} host")
+    canonical_listing_url(url, platform)
 
 
 def load_search_profiles(path: str | Path | None = None) -> tuple[SearchProfile, ...]:

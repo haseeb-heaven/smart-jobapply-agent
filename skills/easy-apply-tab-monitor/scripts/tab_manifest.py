@@ -6,20 +6,77 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
-ALLOWED_ROOTS = ("linkedin.com", "indeed.com")
 PLATFORMS = {"linkedin", "indeed"}
 APPLY_PATHS = {"easy_apply", "apply_with_indeed", "external"}
 STATUSES = {"unknown", "submitted", "not_found"}
+_LINKEDIN_LISTING_PATH = re.compile(r"^/jobs/view/(?P<job_id>[A-Za-z0-9_-]+)/?$")
+_INDEED_JOB_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_TRACKING_QUERY_KEYS = frozenset(
+    {"campaign", "from", "mcid", "ref", "source", "trackingid", "trk"}
+)
 
 
-def _allowed_host(url: str) -> bool:
-    parsed = urlsplit(url)
+def _is_safe_tracking_key(key: str) -> bool:
+    normalized = key.casefold()
+    return normalized in _SAFE_TRACKING_QUERY_KEYS or normalized.startswith("utm_")
+
+
+def _canonical_listing(url: str) -> tuple[str, str]:
+    parsed = urlsplit(url.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("job URL must be a canonical credential-free listing URL") from None
     host = (parsed.hostname or "").casefold().rstrip(".")
-    return parsed.scheme == "https" and any(host == root or host.endswith("." + root) for root in ALLOWED_ROOTS)
+    if (
+        parsed.scheme.casefold() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+    ):
+        raise ValueError("job URL must be a canonical credential-free listing URL")
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if parsed.query and not query:
+        raise ValueError("job URL must be a canonical credential-free listing URL")
+    if any(not key or (key.casefold() != "jk" and not _is_safe_tracking_key(key)) for key, _value in query):
+        raise ValueError("job URL must be a canonical credential-free listing URL")
+    if host == "linkedin.com" or host.endswith(".linkedin.com"):
+        match = _LINKEDIN_LISTING_PATH.fullmatch(parsed.path)
+        if match is None or any(key.casefold() == "jk" for key, _value in query):
+            raise ValueError("job URL must be a canonical credential-free listing URL")
+        canonical = urlunsplit(("https", host, f"/jobs/view/{match.group('job_id')}", "", ""))
+        return "linkedin", canonical
+    if host == "indeed.com" or host.endswith(".indeed.com"):
+        if parsed.path.rstrip("/") != "/viewjob":
+            raise ValueError("job URL must be a canonical credential-free listing URL")
+        job_ids = [value for key, value in query if key.casefold() == "jk"]
+        if len(job_ids) != 1 or _INDEED_JOB_ID.fullmatch(job_ids[0]) is None:
+            raise ValueError("job URL must be a canonical credential-free listing URL")
+        canonical = urlunsplit(("https", host, "/viewjob", urlencode({"jk": job_ids[0]}), ""))
+        return "indeed", canonical
+    raise ValueError("job URL must be a canonical HTTPS LinkedIn or Indeed listing URL")
+
+
+def _listing_identity(canonical_url: str) -> tuple[str, str]:
+    parsed = urlsplit(canonical_url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host == "linkedin.com" or host.endswith(".linkedin.com"):
+        match = _LINKEDIN_LISTING_PATH.fullmatch(parsed.path)
+        if match is not None:
+            return "linkedin", match.group("job_id")
+    if host == "indeed.com" or host.endswith(".indeed.com"):
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        job_ids = [value for key, value in query if key.casefold() == "jk"]
+        if len(job_ids) == 1:
+            return "indeed", job_ids[0]
+    raise ValueError("job URL must be a canonical listing URL")
 
 
 def validate_jobs(payload: object) -> list[dict[str, Any]]:
@@ -28,7 +85,7 @@ def validate_jobs(payload: object) -> list[dict[str, Any]]:
     if not 1 <= len(payload) <= 5:
         raise ValueError("queue must contain between one and five jobs")
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for raw in payload:
         if not isinstance(raw, dict):
             raise ValueError("each job must be an object")
@@ -39,20 +96,18 @@ def validate_jobs(payload: object) -> list[dict[str, Any]]:
         if platform not in PLATFORMS:
             raise ValueError(f"platform must be one of {sorted(PLATFORMS)}")
         url = raw["url"].strip()
-        if not _allowed_host(url):
-            raise ValueError("job URL must be an HTTPS LinkedIn or Indeed URL")
-        host = urlsplit(url).hostname.casefold().rstrip(".") if urlsplit(url).hostname else ""
-        host_platform = "linkedin" if host == "linkedin.com" or host.endswith(".linkedin.com") else "indeed"
+        host_platform, url = _canonical_listing(url)
         if platform != host_platform:
             raise ValueError("platform must match the job URL host")
-        if url in seen:
+        identity = _listing_identity(url)
+        if identity in seen:
             raise ValueError("job URLs must be unique")
         if raw["apply_path"] not in APPLY_PATHS:
             raise ValueError(f"apply_path must be one of {sorted(APPLY_PATHS)}")
         status = raw.get("prior_application", "unknown")
         if not isinstance(status, str) or status not in STATUSES:
             raise ValueError(f"prior_application must be one of {sorted(STATUSES)}")
-        seen.add(url)
+        seen.add(identity)
         result.append(
             {
                 "title": raw["title"].strip(),
@@ -75,8 +130,16 @@ def create(input_path: Path, output_path: Path) -> None:
 def missing(manifest_path: Path, observed_urls: list[str]) -> list[str]:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     jobs = validate_jobs(payload.get("jobs") if isinstance(payload, dict) else None)
-    observed = set(observed_urls)
-    return [job["url"] for job in jobs if job["url"] not in observed]
+    observed: set[tuple[str, str]] = set()
+    for observed_url in observed_urls:
+        if not isinstance(observed_url, str):
+            raise ValueError("observed URLs must be strings")
+        try:
+            _platform, canonical = _canonical_listing(observed_url)
+        except ValueError:
+            continue
+        observed.add(_listing_identity(canonical))
+    return [job["url"] for job in jobs if _listing_identity(job["url"]) not in observed]
 
 
 def main() -> int:
@@ -92,7 +155,11 @@ def main() -> int:
     try:
         if args.command == "create":
             create(args.input, args.output)
-            print(json.dumps({"ok": True, "job_count": len(validate_jobs(json.loads(args.input.read_text(encoding="utf-8"))))}))
+            print(
+                json.dumps(
+                    {"ok": True, "job_count": len(validate_jobs(json.loads(args.input.read_text(encoding="utf-8"))))}
+                )
+            )
         else:
             print(json.dumps({"ok": True, "missing_urls": missing(args.manifest, args.observed_url)}))
     except (OSError, ValueError, json.JSONDecodeError) as error:

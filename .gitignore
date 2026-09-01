@@ -28,6 +28,7 @@ venv/
 
 # Local review artifacts.
 .lavish/
+.worktrees/
 .stow-notes.md
 
 # Candidate-supplied material and local job-search notes must never be staged.

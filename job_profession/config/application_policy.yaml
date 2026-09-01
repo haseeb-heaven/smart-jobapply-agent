@@ -1,24 +1,60 @@
-schema_version: 1
+schema_version: 2
 application_policy:
-  purpose: "Local, review-only preparation. It is not a browser or form automation tool."
-  allowed_automation:
-    - compose_truthful_job_specific_drafts
-    - prepare_local_field_suggestions
-    - record_missing_answer_prompts
-    - track_human_review_state
-  prohibited_automation:
-    - browse_or_navigate_to_application_sites
-    - depend_on_or_inspect_a_browser_session
-    - inspect_browser_credentials
+  purpose: "Local, evidence-first recommendation preparation under candidate control."
+  candidate_owns_all_application_actions: true
+  application_actions_performed_by_agents: 0
+
+  core_engine_boundary:
+    paths:
+      - job_profession/src
+      - job_profession/scripts
+    network_access: prohibited
+    browser_access: prohibited
+    allowed_automation:
+      - validate_candidate_intake_without_reading_documents
+      - activate_only_explicitly_user_confirmed_intake
+      - validate_closed_llm_listing_extraction
+      - evaluate_hard_eligibility_before_ranking
+      - score_only_eligible_jobs
+      - compose_evidence_grounded_explanations
+      - prepare_local_field_suggestions_for_candidate_review
+      - record_missing_answer_prompts
+      - plan_five_listing_smart_queue_replenishment
+      - mark_missing_tabs_as_awaiting_outcome
+      - track_candidate_recorded_review_state
+
+  bounded_tab_watcher:
+    authority: skills/easy-apply-tab-monitor/SKILL.md
+    runtime_boundary:
+      llm: bring_your_own
+      operating_system: any
+      browser: any_with_a_conforming_tab_bridge
+      compatibility_adapter: macos_chrome_applescript
+      external_bridge_protocol: argv_json
+    allowed_automation:
+      - list_current_tab_urls
+      - open_an_exact_approved_linkedin_or_indeed_listing_url_when_missing
+    prohibited_automation:
+      - inspect_page_content
+      - inspect_browser_credentials_or_cookies
+      - enter_an_application_flow
+      - close_or_replace_a_target_with_a_new_search_result
+      - click_any_page_control
+      - type_any_field_value
+      - upload_any_document
+
+  repository_wide_prohibited_automation:
+    - log_in_or_handle_authentication
+    - type_personal_data_or_application_field_values
+    - click_apply_easy_apply_continue_next_review_or_submit
     - upload_a_resume_or_attachment
-    - type_personal_data_or_field_values
-    - click_apply
-    - click_submit
+    - send_a_message
     - accept_attestations
-    - answer_unspecified_screening_questions
-    - complete_captcha
+    - infer_or_answer_unspecified_screening_questions
+    - solve_or_bypass_captcha
     - answer_eeo_or_sensitive_demographic_questions
-  human_review_required_for:
+
+  candidate_review_required_for:
     - company_name
     - job_title
     - every_claim
@@ -27,4 +63,5 @@ application_policy:
     - sponsorship
     - salary_or_compensation
     - notice_period_or_availability
+    - all_application_fields
     - all_screening_and_eeo_questions

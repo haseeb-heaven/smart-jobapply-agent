@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import fcntl
+import errno
 from hashlib import sha256
 import json
 import logging
@@ -24,6 +24,16 @@ import time
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
+try:  # POSIX advisory locks.
+    import fcntl as _fcntl
+except ModuleNotFoundError:  # pragma: no cover - exercised in an isolated child
+    _fcntl = None
+
+try:  # Windows advisory locks.
+    import msvcrt as _msvcrt
+except ModuleNotFoundError:  # pragma: no cover - platform dependent
+    _msvcrt = None
+
 from .matcher import matcher_policy_revision, score_job
 from .models import CandidateProfile, JobListing
 from .normalize import listing_fingerprint, normalize_listing
@@ -35,7 +45,175 @@ MINIMUM_RECOMMENDED_SCORE = 85
 DEFAULT_LOCK_WAIT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.05
 _LOCK_FILE_NAME = ".job_discovery_scheduler.lock"
-_PROFILE_REVISION_SCHEMA_VERSION = 1
+_PROFILE_REVISION_SCHEMA_VERSION = 2
+_PORTABLE_CLAIM_STALE_SECONDS = 24 * 60 * 60
+_INCOMPLETE_CLAIM_GRACE_SECONDS = 1.0
+_MAX_PORTABLE_CLAIM_BYTES = 16_384
+
+
+def _process_is_running(pid: object) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno not in {errno.ESRCH, errno.EINVAL}
+    return True
+
+
+def _portable_claim_path(lock_path: Path) -> Path:
+    return lock_path.with_name(lock_path.name + ".claim")
+
+
+def _portable_recovery_path(lock_path: Path) -> Path:
+    return lock_path.with_name(lock_path.name + ".claim.recovery")
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableClaimSnapshot:
+    claim: Mapping[str, Any] | None
+    device: int
+    inode: int
+    modified_ns: int
+    size: int
+    digest: str
+
+    @property
+    def identity(self) -> tuple[int, int, int, int, str]:
+        return (self.device, self.inode, self.modified_ns, self.size, self.digest)
+
+
+def _read_portable_claim_snapshot(path: Path) -> _PortableClaimSnapshot | None:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_PORTABLE_CLAIM_BYTES + 1)
+            metadata = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    value: object = None
+    if len(raw) <= _MAX_PORTABLE_CLAIM_BYTES:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    return _PortableClaimSnapshot(
+        claim=value if isinstance(value, Mapping) else None,
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        modified_ns=int(metadata.st_mtime_ns),
+        size=int(metadata.st_size),
+        digest=sha256(raw).hexdigest(),
+    )
+
+
+def _portable_claim_is_stale(
+    path: Path, *, snapshot: _PortableClaimSnapshot | None = None
+) -> bool:
+    snapshot = snapshot or _read_portable_claim_snapshot(path)
+    if snapshot is None:
+        return True
+    claim = snapshot.claim
+    age = max(0.0, time.time() - (snapshot.modified_ns / 1_000_000_000))
+    if claim is None:
+        return age >= _INCOMPLETE_CLAIM_GRACE_SECONDS
+    acquired_at = claim.get("acquired_at")
+    if isinstance(acquired_at, bool) or not isinstance(acquired_at, (int, float)):
+        return age >= _INCOMPLETE_CLAIM_GRACE_SECONDS
+    return not _process_is_running(claim.get("pid")) or time.time() - acquired_at >= _PORTABLE_CLAIM_STALE_SECONDS
+
+
+def _unlink_portable_claim_if_unchanged(path: Path, expected: _PortableClaimSnapshot) -> bool:
+    """Remove only the exact stale claim previously inspected.
+
+    The inode, metadata, and content digest are all re-read immediately before
+    removal. A contender that replaced or refreshed the path therefore cannot
+    have its live claim removed by stale-recovery work based on an older read.
+    """
+
+    current = _read_portable_claim_snapshot(path)
+    if current is None or current.identity != expected.identity:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _try_portable_claim(lock_path: Path, token: str) -> bool:
+    claim_path = _portable_claim_path(lock_path)
+    recovery_path = _portable_recovery_path(lock_path)
+    recovery_snapshot = _read_portable_claim_snapshot(recovery_path)
+    if recovery_snapshot is not None:
+        if _portable_claim_is_stale(recovery_path, snapshot=recovery_snapshot):
+            _unlink_portable_claim_if_unchanged(recovery_path, recovery_snapshot)
+        return False
+    payload = json.dumps(
+        {"schema_version": 1, "pid": os.getpid(), "token": token, "acquired_at": time.time()},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        snapshot = _read_portable_claim_snapshot(claim_path)
+        if snapshot is not None and _portable_claim_is_stale(claim_path, snapshot=snapshot):
+            recovery_token = str(uuid4())
+            recovery_payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "pid": os.getpid(),
+                    "token": recovery_token,
+                    "acquired_at": time.time(),
+                    "expected_claim_digest": snapshot.digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            try:
+                recovery_descriptor = os.open(
+                    recovery_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+            except FileExistsError:
+                return False
+            try:
+                os.write(recovery_descriptor, recovery_payload)
+                os.fsync(recovery_descriptor)
+            finally:
+                os.close(recovery_descriptor)
+            try:
+                # Every conforming claimant observes the recovery marker before
+                # creating a claim. Only this elected recovery owner may remove
+                # the stale identity, closing the inspect/unlink replacement race.
+                _unlink_portable_claim_if_unchanged(claim_path, snapshot)
+            finally:
+                marker = _read_portable_claim_snapshot(recovery_path)
+                if marker is not None and marker.claim is not None and marker.claim.get("token") == recovery_token:
+                    _unlink_portable_claim_if_unchanged(recovery_path, marker)
+        return False
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    except OSError:
+        try:
+            claim_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def _release_portable_claim(lock_path: Path, token: str) -> None:
+    claim_path = _portable_claim_path(lock_path)
+    snapshot = _read_portable_claim_snapshot(claim_path)
+    if snapshot is not None and snapshot.claim is not None and snapshot.claim.get("token") == token:
+        _unlink_portable_claim_if_unchanged(claim_path, snapshot)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +248,10 @@ class DiscoveryRunResult:
 def candidate_profile_revision(profile: CandidateProfile, *, rules_path: str | Path | None = None) -> str:
     """Return a deterministic hash of only safe matching evidence.
 
-    Contact details, compensation, location, work authorization, and autofill
-    values are intentionally absent.  The selected fields are the evidence and
-    role constraints that can change the discovery decision.
+    Contact details, compensation, and autofill values are intentionally
+    absent. The selected fields are approved evidence and normalized
+    eligibility constraints, including work-authorization classifications,
+    that can change the discovery decision.
     """
 
     def normalized(values: Iterable[str]) -> list[str]:
@@ -89,9 +268,14 @@ def candidate_profile_revision(profile: CandidateProfile, *, rules_path: str | P
         "professional_skills": normalized(profile.professional_skills),
         "personal_open_source_skills": normalized(profile.personal_open_source_skills),
         "learning_or_exposure_skills": normalized(profile.learning_or_exposure_skills),
+        "years_experience": profile.years_experience,
         "role_targets": normalized(profile.role_targets),
         "excluded_title_terms": normalized(profile.excluded_title_terms),
         "mandatory_excluded_requirements": normalized(profile.mandatory_excluded_requirements),
+        "location_preferences": normalized(profile.location_preferences),
+        "work_mode_preferences": normalized(profile.work_mode_preferences),
+        "employment_type_preferences": normalized(profile.employment_type_preferences),
+        "work_authorizations": normalized(profile.work_authorizations),
         "evidence_by_skill": evidence,
         "matcher_policy_revision": matcher_policy_revision(str(rules_path) if rules_path is not None else None),
     }
@@ -252,9 +436,9 @@ class JobDiscoveryScheduler:
         for search in self.search_profiles:
             url = build_search_url(search)
             try:
-                payloads = adapter.read_visible_listings(url)
-            except Exception as exc:  # The run remains an auditable no-action result.
-                errors.append(f"{search.platform} adapter read failed: {type(exc).__name__}: {exc}")
+                payloads = tuple(adapter.read_visible_listings(url))
+            except Exception as error:  # The run remains an auditable no-action result.
+                errors.append(f"{search.platform} adapter read failed: {type(error).__name__}")
                 continue
             for payload in payloads:
                 payloads_seen += 1
@@ -265,9 +449,9 @@ class JobDiscoveryScheduler:
                 try:
                     listing = listing_from_visible_payload(payload, platform=search.platform)
                     listing = normalize_listing(listing)
-                except (TypeError, ValueError) as exc:
+                except (TypeError, ValueError) as error:
                     malformed += 1
-                    errors.append(f"{search.platform} visible payload rejected: {exc}")
+                    errors.append(f"{search.platform} visible payload rejected: {type(error).__name__}")
                     continue
                 fingerprint = listing_fingerprint(listing.platform, listing.url, listing.title, listing.company)
                 if fingerprint in known or fingerprint in run_seen:
@@ -329,39 +513,70 @@ class JobDiscoveryScheduler:
 
     @contextmanager
     def _exclusive_run_lock(self) -> Iterator[None]:
-        """Serialize schedulers sharing any artifact with bounded flocks.
+        """Serialize schedulers sharing any artifact with bounded locks.
 
-        ``flock`` ownership belongs to the open file descriptor, not the lock
-        file's presence.  A process crash therefore releases the advisory lock
-        automatically; a left-behind lock file remains recoverable.  A live
-        competing process waits only for the configured bounded interval.  All
-        state, recommendation-export, and audit-log paths are locked in stable
-        order, so sharing any one artifact serializes the complete run.
+        POSIX uses ``flock`` and Windows uses ``msvcrt.locking``. Environments
+        without either API use an atomic ownership claim with PID and bounded
+        stale-claim recovery; they never fall back to an unlocked run. Lock
+        files are durable sentinels, while actual ownership is crash-recoverable.
+        All artifact paths are acquired in stable order.
         """
 
         deadline = time.monotonic() + self._lock_wait_seconds
-        handles: list[tuple[Path, Any]] = []
+        handles: list[tuple[Path, Any, str, str | None]] = []
         try:
             for lock_path in self._lock_paths:
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 handle = lock_path.open("a+", encoding="utf-8")
-                handles.append((lock_path, handle))
-                while True:
-                    try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
+                backend = "fcntl" if _fcntl is not None else "msvcrt" if _msvcrt is not None else "claim"
+                token = str(uuid4()) if backend == "claim" else None
+                try:
+                    while True:
+                        blocked = False
+                        try:
+                            if backend == "fcntl":
+                                assert _fcntl is not None
+                                _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                            elif backend == "msvcrt":
+                                assert _msvcrt is not None
+                                handle.seek(0)
+                                if handle.read(1) == "":
+                                    handle.write("\0")
+                                    handle.flush()
+                                handle.seek(0)
+                                _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+                            else:
+                                assert token is not None
+                                blocked = not _try_portable_claim(lock_path, token)
+                        except BlockingIOError:
+                            blocked = True
+                        except OSError:
+                            if backend != "msvcrt":
+                                raise
+                            blocked = True
+                        if not blocked:
+                            break
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError(
                                 f"Timed out waiting {self._lock_wait_seconds:g}s for scheduler locks"
                             )
                         time.sleep(min(_LOCK_POLL_SECONDS, remaining))
+                except Exception:
+                    handle.close()
+                    raise
+                handles.append((lock_path, handle, backend, token))
             yield
         finally:
-            for _lock_path, handle in reversed(handles):
+            for lock_path, handle, backend, token in reversed(handles):
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    if backend == "fcntl" and _fcntl is not None:
+                        _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+                    elif backend == "msvcrt" and _msvcrt is not None:
+                        handle.seek(0)
+                        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+                    elif backend == "claim" and token is not None:
+                        _release_portable_claim(lock_path, token)
                 finally:
                     handle.close()
 

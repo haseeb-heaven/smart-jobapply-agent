@@ -1,42 +1,37 @@
-name: Tests
+name: Agent validation gate
 
 on:
   push:
-    branches: [main, develop, feature]
+    branches:
+      - main
+      - develop
+      - "feature/**"
   pull_request:
-    branches: [main, develop, feature]
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install test dependencies
+          cache: pip
+      - name: Install agent validation dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
-      - name: Run tests
-        run: python -m pytest
-      - name: Lint Python
-        run: ruff check job_profession/src job_profession/scripts tests
-      - name: Enforce watcher coverage
-        run: >-
-          python -m coverage run --branch
-          --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py'
-          -m pytest tests/test_chrome_tab_watcher.py &&
-          python -m coverage report
-          --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py'
-          --fail-under=100
-      - name: Compile Python sources
-        run: python -m compileall -q job_profession/src job_profession/scripts
-
-  shellcheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Lint shell entry points
-        run: shellcheck job_profession/scripts/cron_wrapper.sh
+      - name: Install shell analysis dependency
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Run the authoritative agent validation gate
+        run: ./scripts/verify.sh

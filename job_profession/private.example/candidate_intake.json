@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "documents": [
+    {
+      "document_id": "resume-primary",
+      "path": "documents/resume.pdf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "media_type": "application/pdf",
+      "review_state": "untrusted"
+    }
+  ],
+  "approved_facts": {},
+  "unknown_fields": [
+    "identity.contact",
+    "experience.roles_and_dates",
+    "experience.achievements_and_metrics",
+    "education",
+    "certifications",
+    "projects",
+    "open_source",
+    "volunteer_work",
+    "languages",
+    "skills.professional",
+    "skills.personal_open_source",
+    "skills.learning_or_exposure",
+    "targets.roles_and_levels",
+    "targets.locations_and_work_modes",
+    "targets.employment_types_and_industries",
+    "targets.exclusions",
+    "work_authorization",
+    "sponsorship",
+    "compensation",
+    "availability",
+    "eeo"
+  ],
+  "contradictions": [],
+  "pending_facts": [
+    {
+      "field": "candidate_profile",
+      "status": "VERIFY",
+      "question": "Review the grouped unknown fields and approve only evidence-supported facts.",
+      "reason": "The agent must not activate inferred or defaulted candidate facts."
+    }
+  ]
+}

@@ -9,7 +9,7 @@ import re
 from typing import Any, Mapping
 
 from .models import CandidateProfile, JobListing, MatchResult
-from .normalize import normalize_listing
+from .normalize import normalize_listing, normalize_work_mode
 
 
 _DEFAULT_CONFIG = {
@@ -53,7 +53,12 @@ _REQUIRED_TECHNOLOGY_PATTERNS = {
     "hadoop": r"\bhadoop\b",
     "redis": r"\bredis\b",
     "elasticsearch": r"\belasticsearch\b",
-    "react": r"\breact(?:\.js|js)\b|\breact\s+(?:framework|library)\b",
+    "react": (
+        r"\breact(?:\.js|js)\b|\breact\s+(?:framework|library)\b|"
+        r"(?<=must have )\breact\b|(?<=requires )\breact\b|"
+        r"\breact\b(?=\s+(?:(?:experience|skills?|knowledge)\b|"
+        r"(?:is|are)\s+(?:required|mandatory|needed)\b))"
+    ),
     "angular": r"\bangular\b",
     "typescript": r"\btypescript\b",
     "pytorch": r"\bpytorch\b",
@@ -82,7 +87,7 @@ _NON_MID_LEVEL_TITLE_PATTERNS = (
 _JOB_LEVEL_SUFFIX_PATTERN = re.compile(
     r"\b(?:sde|(?:[\w+.#/-]+\s+){0,4}(?:engineer|developer))\s*"
     r"(?:(?:[-–—,#/:;.]|\(|\[)\s*)*(?:level\b\s*)?(?:(?:[-–—,#/:;.]|\(|\[)\s*)*"
-    r"(?P<suffix>l?0*[1-9]\d*|[mdclxvi]+)\b"
+    r"(?P<suffix>l?0*[1-9]\d*|[mdclxvi]+)\b(?!\s*(?:years?|yrs?)\b)"
 )
 _VALID_ROMAN_NUMERAL = re.compile(
     r"m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
@@ -95,6 +100,25 @@ _ROLE_TARGET_TITLE_FORMS = {
     "api integration developer": ("api integration developer", "api integration engineer"),
     "ai application developer": ("ai application developer", "llm application developer"),
 }
+_EXPERIENCE_YEARS_PATTERN = re.compile(
+    r"\b(?P<minimum>\d{1,2})\s*"
+    r"(?:(?P<range>[-–—]|to)\s*(?P<maximum>\d{1,2})\s*)?"
+    r"(?P<plus>\+)?\s*(?:years?|yrs?)\b"
+)
+_EXPERIENCE_MANDATORY_CUE = re.compile(
+    r"\b(?:at\s+least|minimum(?:\s+of)?|must(?:\s+have)?|required|mandatory|"
+    r"requires?|need(?:ed)?|must[-\s]+have)\b"
+)
+_EXPERIENCE_OPTIONAL_CUE = re.compile(
+    r"\b(?:preferred|desirable|nice[-\s]+to[-\s]+have|optional|a\s+plus)\b"
+)
+_EXPERIENCE_NEGATED_CUE = re.compile(
+    r"\b(?:not|never)\s+(?:required|mandatory|needed)\b"
+)
+_MAXIMUM_ONLY_EXPERIENCE_PATTERN = re.compile(
+    r"\b(?:no\s+more\s+than|up\s+to|maximum(?:\s+of)?)\s+"
+    r"(?P<maximum>\d{1,2})\s*(?:years?|yrs?)\b"
+)
 
 
 def _parse_scalar(value: str) -> Any:
@@ -252,6 +276,78 @@ def _has_professional_evidence_for_technology(profile: CandidateProfile, technol
     return False
 
 
+def _technology_requirement_is_negated(clause: str, start: int, end: int) -> bool:
+    """Return whether a nearby requirement cue explicitly negates a technology."""
+
+    before = clause[:start]
+    after = clause[end:]
+    words_without_contrast = r"(?:(?!\s+(?:but|however|although|though|yet)\b)\s+[\w/+.#-]+)"
+    negated_after = re.match(
+        rf"^{words_without_contrast}{{0,5}}\s+"
+        r"(?:(?:is|are|was|were|will\s+be)\s+)?"
+        r"(?:not|never|no\s+longer)\s+(?:required|mandatory|needed)\b",
+        after,
+    )
+    if negated_after:
+        return True
+
+    no_prefix = re.search(rf"\bno{words_without_contrast}{{0,4}}\s*$", before)
+    required_after = re.match(
+        rf"^{words_without_contrast}{{0,5}}\s+"
+        r"(?:(?:is|are|was|were)\s+)?(?:required|mandatory|needed)\b",
+        after,
+    )
+    if no_prefix and required_after:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:not|never)\s+(?:required|mandatory|needed)\s+"
+            r"(?:to\s+(?:know|use|have)\s+|(?:knowledge|experience|skills?)\s+(?:of|with|in)\s+)?$",
+            before,
+        )
+    )
+
+
+def _technology_requirement_is_optional(clause: str, start: int, end: int) -> bool:
+    """Return whether the technology mention has a direct optional qualifier."""
+
+    before = clause[max(0, start - 90) : start]
+    after = clause[end : min(len(clause), end + 90)]
+    optional = r"(?:preferred|optional|desirable|nice[-\s]+to[-\s]+have|a\s+plus)"
+    optional_before = re.search(
+        rf"\b{optional}\b(?:\s+(?:experience|skills?|knowledge))?"
+        r"(?:\s+(?:with|in|of))?\s*$",
+        before,
+    )
+    optional_after = re.match(
+        rf"^(?:\s+(?:experience|skills?|knowledge))?"
+        rf"(?:\s+(?:is|are))?\s+{optional}\b",
+        after,
+    )
+    return bool(optional_before or optional_after)
+
+
+def _technology_requirement_is_explicit(clause: str, start: int, end: int) -> bool:
+    """Bind a mandatory cue to one nearby controlled technology mention."""
+
+    before = clause[max(0, start - 120) : start]
+    after = clause[end : min(len(clause), end + 120)]
+    contrast = r"(?:but|however|although|though|yet)"
+    mandatory_before = re.search(
+        rf"\b(?:must(?:\s+have)?|required|mandatory|minimum(?:\s+of)?|"
+        rf"need(?:ed)?|at\s+least|\d+\+?\s+years?)\b"
+        rf"(?:(?!\b{contrast}\b).){{0,90}}$",
+        before,
+    )
+    mandatory_after = re.match(
+        rf"^(?:(?!\b{contrast}\b).){{0,90}}\b"
+        r"(?:(?:is|are|was|were)\s+)?(?:required|mandatory|needed)\b",
+        after,
+    )
+    return bool(mandatory_before or mandatory_after)
+
+
 def _unsupported_explicit_mandatory_technologies(text: str, profile: CandidateProfile) -> list[str]:
     """Find named technologies in clear requirement clauses lacking professional evidence.
 
@@ -269,7 +365,16 @@ def _unsupported_explicit_mandatory_technologies(text: str, profile: CandidatePr
         if not requirement_cue.search(clause):
             continue
         for technology, pattern in _REQUIRED_TECHNOLOGY_PATTERNS.items():
-            if re.search(pattern, clause) and not _has_professional_evidence_for_technology(profile, technology):
+            technology_match = re.search(pattern, clause)
+            if (
+                technology_match
+                and _technology_requirement_is_explicit(
+                    clause, technology_match.start(), technology_match.end()
+                )
+                and not _technology_requirement_is_negated(clause, technology_match.start(), technology_match.end())
+                and not _technology_requirement_is_optional(clause, technology_match.start(), technology_match.end())
+                and not _has_professional_evidence_for_technology(profile, technology)
+            ):
                 unsupported.add(technology)
     return sorted(unsupported)
 
@@ -288,11 +393,220 @@ def _mandatory_exclusion_reasons(text: str, profile: CandidateProfile) -> list[s
             and _requires_ml_model_training_or_deployment_ownership(text)
         ):
             reasons.append("mandatory ML model training/deployment ownership is excluded")
-        if "unsupported technology" in normalized_requirement and "approved evidence" in normalized_requirement:
-            unsupported = _unsupported_explicit_mandatory_technologies(text, profile)
-            if unsupported:
-                reasons.append("mandatory unsupported technology requirement: " + ", ".join(unsupported))
     return list(dict.fromkeys(reasons))
+
+
+def _mandatory_experience_bounds(text: str) -> list[tuple[int, int | None]]:
+    """Extract explicit, non-negated mandatory experience bounds.
+
+    A bare ``N years`` mention is ambiguous and therefore remains unknown. A
+    plus suffix or range establishes a lower bound. A range's upper bound is
+    restrictive only when an explicit mandatory cue is present. Optional
+    wording prevents the mention becoming a hard eligibility rule.
+    """
+
+    bounds: list[tuple[int, int | None]] = []
+    for clause in re.split(r"[.!?;\n]+", text):
+        optional_clause = bool(_EXPERIENCE_OPTIONAL_CUE.search(clause))
+        if not optional_clause:
+            bounds.extend(
+                (0, int(match.group("maximum")))
+                for match in _MAXIMUM_ONLY_EXPERIENCE_PATTERN.finditer(clause)
+            )
+        for match in _EXPERIENCE_YEARS_PATTERN.finditer(clause):
+            context_start = max(0, match.start() - 80)
+            context_end = min(len(clause), match.end() + 100)
+            context = clause[context_start:context_end]
+            if _EXPERIENCE_NEGATED_CUE.search(context):
+                continue
+            has_mandatory_cue = bool(_EXPERIENCE_MANDATORY_CUE.search(context))
+            if _EXPERIENCE_OPTIONAL_CUE.search(context) and not has_mandatory_cue:
+                continue
+            mandatory = bool(
+                match.group("plus")
+                or match.group("range")
+                or has_mandatory_cue
+            )
+            if not mandatory:
+                continue
+            maximum = (
+                int(match.group("maximum"))
+                if match.group("maximum") is not None and has_mandatory_cue
+                else None
+            )
+            bounds.append((int(match.group("minimum")), maximum))
+    return bounds
+
+
+def _normalize_employment_type(value: str) -> str:
+    normalized = re.sub(r"[\s-]+", "_", value.casefold().strip())
+    aliases = {
+        "fulltime": "full_time",
+        "parttime": "part_time",
+        "fixed_term": "temporary",
+        "permanent": "full_time",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _authorization_matches(subject: str, approved_authorizations: tuple[str, ...]) -> bool:
+    normalized_subject = " ".join(subject.casefold().split())
+    return any(
+        _contains_term(normalized_subject, " ".join(value.casefold().split()))
+        or _contains_term(" ".join(value.casefold().split()), normalized_subject)
+        for value in approved_authorizations
+        if value.strip()
+    )
+
+
+def _structured_requirement_eligibility(
+    profile: CandidateProfile, job: JobListing
+) -> tuple[list[str], list[str]]:
+    """Recompute mandatory requirement eligibility without trusting LLM evaluation."""
+
+    rejections: list[str] = []
+    unknowns: list[str] = []
+    for requirement in job.requirements:
+        if requirement.importance != "mandatory":
+            continue
+        identifier = requirement.requirement_id
+        if requirement.kind == "skill":
+            if not requirement.subject or not _has_professional_evidence_for_technology(
+                profile, requirement.subject
+            ):
+                rejections.append(
+                    f"mandatory structured skill lacks approved professional evidence: "
+                    f"{requirement.subject or identifier}"
+                )
+        elif requirement.kind == "experience":
+            if requirement.minimum_years is None:
+                unknowns.append(
+                    f"mandatory experience requirement lacks a deterministic bound: {identifier}"
+                )
+            elif profile.years_experience is None:
+                unknowns.append(
+                    f"approved candidate experience is unknown for mandatory requirement: {identifier}"
+                )
+            elif profile.years_experience < requirement.minimum_years:
+                rejections.append(
+                    f"mandatory structured experience requirement ({requirement.minimum_years:g} years) "
+                    f"exceeds approved candidate experience ({profile.years_experience} years)"
+                )
+        elif requirement.kind == "authorization":
+            if not profile.work_authorizations:
+                unknowns.append(
+                    f"approved work authorization is unknown for mandatory requirement: {identifier}"
+                )
+            elif not requirement.subject or not _authorization_matches(
+                requirement.subject, profile.work_authorizations
+            ):
+                rejections.append(
+                    f"mandatory work authorization requirement is not supported: "
+                    f"{requirement.subject or identifier}"
+                )
+        elif requirement.kind == "employment_type":
+            # The validated top-level employment type is gated separately.
+            continue
+        elif requirement.kind == "responsibility":
+            requirement_text = f"{requirement.text} {requirement.source_evidence}".casefold()
+            has_supported_skill = any(
+                profile.evidence_label_for(skill) == "professional"
+                and _matches_skill(skill, requirement_text)
+                for skill in profile.professional_skills
+            )
+            has_supported_responsibility = any(
+                re.search(pattern, requirement_text)
+                for _name, pattern in _RESPONSIBILITY_PATTERNS
+            )
+            if not has_supported_skill or not has_supported_responsibility:
+                unknowns.append(
+                    f"mandatory responsibility requirement needs candidate-approved evidence: {identifier}"
+                )
+        else:
+            unknowns.append(
+                f"mandatory {requirement.kind} requirement needs candidate-approved evidence: {identifier}"
+            )
+    return list(dict.fromkeys(rejections)), list(dict.fromkeys(unknowns))
+
+
+def _experience_rejection_reasons(text: str, profile: CandidateProfile) -> list[str]:
+    """Reject only requirements contradicted by approved experience evidence."""
+
+    required_bounds = _mandatory_experience_bounds(text)
+    if not required_bounds or profile.years_experience is None:
+        return []
+    required_years = max(minimum for minimum, _maximum in required_bounds)
+    if required_years <= profile.years_experience:
+        maximums = [maximum for _minimum, maximum in required_bounds if maximum is not None]
+        if not maximums or profile.years_experience <= min(maximums):
+            return []
+        maximum = min(maximums)
+        return [
+            f"approved candidate experience ({profile.years_experience} years) exceeds "
+            f"mandatory experience maximum ({maximum} years)"
+        ]
+    return [
+        f"mandatory experience requirement ({required_years} years) exceeds "
+        f"approved candidate experience ({profile.years_experience} years)"
+    ]
+
+
+def _experience_uncertainty_gaps(text: str, profile: CandidateProfile) -> list[str]:
+    """Expose mandatory experience when the approved candidate total is unknown."""
+
+    if profile.years_experience is None and _mandatory_experience_bounds(text):
+        return ["approved candidate experience is unknown for a mandatory experience requirement"]
+    return []
+
+
+def _location_matches_preferences(location: str, preferences: tuple[str, ...]) -> bool:
+    """Compare a visible location only with explicitly approved location terms."""
+
+    return any(
+        _contains_term(location.casefold(), preference.casefold().strip())
+        for preference in preferences
+        if preference.strip()
+    )
+
+
+def _preference_eligibility_gaps(
+    profile: CandidateProfile, job: JobListing
+) -> tuple[list[str], list[str]]:
+    """Separate visible preference contradictions from missing listing facts."""
+
+    contradictions: list[str] = []
+    unknowns: list[str] = []
+    approved_modes = {normalize_work_mode(mode) for mode in profile.work_mode_preferences if mode.strip()}
+    visible_mode = job.work_mode
+    if approved_modes:
+        if not visible_mode:
+            unknowns.append("work mode is not visible for restrictive approved preferences")
+        elif visible_mode not in approved_modes:
+            contradictions.append("work mode is outside approved preferences")
+
+    location_bound_mode = visible_mode in {"on-site", "hybrid"}
+    if profile.location_preferences:
+        if not job.location:
+            unknowns.append("location is not visible for restrictive approved preferences")
+        elif location_bound_mode and not _location_matches_preferences(
+            job.location, profile.location_preferences
+        ):
+            contradictions.append("location is outside approved preferences")
+
+    approved_employment_types = {
+        _normalize_employment_type(value)
+        for value in profile.employment_type_preferences
+        if value.strip()
+    }
+    if approved_employment_types:
+        visible_employment_type = _normalize_employment_type(job.employment_type)
+        if not visible_employment_type:
+            unknowns.append(
+                "employment type is not visible for restrictive approved preferences"
+            )
+        elif visible_employment_type not in approved_employment_types:
+            contradictions.append("employment type is outside approved preferences")
+    return contradictions, unknowns
 
 
 def _is_backend_dominant(text: str, configured_responsibilities: tuple[str, ...] = ()) -> bool:
@@ -378,8 +692,22 @@ def score_job(profile: CandidateProfile, job: JobListing, *, rules_path: str | N
     )
     reasons.extend(_ownership_rejection_reasons(text))
     reasons.extend(_mandatory_exclusion_reasons(text, profile))
+    unsupported_technologies = _unsupported_explicit_mandatory_technologies(text, profile)
+    if unsupported_technologies:
+        reasons.append(
+            "mandatory unsupported technology requirement: "
+            + ", ".join(unsupported_technologies)
+        )
+    reasons.extend(_experience_rejection_reasons(text, profile))
+    structured_rejections, structured_unknowns = _structured_requirement_eligibility(
+        profile, normalized
+    )
+    reasons.extend(structured_rejections)
     if _requires_production_genai_ownership(text):
         reasons.append("mandatory production GenAI ownership is not approved professional evidence")
+    eligibility_gaps, eligibility_unknowns = _preference_eligibility_gaps(profile, normalized)
+    eligibility_unknowns.extend(_experience_uncertainty_gaps(text, profile))
+    eligibility_unknowns.extend(structured_unknowns)
     full_stack_terms = tuple(str(term) for term in rules.get("full_stack_terms", ()) if str(term).strip())
     full_stack = any(_contains_term(title, term) for term in full_stack_terms)
     configured_backend_responsibilities = tuple(
@@ -388,8 +716,8 @@ def score_job(profile: CandidateProfile, job: JobListing, *, rules_path: str | N
     if full_stack and not _is_backend_dominant(text, configured_backend_responsibilities):
         gap = "general full-stack role lacks backend-dominant responsibilities"
         return MatchResult(0, "reject", reasons or ["not an implementation-focused backend role"], [gap])
-    if reasons:
-        return MatchResult(0, "reject", reasons, [])
+    if reasons or eligibility_gaps:
+        return MatchResult(0, "reject", reasons, eligibility_gaps)
 
     score = 0
     positive: list[str] = []
@@ -433,13 +761,15 @@ def score_job(profile: CandidateProfile, job: JobListing, *, rules_path: str | N
         gaps.append("listing does not show maintain/extend, testing, database, background-job, or integration work")
 
     if profile.location_preferences and normalized.location:
-        if any(preference.casefold() in normalized.location.casefold() for preference in profile.location_preferences):
+        if _location_matches_preferences(normalized.location, profile.location_preferences):
             score += int(weights["location_and_work_mode_fit"])
             positive.append("location matches approved preference")
         else:
             gaps.append("location is outside approved preferences")
     elif profile.work_mode_preferences and normalized.work_mode:
-        if normalized.work_mode in {mode.casefold() for mode in profile.work_mode_preferences}:
+        if normalized.work_mode in {
+            normalize_work_mode(mode) for mode in profile.work_mode_preferences if mode.strip()
+        }:
             score += int(weights["location_and_work_mode_fit"])
             positive.append("work mode matches approved preference")
         else:
@@ -450,7 +780,10 @@ def score_job(profile: CandidateProfile, job: JobListing, *, rules_path: str | N
 
     direct_professional_evidence = bool(professional_matches)
     hard_gaps = bool(gaps and (not direct_professional_evidence or not responsibility_matches))
-    if score >= int(thresholds["recommended"]) and direct_professional_evidence and not hard_gaps:
+    if eligibility_unknowns:
+        gaps.extend(eligibility_unknowns)
+        decision = "review"
+    elif score >= int(thresholds["recommended"]) and direct_professional_evidence and not hard_gaps:
         decision = "recommended"
     elif score >= int(thresholds["review"]):
         decision = "review"

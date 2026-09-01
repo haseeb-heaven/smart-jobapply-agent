@@ -86,8 +86,19 @@ spawn_fix_agent() {
     "$@" &
     local child=$! watcher rc
     (
-      trap 'exit 0' TERM INT
-      sleep "$seconds"
+      timeout_timer=""
+      cancel_timeout_timer() {
+        if [[ -n "$timeout_timer" ]]; then
+          kill -TERM "$timeout_timer" 2>/dev/null || true
+          wait "$timeout_timer" 2>/dev/null || true
+        fi
+        exit 0
+      }
+      trap cancel_timeout_timer TERM INT
+      sleep "$seconds" &
+      timeout_timer=$!
+      wait "$timeout_timer" || exit 0
+      trap '' TERM INT
       kill -TERM "$child" 2>/dev/null || true
       pkill -TERM -P "$child" 2>/dev/null || true
       sleep 1
@@ -97,7 +108,6 @@ spawn_fix_agent() {
     watcher=$!
     if wait "$child"; then rc=0; else rc=$?; fi
     kill -TERM "$watcher" 2>/dev/null || true
-    pkill -TERM -P "$watcher" 2>/dev/null || true
     wait "$watcher" 2>/dev/null || true
     return "$rc"
   }

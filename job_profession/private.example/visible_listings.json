@@ -1,0 +1,17 @@
+{
+  "pages": {
+    "https://www.linkedin.com/jobs/search/?keywords=Python+Backend+Developer&f_E=3": [
+      {
+        "title": "Python Backend Developer",
+        "company": "Example Company",
+        "url": "https://www.linkedin.com/jobs/view/0000000000/",
+        "description": "Redacted visible listing description with Python, API, and testing requirements.",
+        "location": "Example City",
+        "work_mode": "hybrid",
+        "posted_at": "2026-01-01",
+        "discovered_at": "2026-01-01T00:00:00Z",
+        "source_job_id": "0000000000"
+      }
+    ]
+  }
+}

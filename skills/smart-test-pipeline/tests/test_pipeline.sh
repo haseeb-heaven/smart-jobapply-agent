@@ -22,6 +22,7 @@ pass() { echo "ok - $1"; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "$3"; }
 assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "$3"; }
 assert_regex() { grep -Eq -- "$2" "$1" || fail "$3"; }
+monotonic_millis() { python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'; }
 
 git -C "$TMP_ROOT" init -q repo
 git -C "$TMP_ROOT/repo" config user.email test@example.invalid
@@ -79,6 +80,29 @@ for agent in pi claude codex opencode; do
   assert_not_contains "$CAPTURE_FILE" "--file" "$agent adapter uses the removed generic --file flag"
 done
 pass "all agent adapters use non-generic prompt syntax and no GitHub credentials"
+
+PROMPT_TIMEOUT_SECONDS=4
+PROMPT_RETURN_LIMIT_MILLIS=1500
+prompt_start=$(monotonic_millis)
+AGENT_TIMEOUT=$PROMPT_TIMEOUT_SECONDS spawn_fix_agent \
+  "$TMP_ROOT/repo" "$TMP_ROOT/findings.json" codex "$TMP_ROOT/home" "$TMP_ROOT/agent-tmp" \
+  || fail "quick fake agent failed"
+agent_elapsed=$(( $(monotonic_millis) - prompt_start ))
+prompt_start=$(monotonic_millis)
+VALIDATION_TIMEOUT=$PROMPT_TIMEOUT_SECONDS run_validation_command \
+  "$PROMPT_TIMEOUT_SECONDS" bash -c true || fail "quick validation command failed"
+validation_elapsed=$(( $(monotonic_millis) - prompt_start ))
+timing_failed=false
+if (( agent_elapsed >= PROMPT_RETURN_LIMIT_MILLIS )); then
+  echo "not ok - quick fake agent waited ${agent_elapsed}ms for its ${PROMPT_TIMEOUT_SECONDS}s timeout watcher" >&2
+  timing_failed=true
+fi
+if (( validation_elapsed >= PROMPT_RETURN_LIMIT_MILLIS )); then
+  echo "not ok - quick validation waited ${validation_elapsed}ms for its ${PROMPT_TIMEOUT_SECONDS}s timeout watcher" >&2
+  timing_failed=true
+fi
+[[ "$timing_failed" == false ]] || exit 1
+pass "completed agent and validation commands return before their timeout watchers"
 
 mkdir -p "$TMP_ROOT/home" "$TMP_ROOT/agent-tmp"
 unset GH_TOKEN GITHUB_TOKEN AWS_SECRET_ACCESS_KEY

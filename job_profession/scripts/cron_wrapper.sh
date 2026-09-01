@@ -17,9 +17,14 @@ PAYLOAD_ARGS=()
 if [[ -n "${JOB_PROFESSION_VISIBLE_PAYLOADS:-}" ]]; then
   PAYLOAD_ARGS=(--visible-payloads "${JOB_PROFESSION_VISIBLE_PAYLOADS}")
 fi
+if [[ -z "${JOB_PROFESSION_CANDIDATE_INTAKE:-}" ]]; then
+  print -u2 "Discovery did not run: JOB_PROFESSION_CANDIDATE_INTAKE is required"
+  exit 2
+fi
+CANDIDATE_ARGS=(--candidate-intake "${JOB_PROFESSION_CANDIDATE_INTAKE}")
 PYTHON_BIN="${JOB_PROFESSION_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
-"${PYTHON_BIN}" "${SCRIPT_DIR}/discover.py" --output-dir "${OUTPUT_DIR}" "${PAYLOAD_ARGS[@]}"
-"${PYTHON_BIN}" "${SCRIPT_DIR}/discover.py" --output-dir "${OUTPUT_DIR}" --export-current-recommendations "${CURRENT_RECOMMENDATION_QUEUE}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/discover.py" --output-dir "${OUTPUT_DIR}" "${CANDIDATE_ARGS[@]}" "${PAYLOAD_ARGS[@]}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/discover.py" --output-dir "${OUTPUT_DIR}" "${CANDIDATE_ARGS[@]}" --export-current-recommendations "${CURRENT_RECOMMENDATION_QUEUE}"

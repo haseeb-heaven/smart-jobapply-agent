@@ -77,10 +77,9 @@ def _as_json(values: list[str]) -> str:
 
 
 def _require_actor(actor: str) -> str:
-    cleaned = actor.strip()
-    if not cleaned:
+    if not isinstance(actor, str) or not actor.strip():
         raise InvalidTransition("a non-empty actor is required for an auditable status transition")
-    return cleaned
+    return actor
 
 
 def _is_user_actor(actor: str) -> bool:
@@ -91,7 +90,7 @@ def _is_user_actor(actor: str) -> bool:
     cannot represent a manual final submission.
     """
 
-    return actor.casefold() == "user"
+    return actor == "user"
 
 
 def transition_application(application: ApplicationRecord, target: ReviewState, actor: str) -> ApplicationRecord:

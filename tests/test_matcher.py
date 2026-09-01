@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
 
 from job_profession.matcher import load_scoring_rules, score_job
-from job_profession.models import CandidateProfile, JobListing
+from job_profession.models import CandidateProfile, JobListing, JobRequirement
 
 
 def profile() -> CandidateProfile:
@@ -32,6 +32,181 @@ def test_yaml_rules_enforce_selective_profile_fit_thresholds():
 
     assert rules["thresholds"] == {"recommended": 85, "review": 70, "reject": 0}
     assert rules["weights"]["verified_professional_skill_fit"] == 30
+
+
+def test_candidate_profile_rejects_cross_group_skill_overlap_after_normalization():
+    with pytest.raises(ValueError, match="disjoint|python"):
+        CandidateProfile(
+            professional_skills=(" Python ",),
+            personal_open_source_skills=("python",),
+        )
+
+
+def test_candidate_profile_rejects_evidence_label_conflicting_with_skill_group():
+    with pytest.raises(ValueError, match="label conflicts|python"):
+        CandidateProfile(
+            professional_skills=("Python",),
+            evidence_by_skill={" python ": "learning_or_exposure"},
+        )
+
+
+@pytest.mark.parametrize("subject", ("Cassandra", "RabbitMQ", "C++"))
+def test_rejects_any_atomic_mandatory_structured_skill_without_professional_evidence(
+    subject: str,
+):
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        requirements=(
+            JobRequirement(
+                requirement_id="req-skill",
+                text=f"{subject} is required",
+                kind="skill",
+                importance="mandatory",
+                subject=subject,
+                source_evidence=f"{subject} is required.",
+            ),
+        ),
+    )
+
+    result = score_job(profile(), job)
+
+    assert result.decision == "reject"
+    assert result.score == 0
+    assert any(subject.casefold() in reason.casefold() for reason in result.reasons)
+
+
+def test_supported_structured_skill_uses_only_professional_evidence():
+    base = profile()
+    personal_only = CandidateProfile(
+        professional_skills=base.professional_skills,
+        personal_open_source_skills=("Cassandra",),
+        role_targets=base.role_targets,
+        evidence_by_skill={
+            **base.evidence_by_skill,
+            "Cassandra": "personal_open_source",
+        },
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        requirements=(
+            JobRequirement(
+                requirement_id="req-cassandra",
+                text="Cassandra is required",
+                kind="skill",
+                importance="mandatory",
+                subject="Cassandra",
+            ),
+        ),
+    )
+
+    assert score_job(personal_only, job).decision == "reject"
+
+
+def test_employment_type_preference_is_a_hard_gate_when_visible():
+    base = profile()
+    full_time_only = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        employment_type_preferences=("full-time",),
+        evidence_by_skill=base.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        employment_type="contract",
+    )
+
+    result = score_job(full_time_only, job)
+
+    assert result.decision == "reject"
+    assert "employment type is outside approved preferences" in result.gaps
+
+
+def test_unknown_employment_type_cannot_be_recommended_when_preference_is_restrictive():
+    base = profile()
+    full_time_only = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        employment_type_preferences=("full_time",),
+        evidence_by_skill=base.evidence_by_skill,
+    )
+
+    result = score_job(
+        full_time_only,
+        JobListing(
+            title="Python Backend Developer",
+            description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        ),
+    )
+
+    assert result.decision == "review"
+    assert any("employment type is not visible" in gap for gap in result.gaps)
+
+
+def test_authorization_requirement_uses_only_approved_candidate_authorization():
+    base = profile()
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        requirements=(
+            JobRequirement(
+                requirement_id="req-auth",
+                text="Must be authorized to work in India",
+                kind="authorization",
+                importance="mandatory",
+                subject="India",
+            ),
+        ),
+    )
+    unknown = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        evidence_by_skill=base.evidence_by_skill,
+    )
+    mismatched = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        work_authorizations=("United Arab Emirates",),
+        evidence_by_skill=base.evidence_by_skill,
+    )
+    approved = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        work_authorizations=("India",),
+        evidence_by_skill=base.evidence_by_skill,
+    )
+
+    assert score_job(unknown, job).decision == "review"
+    assert score_job(mismatched, job).decision == "reject"
+    assert score_job(approved, job).decision == "recommended"
+
+
+@pytest.mark.parametrize(
+    "description",
+    ("No more than 2 years of experience.", "Experience of up to 2 years."),
+)
+def test_maximum_only_experience_is_enforced(description: str):
+    base = profile()
+    three_year_profile = CandidateProfile(
+        professional_skills=base.professional_skills,
+        role_targets=base.role_targets,
+        years_experience=3,
+        evidence_by_skill=base.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL. "
+            + description
+        ),
+    )
+
+    result = score_job(three_year_profile, job)
+
+    assert result.decision == "reject"
+    assert any("maximum (2 years)" in reason for reason in result.reasons)
 
 
 def test_configured_hard_reject_terms_change_matching(tmp_path: Path):
@@ -268,6 +443,28 @@ def test_does_not_treat_ordinary_words_as_required_technology_skills(ordinary_ph
     assert not any("unsupported technology" in reason for reason in result.reasons)
 
 
+def test_does_not_treat_negated_technology_requirement_as_mandatory():
+    base_profile = profile()
+    exclusion_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        role_targets=base_profile.role_targets,
+        mandatory_excluded_requirements=("unsupported technology with no comparable approved evidence",),
+        evidence_by_skill=base_profile.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL. "
+            "Django experience is not required."
+        ),
+    )
+
+    result = score_job(exclusion_profile, job)
+
+    assert result.decision == "recommended"
+    assert not any("mandatory unsupported technology" in reason for reason in result.reasons)
+
+
 def test_recommends_mid_level_fastapi_maintenance_role():
     job = JobListing(
         title="Python Backend Developer",
@@ -413,3 +610,159 @@ def test_ordinary_mid_level_titles_are_not_rejected_by_level_alias_gate(title: s
             "explicit job-level suffix",
         }
     )
+
+
+def test_title_experience_years_are_not_misclassified_as_a_job_level_suffix():
+    job = JobListing(
+        title="Python Developer - 3 Years Experience",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+
+    result = score_job(profile(), job)
+
+    assert result.decision == "recommended"
+    assert "explicit job-level suffix" not in result.reasons
+
+
+def test_rejects_mandatory_experience_above_candidate_approved_years():
+    base_profile = profile()
+    three_year_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        role_targets=base_profile.role_targets,
+        evidence_by_skill=base_profile.evidence_by_skill,
+        years_experience=3,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "10+ years of professional software development experience is mandatory. "
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL."
+        ),
+    )
+
+    result = score_job(three_year_profile, job)
+
+    assert result.score == 0
+    assert result.decision == "reject"
+    assert any("experience" in reason for reason in result.reasons)
+
+
+def test_rejects_onsite_location_outside_explicit_location_allowlist():
+    base_profile = profile()
+    hyderabad_only_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        role_targets=base_profile.role_targets,
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("onsite",),
+        evidence_by_skill=base_profile.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        location="New York, NY",
+        work_mode="onsite",
+    )
+
+    result = score_job(hyderabad_only_profile, job)
+
+    assert result.score == 0
+    assert result.decision == "reject"
+    assert "location is outside approved preferences" in result.gaps
+
+
+def test_mandatory_unsupported_skill_is_a_hard_reject_without_profile_opt_in():
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "Must have 5 years of Rust. Maintain FastAPI APIs, add features, "
+            "write unit tests, and work with PostgreSQL."
+        ),
+    )
+
+    result = score_job(profile(), job)
+
+    assert result.score == 0
+    assert result.decision == "reject"
+    assert any("rust" in reason.casefold() for reason in result.reasons)
+
+
+def test_unknown_candidate_experience_cannot_satisfy_mandatory_years():
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "Must have 10+ years of professional software development experience. "
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL."
+        ),
+    )
+
+    result = score_job(profile(), job)
+
+    assert result.decision != "recommended"
+    assert any("experience" in value.casefold() for value in (*result.reasons, *result.gaps))
+
+
+def test_explicit_required_experience_range_enforces_its_maximum():
+    base_profile = profile()
+    three_year_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        years_experience=3,
+        role_targets=base_profile.role_targets,
+        evidence_by_skill=base_profile.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "Required: 1-2 years of professional software development experience. "
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL."
+        ),
+    )
+
+    result = score_job(three_year_profile, job)
+
+    assert result.score == 0
+    assert result.decision == "reject"
+    assert any("maximum" in reason.casefold() for reason in result.reasons)
+
+
+def test_preferred_experience_range_does_not_create_a_maximum_gate():
+    base_profile = profile()
+    three_year_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        years_experience=3,
+        role_targets=base_profile.role_targets,
+        evidence_by_skill=base_profile.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description=(
+            "1-2 years of professional software development experience preferred. "
+            "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL."
+        ),
+    )
+
+    result = score_job(three_year_profile, job)
+
+    assert result.decision == "recommended"
+    assert not any("maximum" in reason.casefold() for reason in result.reasons)
+
+
+def test_missing_listing_location_and_work_mode_block_recommendation_for_restrictive_preferences():
+    base_profile = profile()
+    restricted_profile = CandidateProfile(
+        professional_skills=base_profile.professional_skills,
+        years_experience=3,
+        role_targets=base_profile.role_targets,
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("onsite",),
+        evidence_by_skill=base_profile.evidence_by_skill,
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+
+    result = score_job(restricted_profile, job)
+
+    assert result.decision != "recommended"
+    assert any("location" in gap.casefold() for gap in result.gaps)
+    assert any("work mode" in gap.casefold() for gap in result.gaps)

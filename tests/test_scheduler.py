@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import importlib.util
 import json
 import multiprocessing
@@ -13,9 +12,15 @@ from queue import Empty
 
 import pytest
 
+try:
+    import fcntl
+except ModuleNotFoundError:  # Windows uses the separately exercised msvcrt backend.
+    fcntl = None  # type: ignore[assignment]
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "job_profession" / "src"))
 
 from job_profession.models import CandidateProfile
+import job_profession.scheduler as scheduler_module
 from job_profession.scheduler import JobDiscoveryScheduler, candidate_profile_revision, current_profile_recommendations
 from job_profession.matcher import matcher_policy_revision
 from job_profession.sources import MappingVisiblePageAdapter, SearchProfile, build_search_url, listing_from_visible_payload
@@ -91,6 +96,8 @@ def _concurrent_scheduler_worker(
 def _hold_scheduler_lock(
     lock_path: str, acquired: multiprocessing.synchronize.Event, release: multiprocessing.synchronize.Event
 ) -> None:
+    if fcntl is None:
+        raise RuntimeError("POSIX flock is unavailable")
     path = Path(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
@@ -366,18 +373,59 @@ def test_profile_revision_changes_for_safe_roles_and_classified_evidence_only():
         mandatory_excluded_requirements=("ML model training or deployment ownership",),
         evidence_by_skill={"python": "professional"},
     )
-    confirmation_gated_preferences = CandidateProfile(
+    changed_preferences = CandidateProfile(
         professional_skills=("python",),
         role_targets=("Python Developer",),
-        location_preferences=("private-location",),
-        work_mode_preferences=("private-work-mode",),
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("onsite",),
         evidence_by_skill={"python": "professional"},
     )
 
     assert candidate_profile_revision(base) != candidate_profile_revision(changed_roles)
     assert candidate_profile_revision(base) != candidate_profile_revision(changed_evidence)
     assert candidate_profile_revision(base) != candidate_profile_revision(changed_mandatory_exclusion)
-    assert candidate_profile_revision(base) == candidate_profile_revision(confirmation_gated_preferences)
+    assert candidate_profile_revision(base) != candidate_profile_revision(changed_preferences)
+
+
+def test_profile_revision_changes_for_each_approved_eligibility_constraint():
+    base = CandidateProfile(
+        professional_skills=("python",),
+        years_experience=3,
+        role_targets=("Python Developer",),
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("onsite",),
+        evidence_by_skill={"python": "professional"},
+    )
+    changed_years = CandidateProfile(
+        professional_skills=("python",),
+        years_experience=4,
+        role_targets=("Python Developer",),
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("onsite",),
+        evidence_by_skill={"python": "professional"},
+    )
+    changed_location = CandidateProfile(
+        professional_skills=("python",),
+        years_experience=3,
+        role_targets=("Python Developer",),
+        location_preferences=("Bengaluru",),
+        work_mode_preferences=("onsite",),
+        evidence_by_skill={"python": "professional"},
+    )
+    changed_work_mode = CandidateProfile(
+        professional_skills=("python",),
+        years_experience=3,
+        role_targets=("Python Developer",),
+        location_preferences=("Hyderabad",),
+        work_mode_preferences=("remote",),
+        evidence_by_skill={"python": "professional"},
+    )
+
+    revision = candidate_profile_revision(base)
+
+    assert revision != candidate_profile_revision(changed_years)
+    assert revision != candidate_profile_revision(changed_location)
+    assert revision != candidate_profile_revision(changed_work_mode)
 
 
 def test_only_85_plus_recommendations_are_exported(tmp_path: Path):
@@ -727,6 +775,7 @@ def test_stale_scheduler_lock_file_is_recoverable(tmp_path: Path):
     assert result.application_actions == 0
 
 
+@pytest.mark.skipif(fcntl is None, reason="POSIX-specific external flock contention test")
 def test_active_scheduler_lock_times_out_with_a_bounded_wait(tmp_path: Path):
     context = multiprocessing.get_context("spawn")
     state_path = tmp_path / "state.json"
@@ -755,12 +804,30 @@ def test_active_scheduler_lock_times_out_with_a_bounded_wait(tmp_path: Path):
 def test_cron_wrapper_runs_despite_abandoned_legacy_directory_lock(tmp_path: Path):
     """The scheduler flock, not a stale mkdir lock, controls scheduled runs."""
 
+    from job_profession.intake import activate_candidate_profile, validate_candidate_intake
+
     output_dir = tmp_path / "scheduled-output"
     output_dir.mkdir()
     (output_dir / ".discovery.lock").mkdir()
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir()
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": {"candidate_confirmed": True},
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    intake_path.write_text(
+        json.dumps(activate_candidate_profile(draft, actor="user")), encoding="utf-8"
+    )
     environment = os.environ.copy()
     environment["JOB_PROFESSION_OUTPUT_DIR"] = str(output_dir)
     environment["JOB_PROFESSION_PYTHON"] = sys.executable
+    environment["JOB_PROFESSION_CANDIDATE_INTAKE"] = str(intake_path)
 
     completed = subprocess.run(
         [str(PROJECT_ROOT / "job_profession" / "scripts" / "cron_wrapper.sh")],
@@ -799,3 +866,93 @@ def test_generated_launchd_bootstrap_has_no_legacy_directory_lock(tmp_path: Path
     assert "discover.py" in bootstrap
     assert "--export-current-recommendations" in bootstrap
     assert "Current_Profile_Recommended_Queue.csv" in bootstrap
+
+
+def test_scheduler_redacts_adapter_and_payload_exception_details_from_audit_output(tmp_path: Path):
+    secret = "candidate-private-token"
+    search = SearchProfile("linkedin", "Python Backend Developer")
+
+    class FailingAdapter:
+        def read_visible_listings(self, _search_url: str):
+            raise RuntimeError(f"adapter exposed {secret}")
+
+    failed = JobDiscoveryScheduler(
+        profile(),
+        [search],
+        state_path=tmp_path / "failed-state.json",
+        export_path=tmp_path / "failed-jobs.jsonl",
+        run_log_path=tmp_path / "failed-runs.jsonl",
+    ).run(FailingAdapter())
+
+    assert failed.errors == ("linkedin adapter read failed: RuntimeError",)
+    assert secret not in (tmp_path / "failed-runs.jsonl").read_text(encoding="utf-8")
+
+    invalid_payload = MappingVisiblePageAdapter(
+        {
+            build_search_url(search): [
+                {
+                    "title": "Python Backend Developer",
+                    "url": f"https://www.linkedin.com/jobs/view/1?access_token={secret}",
+                }
+            ]
+        }
+    )
+    rejected = JobDiscoveryScheduler(
+        profile(),
+        [search],
+        state_path=tmp_path / "rejected-state.json",
+        export_path=tmp_path / "rejected-jobs.jsonl",
+        run_log_path=tmp_path / "rejected-runs.jsonl",
+    ).run(invalid_payload)
+
+    assert rejected.errors == ("linkedin visible payload rejected: ValueError",)
+    assert secret not in (tmp_path / "rejected-runs.jsonl").read_text(encoding="utf-8")
+
+
+def test_profile_revision_includes_employment_types_and_work_authorizations():
+    base = CandidateProfile(
+        professional_skills=("python",),
+        employment_type_preferences=("full-time",),
+        work_authorizations=("india",),
+        evidence_by_skill={"python": "professional"},
+    )
+    changed_employment = CandidateProfile(
+        professional_skills=("python",),
+        employment_type_preferences=("contract",),
+        work_authorizations=("india",),
+        evidence_by_skill={"python": "professional"},
+    )
+    changed_authorization = CandidateProfile(
+        professional_skills=("python",),
+        employment_type_preferences=("full-time",),
+        work_authorizations=("uae",),
+        evidence_by_skill={"python": "professional"},
+    )
+
+    revision = candidate_profile_revision(base)
+
+    assert revision != candidate_profile_revision(changed_employment)
+    assert revision != candidate_profile_revision(changed_authorization)
+
+
+def test_portable_stale_recovery_never_deletes_a_replaced_fresh_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    lock_path = tmp_path / "scheduler.lock"
+    claim_path = scheduler_module._portable_claim_path(lock_path)
+    claim_path.write_text(
+        json.dumps({"pid": 999_999_999, "token": "stale-token", "acquired_at": 0}),
+        encoding="utf-8",
+    )
+    fresh_claim = {"pid": os.getpid(), "token": "fresh-token", "acquired_at": scheduler_module.time.time()}
+    real_stale_check = scheduler_module._portable_claim_is_stale
+
+    def replace_after_stale_check(path: Path, snapshot: object | None = None) -> bool:
+        assert real_stale_check(path, snapshot=snapshot) is True
+        claim_path.write_text(json.dumps(fresh_claim), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(scheduler_module, "_portable_claim_is_stale", replace_after_stale_check)
+
+    assert scheduler_module._try_portable_claim(lock_path, "contender-token") is False
+    assert json.loads(claim_path.read_text(encoding="utf-8"))["token"] == "fresh-token"
