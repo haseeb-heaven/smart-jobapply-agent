@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "smart-jobs-apply-ai"
+name = "smart-jobapply-agent"
 version = "0.1.0"
 description = "Evidence-first AI-assisted job matching and human-review tracking"
 readme = "README.md"

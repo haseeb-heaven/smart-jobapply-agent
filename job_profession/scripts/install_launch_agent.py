@@ -13,9 +13,9 @@ import sys
 from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLIST_NAME = "com.haseeb.smart-jobs-apply-ai.plist"
+PLIST_NAME = "com.haseeb.smart-jobapply-agent.plist"
 SOURCE_PLIST = PROJECT_ROOT / "launchd" / PLIST_NAME
-RUNTIME_ROOT = Path.home() / "Library" / "Caches" / "smart_jobs_apply_ai_runtime"
+RUNTIME_ROOT = Path.home() / "Library" / "Caches" / "smart_jobapply_agent_runtime"
 RUNTIME_BOOTSTRAP = RUNTIME_ROOT / "launchd_discover_bootstrap.sh"
 RUNTIME_SRC = RUNTIME_ROOT / "src" / "job_profession"
 RUNTIME_DISCOVER_SCRIPT = RUNTIME_ROOT / "discover.py"
@@ -41,7 +41,7 @@ def _write_runtime_bootstrap() -> None:
 
             OUTPUT_DIR=$2
             CURRENT_RECOMMENDATION_QUEUE="${OUTPUT_DIR}/Current_Profile_Recommended_Queue.csv"
-            RUNTIME_ROOT="${HOME}/Library/Caches/smart_jobs_apply_ai_runtime"
+            RUNTIME_ROOT="${HOME}/Library/Caches/smart_jobapply_agent_runtime"
             RUNTIME_SRC="${RUNTIME_ROOT}/src/job_profession"
             RUNTIME_CONFIG="${RUNTIME_ROOT}/config"
             RUNTIME_SCRIPT="${RUNTIME_ROOT}/discover.py"

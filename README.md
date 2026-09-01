@@ -1,4 +1,4 @@
-# Smart Jobs Apply AI — Agent Operating Contract
+# Smart JobApply Agent — Operating Contract
 
 This repository is an operating contract for an AI coding agent, not a human-facing job-search application. Use it through **Codex**, **Claude Code**, **Grok**, or another capable LLM agent. The LLM is the review brain; this repository supplies deterministic matching, evidence boundaries, local state, and validation.
 
@@ -68,7 +68,7 @@ tests/                              matcher, policy, tracker, scheduler, watcher
 job_profession/private.example/     redacted local-manifest templates
 ```
 
-`job_profession` remains the stable internal Python package name. The public repository and distribution name are **smart-jobs-apply-ai**.
+`job_profession` remains the stable internal Python package name. The public repository and distribution name are **smart-jobapply-agent**.
 
 ## Required verification before a commit or PR
 

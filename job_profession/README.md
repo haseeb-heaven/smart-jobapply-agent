@@ -1,4 +1,4 @@
-# Smart Jobs Apply AI review workflow
+# Smart JobApply Agent review workflow
 
 This folder supports a private, review-gated job-search workflow for mid-level,
 implementation-focused backend/software roles. It is not an application bot: it
