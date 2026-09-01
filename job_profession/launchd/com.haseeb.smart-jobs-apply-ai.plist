@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.haseeb.smart-jobs-apply-ai</string>
+  <key>Program</key>
+  <string>/bin/zsh</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>__RUNTIME_BOOTSTRAP__</string>
+    <string>__PROJECT_ROOT__</string>
+    <string>__OUTPUT_DIR__</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>__STDOUT_PATH__</string>
+  <key>StandardErrorPath</key><string>__STDERR_PATH__</string>
+</dict>
+</plist>

@@ -29,17 +29,17 @@ Use this skill when the candidate wants job listings opened for manual applicati
 ## Persistent monitoring
 
 For a monitor that must keep running after the current interaction, use
-`scripts/monitor_runtime.mjs` with the already-selected visible Chrome browser
-handle. Start one monitor with the validated manifest URLs and
-`intervalMs: 60000`; it performs an immediate reconciliation, then polls every
-minute. Keep the returned state handle so the caller can report `last`, inspect
-`history`, or call `stop()`. Starting a second monitor for the same manifest is
-not allowed—stop the old handle first.
+`scripts/chrome_tab_watcher.py --manifest <local-manifest> --watch`. It polls
+the user's Google Chrome every minute, reopens only missing listing URLs, and
+writes one redacted JSON status line per cycle. It never applies, fills,
+uploads, or submits. A monitor manifest remains local in
+`job_profession/private/` and can include an `active_url_prefixes` list for an
+expected in-progress route such as Indeed Smart Apply; this prevents a duplicate
+listing tab while the candidate is applying.
 
-The runtime is intentionally a browser-session module rather than a standalone
-network bot: the browser skill supplies the authenticated visible session and
-the runtime only calls `user.openTabs()`, `tabs.new()`, `goto()`, and
-`markHandoff()`. It never applies, fills, uploads, or submits.
+`scripts/monitor_runtime.mjs` remains a short-lived browser-session helper for
+interactive use. The Python watcher is the durable process to use when the
+candidate needs monitoring to survive chat turns.
 
 ## Local manifest helper
 

@@ -10,11 +10,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLIST_NAME = "com.haseeb.job-profession.plist"
+PLIST_NAME = "com.haseeb.smart-jobs-apply-ai.plist"
 SOURCE_PLIST = PROJECT_ROOT / "launchd" / PLIST_NAME
-RUNTIME_ROOT = Path.home() / "Library" / "Caches" / "job_profession_runtime"
+RUNTIME_ROOT = Path.home() / "Library" / "Caches" / "smart_jobs_apply_ai_runtime"
 RUNTIME_BOOTSTRAP = RUNTIME_ROOT / "launchd_discover_bootstrap.sh"
 RUNTIME_SRC = RUNTIME_ROOT / "src" / "job_profession"
 RUNTIME_DISCOVER_SCRIPT = RUNTIME_ROOT / "discover.py"
@@ -40,7 +41,7 @@ def _write_runtime_bootstrap() -> None:
 
             OUTPUT_DIR=$2
             CURRENT_RECOMMENDATION_QUEUE="${OUTPUT_DIR}/Current_Profile_Recommended_Queue.csv"
-            RUNTIME_ROOT="${HOME}/Library/Caches/job_profession_runtime"
+            RUNTIME_ROOT="${HOME}/Library/Caches/smart_jobs_apply_ai_runtime"
             RUNTIME_SRC="${RUNTIME_ROOT}/src/job_profession"
             RUNTIME_CONFIG="${RUNTIME_ROOT}/config"
             RUNTIME_SCRIPT="${RUNTIME_ROOT}/discover.py"
@@ -136,6 +137,24 @@ def _sync_runtime_snapshot() -> None:
     RUNTIME_DISCOVER_SCRIPT.chmod(0o700)
 
 
+def _render_plist() -> str:
+    """Render a portable launchd plist without publishing local machine paths."""
+
+    template = SOURCE_PLIST.read_text(encoding="utf-8")
+    substitutions = {
+        "__RUNTIME_BOOTSTRAP__": str(RUNTIME_BOOTSTRAP),
+        "__PROJECT_ROOT__": str(PROJECT_ROOT),
+        "__OUTPUT_DIR__": str(RUNTIME_ROOT / "data"),
+        "__STDOUT_PATH__": str(RUNTIME_ROOT / "launchd.stdout.log"),
+        "__STDERR_PATH__": str(RUNTIME_ROOT / "launchd.stderr.log"),
+    }
+    for placeholder, value in substitutions.items():
+        template = template.replace(placeholder, xml_escape(value))
+    if "__" in template:
+        raise ValueError("launchd plist contains an unresolved placeholder")
+    return template
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install the opt-in 08:00/17:00 local discovery launch agent.")
     parser.add_argument("--install", action="store_true", help="Copy the reviewed plist into ~/Library/LaunchAgents and load it.")
@@ -175,7 +194,7 @@ def main() -> int:
     finally:
         install_lock.rmdir()
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(SOURCE_PLIST, target)
+    target.write_text(_render_plist(), encoding="utf-8")
     subprocess.run(["launchctl", "bootout", domain, str(target)], check=False)
     subprocess.run(["launchctl", "bootstrap", domain, str(target)], check=True)
     print(f"Installed {target}")

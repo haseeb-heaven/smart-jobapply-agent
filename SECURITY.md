@@ -1,6 +1,6 @@
 # Security policy
 
-This project handles sensitive candidate information. Keep
+Smart Jobs Apply AI handles sensitive candidate information. Keep
 `job_profession/private/` local-only and never commit it. Treat browser
 sessions, cookies, API keys, resumes, compensation, visa details, and screening
 answers as secrets.

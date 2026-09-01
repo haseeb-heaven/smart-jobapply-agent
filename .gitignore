@@ -29,3 +29,7 @@ venv/
 # Local review artifacts.
 .lavish/
 .stow-notes.md
+
+# Candidate-supplied material and local job-search notes must never be staged.
+resumes/
+codex-apply-*.*

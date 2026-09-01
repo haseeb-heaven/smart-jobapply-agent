@@ -171,6 +171,22 @@ def test_runtime_profile_projection_keeps_only_evidence_fields(tmp_path: Path, m
     assert "never-import-this" not in runtime_text
 
 
+def test_launchd_template_renders_local_paths_without_publishing_machine_details(tmp_path: Path, monkeypatch):
+    installer = load_installer_module()
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(installer, "PROJECT_ROOT", tmp_path / "checkout with & character")
+    monkeypatch.setattr(installer, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(installer, "RUNTIME_BOOTSTRAP", runtime_root / "launchd_discover_bootstrap.sh")
+
+    rendered = installer._render_plist()
+
+    assert "__" not in rendered
+    assert "/Users/haseeb-mir/" not in rendered
+    assert "GoogleDrive-haseebmir.hm@gmail.com" not in rendered
+    assert "checkout with &amp; character" in rendered
+    assert str(runtime_root / "data") in rendered
+
+
 def test_current_profile_queue_cli_exports_only_active_safe_recommendations(tmp_path: Path, capsys):
     discover = load_discover_module()
     from job_profession.matcher import matcher_policy_revision

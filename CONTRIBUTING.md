@@ -3,8 +3,8 @@
 ## Branches
 
 Use `feature` for changes, `develop` for verified integration, and `main` for
-releases. Do not commit private candidate data, browser state, credentials, or
-generated tracker databases.
+releases. Do not commit private candidate data, browser state, credentials,
+resumes, local application notes, or generated tracker databases.
 
 ## Required checks
 

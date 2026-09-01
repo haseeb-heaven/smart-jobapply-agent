@@ -18,9 +18,19 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -e '.[test]'
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
       - name: Run tests
         run: python -m pytest
+      - name: Lint Python
+        run: ruff check job_profession/src job_profession/scripts tests
+      - name: Enforce watcher coverage
+        run: >-
+          python -m coverage run --branch
+          --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py'
+          -m pytest tests/test_chrome_tab_watcher.py &&
+          python -m coverage report
+          --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py'
+          --fail-under=100
       - name: Compile Python sources
         run: python -m compileall -q job_profession/src job_profession/scripts
 

@@ -1,13 +1,29 @@
-# Job Profession
+# Smart Jobs Apply AI
 
-Evidence-first job discovery and application preparation for a mid-level,
-implementation-focused software developer.
+Evidence-first AI-assisted job matching and human-reviewed application
+preparation for implementation-focused software roles.
 
 This repository scores **visible LinkedIn and Indeed listing data** against an
-approved candidate profile and produces an auditable review queue. It is not an
-application bot. It never logs in, reads browser credentials, uploads a resume,
-answers screening or EEO questions, clicks Apply/Submit, solves CAPTCHAs, or
-accepts attestations.
+approved candidate profile and produces an auditable review queue. AI-assisted
+recommendations must remain source-grounded and preserve the deterministic
+matcher explanation; a score is profile fit, never hiring probability. It is
+not an application bot. It never logs in, reads browser credentials, uploads a
+resume, answers screening or EEO questions, clicks Apply/Submit, solves
+CAPTCHAs, or accepts attestations.
+
+## LLM-assisted workflow
+
+An interactive coding agent is the review brain for this project. Run the
+workflow through **Codex**, **Claude Code**, or **Grok** (or another capable
+LLM agent) to interpret visible job evidence, use the deterministic matcher,
+surface gaps, and prepare a bounded review queue. The LLM is advisory: it must
+preserve source evidence, expose uncertainty, and defer to the deterministic
+policy whenever the two disagree. It must never invent candidate experience,
+claim a job is guaranteed, bypass a job board, or operate an application form.
+
+Recommended flow: give the agent the private profile only through the local
+ignored manifest, provide visible listing data, review the explainable queue,
+then open the selected tabs for the candidate to apply manually.
 
 ## What it does
 
@@ -23,6 +39,8 @@ accepts attestations.
   matcher-policy revisions.
 - Writes a current-profile CSV queue and an append-only JSONL audit trail.
 - Provides a local SQLite tracker and truthful, review-only application drafts.
+- Includes a review-only Chrome tab watcher that can reopen a bounded local
+  queue; it never interacts with application forms.
 - Includes a macOS `launchd`/cron wrapper for discovery and export only.
 
 ## Safety model
@@ -66,7 +84,7 @@ tests for the payload shape.
 
 ```text
 job_profession/
-  src/job_profession/       Pure models, normalization, matching, scheduling,
+  src/job_profession/       Internal Python package: pure models, normalization, matching, scheduling,
                             tracking, and review-only draft composition.
   scripts/                  Offline discovery, exports, macOS launchd setup,
                             and optional read-only browser health checks.
@@ -100,6 +118,13 @@ ruff check job_profession/src job_profession/scripts tests
 
 Pull requests should use the `feature` branch and include tests for every
 policy or safety change. Do not add any code path that can submit an application.
+
+## Public repository hygiene
+
+The project is safe to publish only because candidate facts stay in the ignored
+`job_profession/private/` directory. Resumes and local application notes are
+also ignored. Before pushing, run `git status --short` and review the staged
+diff; never force-add private material.
 
 ## License
 

@@ -18,7 +18,6 @@ from pathlib import Path
 import re
 import signal
 import ssl
-import sys
 import threading
 from typing import Iterable
 from urllib.parse import urlsplit
