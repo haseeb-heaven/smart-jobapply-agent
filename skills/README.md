@@ -17,4 +17,5 @@ notes ignored.
 
 Opens and monitors a bounded set of LinkedIn/Indeed listings for human review.
 It never fills or submits an application; it only reopens the same listing URL
-if a tab disappears during the requested monitoring cycle.
+if a tab disappears during the requested monitoring cycle. Its persistent
+runtime polls the visible Chrome session every minute until explicitly stopped.

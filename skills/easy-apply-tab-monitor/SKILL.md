@@ -26,6 +26,21 @@ Use this skill when the candidate wants job listings opened for manual applicati
 5. Keep the five tabs open for the requested interval (default 60 seconds). At the check, list visible tab URLs and reopen only missing manifest URLs. If a tab remains open, do nothing.
 6. Return a compact table of the five URLs, recommendation, apply path, prior-application status, and whether the tab was reopened. Stop after the requested monitoring cycle unless the candidate asks for another cycle.
 
+## Persistent monitoring
+
+For a monitor that must keep running after the current interaction, use
+`scripts/monitor_runtime.mjs` with the already-selected visible Chrome browser
+handle. Start one monitor with the validated manifest URLs and
+`intervalMs: 60000`; it performs an immediate reconciliation, then polls every
+minute. Keep the returned state handle so the caller can report `last`, inspect
+`history`, or call `stop()`. Starting a second monitor for the same manifest is
+not allowed—stop the old handle first.
+
+The runtime is intentionally a browser-session module rather than a standalone
+network bot: the browser skill supplies the authenticated visible session and
+the runtime only calls `user.openTabs()`, `tabs.new()`, `goto()`, and
+`markHandoff()`. It never applies, fills, uploads, or submits.
+
 ## Local manifest helper
 
 `scripts/tab_manifest.py` validates and compares the bounded queue without network or browser access. Use it to make the monitor repeatable; use the browser skill for all visible Chrome actions.
