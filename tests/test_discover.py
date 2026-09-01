@@ -198,10 +198,12 @@ def test_profile_loader_enforces_approved_mandatory_ml_exclusion(tmp_path: Path)
 def test_repository_profile_exposes_classified_evidence_without_confirmation_fields():
     discover = load_discover_module()
 
-    profile = discover.approved_candidate_profile()
+    profile = discover.approved_candidate_profile(
+        PROJECT_ROOT / "job_profession" / "private.example" / "candidate_profile.yaml"
+    )
 
     assert "python" in {skill.casefold() for skill in profile.professional_skills}
-    assert "openai" in {skill.casefold() for skill in profile.personal_open_source_skills}
+    assert "llm" in {skill.casefold() for skill in profile.personal_open_source_skills}
     assert "docker" in {skill.casefold() for skill in profile.learning_or_exposure_skills}
     assert profile.location_preferences == ()
     assert profile.work_mode_preferences == ()
