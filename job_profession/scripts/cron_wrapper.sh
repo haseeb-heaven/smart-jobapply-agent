@@ -7,13 +7,13 @@ set -o pipefail
 umask 077
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -h "${SOURCE}" ]]; do
-  LINK_DIR="$(CDPATH= cd -P -- "$(dirname -- "${SOURCE}")" && pwd -P)"
+  LINK_DIR="$(CDPATH="" cd -P -- "$(dirname -- "${SOURCE}")" && pwd -P)"
   SOURCE="$(readlink "${SOURCE}")"
   if [[ "${SOURCE}" != /* ]]; then
     SOURCE="${LINK_DIR}/${SOURCE}"
   fi
 done
-SCRIPT_DIR="$(CDPATH= cd -P -- "$(dirname -- "${SOURCE}")" && pwd -P)"
+SCRIPT_DIR="$(CDPATH="" cd -P -- "$(dirname -- "${SOURCE}")" && pwd -P)"
 PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
 OUTPUT_DIR="${JOB_PROFESSION_OUTPUT_DIR:-${PROJECT_ROOT}/data}"
 CURRENT_RECOMMENDATION_QUEUE="${OUTPUT_DIR}/Current_Profile_Recommended_Queue.csv"
