@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 
@@ -260,8 +261,10 @@ def test_generated_runtime_bootstrap_uses_safe_active_intake_projection(tmp_path
     installer._write_runtime_bootstrap()
 
     output_dir = tmp_path / "runtime-output"
+    shell = shutil.which("zsh") or shutil.which("bash")
+    assert shell is not None
     completed = subprocess.run(
-        ["/bin/zsh", str(installer.RUNTIME_BOOTSTRAP), str(PROJECT_ROOT), str(output_dir)],
+        [shell, str(installer.RUNTIME_BOOTSTRAP), str(PROJECT_ROOT), str(output_dir)],
         cwd=PROJECT_ROOT,
         env={**os.environ, "HOME": str(home)},
         capture_output=True,
