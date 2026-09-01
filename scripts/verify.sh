@@ -18,7 +18,11 @@ echo "[1/8] full Python suite"
 python -m pytest
 
 echo "[2/8] Python lint"
-ruff check job_profession/src job_profession/scripts tests
+# Keep the repository gate independent from a runner's user-level Ruff config
+# and from newly introduced rule families.  The project can expand this
+# baseline deliberately in a separate reviewed change.
+ruff check --isolated --select E4,E7,E9,F --line-length 120 --target-version py311 \
+  job_profession/src job_profession/scripts tests
 
 echo "[3/8] bounded watcher line and branch coverage"
 python -m coverage erase
