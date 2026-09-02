@@ -723,14 +723,17 @@ class SmartJobQueue:
         return connection
 
     @staticmethod
-    def _append_event(connection: sqlite3.Connection, job_id: str, name: str, actor: str) -> None:
-        connection.execute(
+    def _append_event(connection: sqlite3.Connection, job_id: str, name: str, actor: str) -> int:
+        cursor = connection.execute(
             """
             INSERT INTO smart_queue_events (job_id, name, actor, occurred_at)
             VALUES (?, ?, ?, ?)
             """,
             (job_id, name, actor, _utc_now()),
         )
+        if cursor.lastrowid is None:
+            raise QueueStorageError("smart queue event could not be persisted")
+        return int(cursor.lastrowid)
 
     @staticmethod
     def _append_capacity_policy_event(
@@ -1260,6 +1263,143 @@ class SmartJobQueue:
         finally:
             self._close(connection)
         return result
+
+    def _confirm_outcome_with_candidate_memory(
+        self,
+        job_id: str,
+        outcome: str,
+        *,
+        actor: str,
+        memory_database: Path,
+    ) -> tuple[QueueEvent, str, str, bool]:
+        """Atomically record one user outcome and its private suppression row.
+
+        This internal bridge is intentionally reachable only through
+        ``CandidateMemory`` after it has validated and initialized a private
+        memory database.  SQLite's attached-database transaction gives the
+        queue event and candidate-memory row one commit boundary.  It refuses
+        WAL mode because SQLite cannot guarantee an atomic multi-database
+        commit there. Both databases must use a durable rollback-journal mode
+        before the transaction begins.
+        """
+
+        job_id = _require_opaque_job_id(job_id)
+        raw_actor = actor
+        actor = _require_actor(actor)
+        if raw_actor != "user":
+            raise QueuePolicyError("an application outcome must be confirmed by the exact user actor")
+        if not isinstance(outcome, str) or outcome not in _OUTCOMES:
+            raise QueuePolicyError("outcome must be submitted, rejected, or skipped")
+
+        connection = self._connect()
+        attached = False
+        try:
+            connection.execute("ATTACH DATABASE ? AS candidate_memory", (str(memory_database),))
+            attached = True
+            journal_modes = tuple(
+                connection.execute(f"PRAGMA {database}.journal_mode").fetchone()
+                for database in ("main", "candidate_memory")
+            )
+            if any(
+                journal_mode is None
+                or str(journal_mode[0]).lower() not in {"delete", "truncate", "persist"}
+                for journal_mode in journal_modes
+            ):
+                raise QueueStorageError("atomic candidate outcome storage is unavailable")
+            connection.execute("BEGIN IMMEDIATE")
+            row = next((item for item in self._rows(connection) if item["job_id"] == job_id), None)
+            if row is None:
+                raise KeyError("unknown job id")
+
+            state = self._state(row)
+            if state in {"open", "awaiting_outcome"}:
+                event_id = self._append_event(connection, job_id, outcome, actor)
+                occurred_at = str(
+                    connection.execute(
+                        "SELECT occurred_at FROM smart_queue_events WHERE event_id = ?", (event_id,)
+                    ).fetchone()["occurred_at"]
+                )
+            elif state == outcome:
+                existing_event = connection.execute(
+                    """
+                    SELECT event_id, occurred_at
+                    FROM smart_queue_events
+                    WHERE job_id = ? AND name = ? AND actor = 'user'
+                    ORDER BY event_id DESC
+                    LIMIT 1
+                    """,
+                    (job_id, outcome),
+                ).fetchone()
+                if existing_event is None:
+                    raise QueueStorageError("smart queue outcome event is unavailable")
+                event_id = int(existing_event["event_id"])
+                occurred_at = str(existing_event["occurred_at"])
+            else:
+                raise QueuePolicyError(
+                    "an application outcome may be confirmed only for an open or awaiting_outcome listing"
+                )
+
+            source_url = str(row["source_url"])
+            existing_memory = connection.execute(
+                """
+                SELECT job_id, source_url, outcome, actor, vacated, recorded_at
+                FROM candidate_memory.candidate_memory_outcomes
+                WHERE queue_id = ? AND event_id = ?
+                """,
+                (self.queue_id, event_id),
+            ).fetchone()
+            if existing_memory is None:
+                recorded_at = _utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO candidate_memory.candidate_memory_outcomes (
+                        queue_id, event_id, job_id, source_url, outcome, actor, vacated, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (self.queue_id, event_id, job_id, source_url, outcome, actor, 1, recorded_at),
+                )
+                inserted = True
+            else:
+                expected = (job_id, source_url, outcome, actor, 1)
+                actual = (
+                    str(existing_memory["job_id"]),
+                    str(existing_memory["source_url"]),
+                    str(existing_memory["outcome"]),
+                    str(existing_memory["actor"]),
+                    int(existing_memory["vacated"]),
+                )
+                if actual != expected:
+                    raise QueueStorageError("candidate memory event identity conflicts with stored facts")
+                recorded_at = str(existing_memory["recorded_at"])
+                inserted = False
+
+            connection.commit()
+            return (
+                QueueEvent(
+                    event_id=event_id,
+                    job_id=job_id,
+                    name=outcome,
+                    actor=actor,
+                    occurred_at=occurred_at,
+                    queue_id=self.queue_id,
+                ),
+                source_url,
+                recorded_at,
+                inserted,
+            )
+        except (KeyError, QueuePolicyError, QueueStorageError):
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise QueueStorageError("atomic candidate outcome storage failed") from None
+        finally:
+            if attached:
+                try:
+                    connection.execute("DETACH DATABASE candidate_memory")
+                except sqlite3.Error:
+                    pass
+            self._close(connection)
 
     def get(self, job_id: str) -> QueueJob:
         job_id = _require_opaque_job_id(job_id)

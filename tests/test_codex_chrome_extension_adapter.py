@@ -1,9 +1,4 @@
-"""Contract tests for the bounded Codex Chrome extension bridge.
-
-These tests define the adapter seam used by ``SmartQueueCoordinator``.  They
-use an injected HTTP connection factory only: no test starts a server, creates
-a browser session, or reaches a job board.
-"""
+"""Contract tests for the bounded Codex Chrome stdio bridge."""
 
 from __future__ import annotations
 
@@ -11,7 +6,6 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
-from typing import Any
 
 import pytest
 
@@ -35,7 +29,7 @@ BrowserTabAdapter = _COORDINATOR_MODULE.BrowserTabAdapter
 
 _ADAPTER_PATH = _SCRIPTS_DIR / "codex_chrome_extension_adapter.py"
 _SPEC = importlib.util.spec_from_file_location("codex_chrome_extension_adapter", _ADAPTER_PATH)
-assert _SPEC and _SPEC.loader, "implement codex_chrome_extension_adapter.py before enabling the live bridge"
+assert _SPEC and _SPEC.loader
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
@@ -44,190 +38,141 @@ CodexChromeExtensionAdapter = _MODULE.CodexChromeExtensionAdapter
 
 LINKEDIN = "https://www.linkedin.com/jobs/view/123456"
 INDEED = "https://in.indeed.com/viewjob?jk=abc_123"
-_ENDPOINT = "http://127.0.0.1:8765"
-_TOKEN = "private-test-bridge-token"
 
 
-class _Response:
-    def __init__(self, status: int, payload: object = b"") -> None:
-        self.status = status
-        self._payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+class ResponseStream:
+    def __init__(self, frames: list[str]) -> None:
+        self.frames = frames
+        self.read_limits: list[int] = []
 
-    def read(self) -> bytes:
-        return self._payload
-
-
-class _Connection:
-    def __init__(self, response: _Response) -> None:
-        self._response = response
-        self.requests: list[tuple[str, str, bytes | None, dict[str, str]]] = []
-        self.closed = False
-
-    def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None) -> None:
-        self.requests.append((method, path, body, dict(headers or {})))
-
-    def getresponse(self) -> _Response:
-        return self._response
-
-    def close(self) -> None:
-        self.closed = True
+    def readline(self, size: int = -1) -> str:
+        self.read_limits.append(size)
+        return self.frames.pop(0) if self.frames else ""
 
 
-def _adapter(
-    response: _Response = _Response(200, {"urls": [LINKEDIN, INDEED]}),
-) -> tuple[CodexChromeExtensionAdapter, _Connection]:
-    connection = _Connection(response)
+class RequestStream:
+    def __init__(self) -> None:
+        self.frames: list[str] = []
+        self.flush_count = 0
 
-    def connection_factory(host: str, port: int, *, timeout: float) -> _Connection:
-        assert (host, port, timeout) == ("127.0.0.1", 8765, 4.0)
-        return connection
+    def write(self, value: str) -> int:
+        self.frames.append(value)
+        return len(value)
 
+    def flush(self) -> None:
+        self.flush_count += 1
+
+
+def _frame(payload: object) -> str:
+    return json.dumps(payload, separators=(",", ":")) + "\n"
+
+
+def _adapter(*responses: object) -> tuple[CodexChromeExtensionAdapter, RequestStream, ResponseStream]:
+    request_stream = RequestStream()
+    response_stream = ResponseStream([response if isinstance(response, str) else _frame(response) for response in responses])
     return (
-        CodexChromeExtensionAdapter(
-            _ENDPOINT,
-            token=_TOKEN,
-            connection_factory=connection_factory,
-            timeout_seconds=4,
-        ),
-        connection,
+        CodexChromeExtensionAdapter(response_stream=response_stream, request_stream=request_stream),
+        request_stream,
+        response_stream,
     )
 
 
 def _assert_redacted(exception: BaseException, *private_values: str) -> None:
-    rendered = str(exception)
     for value in private_values:
-        assert value not in rendered
+        assert value not in str(exception)
 
 
 def test_adapter_is_a_bounded_listing_protocol_for_live_smart_queue() -> None:
-    adapter, _connection = _adapter()
+    adapter, _requests, _responses = _adapter({"id": "request-1", "ok": True, "urls": []})
 
-    assert adapter.smart_queue_adapter == "codex-chrome-extension"
+    assert adapter.smart_queue_adapter == "codex-chrome-extension-stdio"
     assert isinstance(adapter, BrowserTabAdapter)
-    assert callable(adapter.list_tab_urls)
-    assert callable(adapter.open_listing)
     for prohibited_name in ("click", "fill", "upload", "submit", "close_tab", "inspect_page"):
         assert not hasattr(adapter, prohibited_name)
 
 
-@pytest.mark.parametrize(
-    "endpoint",
-    (
-        "https://127.0.0.1:8765",
-        "http://localhost:8765",
-        "http://127.0.0.1",
-        "http://127.0.0.1:0",
-        "http://127.0.0.1:65536",
-        "http://127.0.0.1:8765/extra",
-        "http://127.0.0.1:8765?token=leaked",
-        "http://127.0.0.1:8765#fragment",
-        "http://user:password@127.0.0.1:8765",
-        "http://192.168.1.8:8765",
-        "http://[::1]:8765",
-        "http://169.254.169.254:8765",
-    ),
-)
-def test_constructor_rejects_every_non_exact_ipv4_loopback_origin(endpoint: str) -> None:
-    with pytest.raises(ValueError) as raised:
-        CodexChromeExtensionAdapter(endpoint, token=_TOKEN)
-
-    _assert_redacted(raised.value, _TOKEN, endpoint)
-
-
-@pytest.mark.parametrize("token", (None, "", " ", 7, object()))
-def test_constructor_requires_a_nonempty_bearer_token(token: object) -> None:
-    with pytest.raises((TypeError, ValueError)) as raised:
-        CodexChromeExtensionAdapter(_ENDPOINT, token=token)
-
-    _assert_redacted(raised.value, _TOKEN)
-
-
-def test_list_tab_urls_uses_only_the_exact_authenticated_get_route() -> None:
-    adapter, connection = _adapter()
+def test_list_and_open_use_sequence_matched_ndjson_stderr_requests() -> None:
+    adapter, requests, responses = _adapter(
+        {"id": "request-1", "ok": True, "urls": [LINKEDIN, INDEED]},
+        {"id": "request-2", "ok": True},
+    )
 
     assert adapter.list_tab_urls() == (LINKEDIN, INDEED)
+    adapter.open_listing(LINKEDIN)
 
-    assert connection.requests == [
-        (
-            "GET",
-            "/v1/tab-urls",
-            None,
-            {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {_TOKEN}",
-            },
-        )
+    assert requests.frames == [
+        '{"id":"request-1","operation":"list_tab_urls"}\n',
+        f'{{"id":"request-2","operation":"open_listing","url":"{LINKEDIN}"}}\n',
     ]
-    assert connection.closed is True
+    assert requests.flush_count == 2
+    assert responses.read_limits == [1_048_577, 1_048_577]
 
 
-def test_list_tab_urls_returns_only_canonical_listing_urls() -> None:
-    adapter, _connection = _adapter(
-        _Response(
-            200,
-            {
-                "urls": [
-                    "https://WWW.LinkedIn.com/jobs/view/123456/?trk=public_jobs&utm_source=host",
-                    "https://IN.INDEED.com/viewjob/?jk=abc_123&utm_source=host",
-                ]
-            },
-        )
+def test_list_tab_urls_canonicalizes_the_bounded_url_response() -> None:
+    adapter, _requests, _responses = _adapter(
+        {
+            "id": "request-1",
+            "ok": True,
+            "urls": [
+                "https://WWW.LinkedIn.com/jobs/view/123456/?trk=public_jobs&utm_source=host",
+                "https://IN.INDEED.com/viewjob/?jk=abc_123&utm_source=host",
+            ],
+        }
     )
 
     assert adapter.list_tab_urls() == (LINKEDIN, INDEED)
 
 
 @pytest.mark.parametrize(
-    "untrusted_url",
+    "response",
     (
-        "https://mail.example.test/inbox?private=value",
-        "https://www.linkedin.com/jobs/search/?keywords=python",
-        "https://www.linkedin.com/jobs/view/123456/apply/",
-        "https://in.indeed.com/viewjob?jk=abc_123&session=private",
+        "not-json\n",
+        '{"id":"request-1","ok":true,"urls":[]}\r\n',
+        '{"id":"request-1","ok":true,"urls":[]}',
+        {"id": "request-2", "ok": True, "urls": []},
+        {"id": "request-1", "ok": True, "urls": [], "diagnostic": "private browser state"},
+        {"id": None, "ok": False, "error": "private browser state"},
+        {"id": "request-1", "ok": True, "urls": ["https://mail.example.test/inbox?private=value"]},
     ),
 )
-def test_list_tab_urls_rejects_private_or_noncanonical_urls_from_untrusted_snapshot(
-    untrusted_url: str,
+def test_list_rejects_malformed_or_untrusted_responses_without_leaking_them(response: object) -> None:
+    private_value = "private browser state"
+    adapter, _requests, _responses = _adapter(response)
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        adapter.list_tab_urls()
+
+    _assert_redacted(raised.value, private_value, "https://mail.example.test/inbox?private=value")
+
+
+@pytest.mark.parametrize("operation", ("list", "open"))
+def test_generic_rejection_response_requires_the_matching_request_id(operation: str) -> None:
+    adapter, _requests, _responses = _adapter(
+        {"id": "request-1", "ok": False, "error": "request_failed"}
+    )
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        if operation == "list":
+            adapter.list_tab_urls()
+        else:
+            adapter.open_listing(LINKEDIN)
+
+    assert str(raised.value) == "browser bridge rejected the request"
+    _assert_redacted(raised.value, LINKEDIN)
+
+
+@pytest.mark.parametrize("response_id", (None, "request-2"))
+def test_generic_rejection_response_rejects_a_missing_or_mismatched_request_id(
+    response_id: object,
 ) -> None:
-    adapter, _connection = _adapter(_Response(200, {"urls": [LINKEDIN, untrusted_url]}))
+    adapter, _requests, _responses = _adapter(
+        {"id": response_id, "ok": False, "error": "request_failed"}
+    )
 
     with pytest.raises(BrowserAdapterError) as raised:
         adapter.list_tab_urls()
 
-    _assert_redacted(raised.value, _TOKEN, LINKEDIN, untrusted_url, _ENDPOINT)
-
-
-def test_list_tab_urls_rejects_malformed_or_non_string_json_without_leaking_response() -> None:
-    private_payload = {"urls": [LINKEDIN, 7], "diagnostic": "private browser state"}
-    adapter, _connection = _adapter(_Response(200, private_payload))
-
-    with pytest.raises(BrowserAdapterError) as raised:
-        adapter.list_tab_urls()
-
-    _assert_redacted(raised.value, _TOKEN, LINKEDIN, "private browser state", _ENDPOINT)
-
-
-@pytest.mark.parametrize("payload", (b"not-json", {"url": LINKEDIN}, [], "not-an-object"))
-def test_list_tab_urls_rejects_nonconforming_payload_shapes(payload: object) -> None:
-    adapter, _connection = _adapter(_Response(200, payload))
-
-    with pytest.raises(BrowserAdapterError) as raised:
-        adapter.list_tab_urls()
-
-    _assert_redacted(raised.value, _TOKEN, LINKEDIN, _ENDPOINT)
-
-
-def test_network_failures_are_typed_and_redacted() -> None:
-    def connection_factory(_host: str, _port: int, *, timeout: float) -> Any:
-        assert timeout == 15
-        raise OSError(f"cannot reach {_ENDPOINT} with {_TOKEN}")
-
-    adapter = CodexChromeExtensionAdapter(_ENDPOINT, token=_TOKEN, connection_factory=connection_factory)
-
-    with pytest.raises(BrowserAdapterError) as raised:
-        adapter.list_tab_urls()
-
-    _assert_redacted(raised.value, _TOKEN, _ENDPOINT)
+    assert str(raised.value) == "browser bridge returned invalid data"
 
 
 @pytest.mark.parametrize(
@@ -241,48 +186,21 @@ def test_network_failures_are_typed_and_redacted() -> None:
         "https://in.indeed.com/viewjob?jk=abc_123&session=private",
     ),
 )
-def test_open_listing_rejects_noncanonical_or_application_urls_before_network_io(url: str) -> None:
-    called = False
-
-    def connection_factory(_host: str, _port: int, *, timeout: float) -> Any:
-        nonlocal called
-        called = True
-        raise AssertionError("invalid listing URL must not create a bridge connection")
-
-    adapter = CodexChromeExtensionAdapter(_ENDPOINT, token=_TOKEN, connection_factory=connection_factory)
+def test_open_listing_rejects_noncanonical_or_application_urls_before_stream_io(url: str) -> None:
+    adapter, requests, responses = _adapter({"id": "request-1", "ok": True})
 
     with pytest.raises(ValueError) as raised:
         adapter.open_listing(url)
 
-    assert called is False
-    _assert_redacted(raised.value, _TOKEN, url, _ENDPOINT)
+    assert requests.frames == []
+    assert responses.read_limits == []
+    _assert_redacted(raised.value, url)
 
 
-def test_open_listing_canonicalizes_then_uses_only_the_exact_authenticated_post_route() -> None:
-    adapter, connection = _adapter(_Response(204))
-
-    adapter.open_listing("https://WWW.LinkedIn.com/jobs/view/123456/?trk=public_jobs&utm_source=host")
-
-    assert connection.requests == [
-        (
-            "POST",
-            "/v1/open-listing",
-            json.dumps({"url": LINKEDIN}, separators=(",", ":")).encode("utf-8"),
-            {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {_TOKEN}",
-                "Content-Type": "application/json",
-            },
-        )
-    ]
-    assert connection.closed is True
-
-
-@pytest.mark.parametrize("status", (200, 201, 400, 401, 403, 404, 500))
-def test_open_listing_requires_no_content_success_and_redacts_listing_and_token(status: int) -> None:
-    adapter, _connection = _adapter(_Response(status, {"detail": f"private {_TOKEN} {LINKEDIN}"}))
+def test_open_listing_rejects_non_generic_response_without_leaking_listing_url() -> None:
+    adapter, _requests, _responses = _adapter({"id": "request-1", "ok": True, "url": LINKEDIN})
 
     with pytest.raises(BrowserAdapterError) as raised:
         adapter.open_listing(LINKEDIN)
 
-    _assert_redacted(raised.value, _TOKEN, LINKEDIN, _ENDPOINT)
+    _assert_redacted(raised.value, LINKEDIN)

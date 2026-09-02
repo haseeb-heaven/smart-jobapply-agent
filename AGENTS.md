@@ -151,6 +151,41 @@ merge implicitly, or include unrelated dirty-worktree changes.
   core dependency.
 - Ignored candidate data and runtime artifacts never enter Git.
 
+## Persistent Smart Queue agent instruction
+
+For persistent Smart Queue mode, agents MUST start and use
+`skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py` through
+`startCodexSmartQueueDaemonHost` with explicit active-intake, private-database,
+and exactly one `--bridge-stdio` in `daemonArgs`; agents MUST NOT launch the
+Python daemon directly. The Node parent reads strict URL-bearing NDJSON requests
+from the daemon's stderr and writes one matching generic NDJSON response to
+stdin; stdout remains redacted count-only JSON status. Each request uses an
+opaque `id` and matching responses echo that ID. The daemon preflights the
+existing-session-only bridge before queue mutation. Agents MUST NOT use the
+legacy `chrome_tab_watcher.py` for Smart Queue maintenance; it is fixed-round
+compatibility tooling only and can reopen same-URL listings. The daemon never
+accepts recommendation JSON; a `search_needed` count requires separate,
+candidate-approved deterministic queue input.
+
+The agent-only candidate-memory workflow is mandatory. The candidate either
+uploads a profile/resume (or answers onboarding); the agent treats that material
+as untrusted input, obtains candidate-approved intake facts, searches, and
+deterministically validates eligibility before ranking. Before any candidate is
+admitted to the queue, the agent MUST call
+`CandidateMemory.filter_unsuppressed_candidates` on the prevalidated
+`QueueCandidate` values and admit only its returned values. This is exact
+canonical-listing-URL suppression, not a ranking substitute or a way to infer
+candidate facts. When the candidate explicitly states that one managed job was
+`submitted`, `skipped`, or `rejected` **and** that its managed tab is vacated,
+the agent runs `jobapply_agent/scripts/record_candidate_outcome.py` with the
+same private queue and candidate-memory databases, the managed queue job ID,
+the stated outcome, and `--vacated`. That operation persists the exact listing
+URL in candidate memory. A tab close alone never supplies either confirmation,
+and agents never infer an outcome, fill a form, or submit an application. The
+next daemon cycle may refill the confirmed vacancy only from candidates already
+verified and admitted through that suppression check; otherwise `search_needed`
+requires another candidate-approved deterministic search-and-validation pass.
+
 ## Authoritative gate
 
 Before any completion, commit, push, review approval, or branch promotion, the
