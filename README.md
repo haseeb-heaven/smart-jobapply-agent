@@ -69,8 +69,8 @@ signals, not safety or correctness scores.
 
 The differentiator is therefore the **Smart Job Queue**: an agent-managed,
 candidate-controlled set of 1–10 evidence-ranked managed listing tabs (default
-5) that is refilled only after the candidate confirms an outcome and a tab is
-actually vacated.
+5) that is refilled only after the candidate explicitly confirms both an
+outcome and that the managed tab has been vacated.
 
 ### What is distinctive in this repo
 
@@ -137,7 +137,7 @@ verified profile + preferences + application history
                         v
        browser snapshot records missing tabs as awaiting_outcome
                         |
-        candidate confirms submitted / rejected / skipped
+ candidate explicitly confirms outcome and that managed tab is vacated
                         |
                         v
         agent searches for search_needed replacements
@@ -168,7 +168,7 @@ You apply to 2
       ↓
 Agent notices / you tell agent
       ↓
-Those 2 are logged (user-confirmed outcome only)
+Those 2 are logged only after the candidate confirms the outcome and vacancy
       ↓
 Agent searches again
       ↓
@@ -189,10 +189,11 @@ Use `jobapply_agent.smart_queue.SmartJobQueue` as the persistent queue authority
 The host keeps its live queue database under the ignored
 `jobapply_agent/private/` directory; a live entry point must reject any other
 location. `record_visible_snapshot` observes only URLs. A missing tab enters
-`awaiting_outcome` and remains a reserved slot until the candidate confirms
-`submitted`, `rejected`, or `skipped`; it never records an application.
-`plan_refill` returns data-only exact URLs and a `search_needed` count only for
-legitimate confirmed vacancies. The host LLM searches when needed, constructs
+`awaiting_outcome` and remains a reserved slot until the candidate explicitly
+confirms both `submitted`, `rejected`, or `skipped` and that its managed tab is
+vacated; it never records an application. An observed missing URL is not that
+vacancy confirmation. `plan_refill` returns data-only exact URLs and a
+`search_needed` count only for legitimate candidate-confirmed vacancies. The host LLM searches when needed, constructs
 only prevalidated deterministic `QueueCandidate` values, creates the live queue
 with `discover.smart_queue_for_active_intake(intake_path, database_path)`, and
 then passes that integrity-bound queue to the skill-level
@@ -204,15 +205,18 @@ Chrome bridge is a reference implementation for an already-connected session,
 requires its durable queue database to resolve inside the ignored
 `jobapply_agent/private/` runtime directory, and exposes counts and opaque
 queue IDs only; URLs never leave its reconciliation boundary. Only
-`confirm_outcome(..., actor="user")` records an outcome.
+the candidate's explicit dual confirmation records an outcome; an implementation
+must require that confirmation to state both the outcome and that the managed
+tab is vacated before calling its candidate-owned outcome-recording operation.
 
-An outcome-confirmed tab that remains physically open still occupies one of the
-managed slots. The agent never closes it; replacement waits until the candidate
-closes it. If the candidate lowers capacity below already managed tabs, the
-agent opens nothing and never closes, revokes, or reclassifies any tab; the
-queue returns to capacity only through candidate-controlled outcomes and tab
-closures. This keeps the visible browser queue bounded without granting close
-or form authority.
+The monitor never treats a physically missing tab as confirmation that the
+candidate vacated it: a manual application or continuation route can make the
+managed listing URL disappear while the candidate is still using that work.
+The agent never closes tabs. If the candidate lowers capacity below already
+managed tabs, the agent opens nothing and never closes, revokes, or reclassifies
+any tab; the queue returns to capacity only through candidate-controlled dual
+outcome-and-vacancy confirmations. This keeps the visible browser queue bounded
+without granting close or form authority.
 
 In contrast to full-automation tools, this implementation is opinionated toward
 being an interview-ready co-pilot workflow: deterministic ranking, strict history
@@ -526,13 +530,34 @@ python jobapply_agent/scripts/discover.py \
 For Smart Job Queue operation, ask the candidate during onboarding: “How many
 managed job listing tabs do you want open? (1–10; default 5.)” Store only an
 explicit candidate choice; an absent choice uses the documented default without
-being inferred from unrelated browser tabs. Feed the visible tab URLs into
-`record_visible_snapshot`, call `plan_refill`, then open only its returned URLs
-through the bounded browser adapter. The legacy watcher below preserves one
-fixed five-tab round by reopening the same URLs; it is separate legacy tooling,
-not a Smart Queue capacity authority. Use it only when the candidate explicitly
-asks to hold that exact round rather than replenish it. For any operating system
-or browser, supply a conforming external bridge as an argv prefix:
+being inferred from unrelated browser tabs.
+
+For persistent Smart Queue monitoring, embed
+`skills/easy-apply-tab-monitor/scripts/persistent_smart_queue_monitor.py` in
+the host and initialize `PersistentSmartQueueMonitor` with the host's
+`SmartQueueCoordinator` and, when searches are needed, its candidate provider.
+It is not a standalone command or CLI: do not invoke it with adapter arguments
+or use it to create a browser bridge. The monitor is existing-session-only; the
+host must supply a listing-only adapter for an already-connected browser
+session. It must never launch a browser, create a session or window, close a
+tab, or inspect page content. Its sole browser operations are listing current
+tab URLs and opening an exact, already-approved LinkedIn or Indeed listing URL.
+
+Each cycle records a URL-only snapshot through the coordinator. A missing
+managed tab becomes `awaiting_outcome`; the monitor does not infer an
+application, a vacancy, reopen that listing, or replace it. Before the monitor
+records `submitted`, `rejected`, or `skipped`, the candidate must explicitly
+confirm both that outcome and that the managed tab is vacated. A missing URL
+does not substitute for that confirmation, because a manual application or
+continuation route can hide the listing while the candidate still needs the
+slot. Only after that dual confirmation may the monitor request and open an
+approved replacement. It never fills, uploads, applies, or submits.
+
+The legacy watcher below preserves one fixed five-tab round by reopening the
+same URLs. It is separate legacy tooling, not a Smart Queue capacity authority;
+use it only when the candidate explicitly asks to hold that exact round rather
+than replenish it. For any operating system or browser, supply its conforming
+external bridge as an argv prefix:
 
 ```sh
 python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \
