@@ -21,6 +21,10 @@ Use this skill when the candidate wants job listings opened for manual applicati
   `submitted`; it keeps the slot reserved until the candidate confirms an
   outcome. The legacy fixed-round watcher reopens the same URL only when the
   candidate explicitly requests that behavior.
+- The live Smart Queue host supplies already-validated `QueueCandidate` values
+  directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
+  recommendation-file CLI. Its local queue database must be under
+  `jobapply_agent/private/`, which is ignored, never at repository root.
 
 ## Workflow
 
@@ -32,13 +36,14 @@ Use this skill when the candidate wants job listings opened for manual applicati
    content or opens a form.
 4. Read prior-application state from the local tracker. Anything not explicitly
    candidate-confirmed remains `unknown`.
-5. In Smart Queue mode, compare visible URLs and record missing jobs as
-   `awaiting_outcome`. Wait for candidate-confirmed outcomes before planning
-   replacements, then open only returned exact listing URLs. If the pool is
-   short, report `search_needed` to the host agent.
-6. Return a compact table of active, waiting, awaiting-outcome, confirmed, and
-   replacement jobs. Stop after the requested monitoring cycle unless the
-   candidate asks for another cycle.
+5. In Smart Queue mode, the host gives `SmartQueueCoordinator(queue, browser)`
+   up to five prevalidated candidates directly. It compares visible URLs and
+   records missing jobs as `awaiting_outcome`. Wait for candidate-confirmed
+   outcomes before planning replacements, then open only returned exact listing
+   URLs. If the pool is short, report `search_needed` to the host agent.
+6. The coordinator result contains counts and opaque queue IDs only; URLs and
+   snapshots remain inside the skill. Stop after the requested monitoring cycle
+   unless the candidate asks for another cycle.
 
 ## Persistent monitoring
 
@@ -48,7 +53,9 @@ use
 external --adapter-command <bridge-argv...>`. The legacy filename is retained
 for compatibility; the external bridge supports any browser and operating
 system through the `list-tabs`/`open-listing` argv/JSON protocol. The optional
-`chrome-applescript` adapter supports macOS Chrome only. The monitor reopens
+`chrome-applescript` adapter supports only an already-running macOS Chrome
+session with an existing window; it fails closed when unavailable. It is legacy
+fixed-round compatibility, not a Smart Queue adapter. The monitor reopens
 only missing listing URLs and writes one counts-only, redacted JSON status line
 per cycle; exact approved/browser URLs remain internal to reconciliation and are
 never included in CLI status output.

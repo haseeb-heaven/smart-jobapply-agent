@@ -73,7 +73,7 @@ on run argv
     if application "Google Chrome" is not running then error "Chrome is not running"
     tell application "Google Chrome"
         if (count of windows) = 0 then error "Chrome has no existing window"
-        tell front window to make new tab at end of tabs with properties {URL:targetUrl}
+        tell window 1 to make new tab at end of tabs with properties {URL:targetUrl}
     end tell
 end run
 """
@@ -257,6 +257,12 @@ def _run_osascript(script: str, args: Sequence[str], runner: Callable[..., subpr
 
 
 class ChromeAppleScript:
+    # This optional adapter is for the legacy fixed-round watcher only. Smart
+    # Queue execution receives a host-supplied BrowserTabAdapter and never
+    # selects this compatibility path. Apple Events cannot make an atomic
+    # no-launch guarantee across the running/window preflight and the later
+    # command, so a vanished Chrome session is treated as an unavailable,
+    # redacted failure rather than retried or launched.
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> None:
         self._runner = runner
 

@@ -62,7 +62,7 @@ class QueueCandidate:
     matcher_policy_revision: str
 
     def __post_init__(self) -> None:
-        job_id = _require_identifier(self.job_id, "job_id")
+        job_id = _require_opaque_job_id(self.job_id)
         source_url = _require_listing_url(self.source_url)
         if isinstance(self.fit_score, bool) or not isinstance(self.fit_score, int):
             raise QueuePolicyError("fit_score must be an integer")
@@ -136,6 +136,15 @@ def _require_identifier(value: object, label: str) -> str:
     if not cleaned or len(cleaned) > _MAX_IDENTIFIER_LENGTH or any(ord(character) < 32 for character in cleaned):
         raise QueuePolicyError(f"{label} must be a non-empty safe identifier")
     return cleaned
+
+
+def _require_opaque_job_id(value: object) -> str:
+    """Reject URL-like job identifiers before they can reach public results."""
+
+    job_id = _require_identifier(value, "job_id")
+    if "://" in job_id:
+        raise QueuePolicyError("job_id must be an opaque identifier, not a URL")
+    return job_id
 
 
 def _require_actor(value: object) -> str:

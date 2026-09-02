@@ -180,13 +180,18 @@ uploads, or submits. It only curates evidence, tracks state, and opens the next
 list of exact listing URLs when the queue opens up.
 
 Use `jobapply_agent.smart_queue.SmartJobQueue` as the persistent queue authority.
-`record_visible_snapshot` observes only URLs. A missing tab enters
+The host keeps its live queue database under the ignored
+`jobapply_agent/private/` directory; a live entry point must reject any other
+location. `record_visible_snapshot` observes only URLs. A missing tab enters
 `awaiting_outcome` and remains a reserved slot until the candidate confirms
 `submitted`, `rejected`, or `skipped`; it never records an application.
 `plan_refill` returns data-only exact URLs and a `search_needed` count only for
-legitimate confirmed vacancies. The host LLM searches when needed, adds only
-deterministic `recommended` candidates, and asks its browser bridge to open the
-returned URLs. Only `confirm_outcome(..., actor="user")` records an outcome.
+legitimate confirmed vacancies. The host LLM searches when needed, constructs
+only prevalidated deterministic `QueueCandidate` values, and passes them
+directly to the skill-level `SmartQueueCoordinator(queue, browser)`. That
+coordinator is the only live browser orchestration path and exposes counts and
+opaque queue IDs only; URLs never leave its reconciliation boundary. Only
+`confirm_outcome(..., actor="user")` records an outcome.
 
 An outcome-confirmed tab that remains physically open still occupies one of the
 five slots. The agent never closes it; replacement waits until the candidate
@@ -520,7 +525,11 @@ python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \
 `--adapter-command` must be last; all remaining tokens are passed as argv without
 a shell. The legacy script name is retained for compatibility. On macOS only, agents may
 explicitly select the optional built-in bridge with
-`--adapter chrome-applescript` and omit `--adapter-command`.
+`--adapter chrome-applescript` and omit `--adapter-command`. It requires an
+already-running Chrome session with an existing window and fails closed when
+that session is unavailable. It is for the legacy fixed-round watcher only;
+Smart Queue hosts provide their own URL-only adapter directly and never receive
+a generic AppleScript capability. Neither route performs a form action.
 
 ## MANDATORY MULTI-AGENT DELIVERY
 

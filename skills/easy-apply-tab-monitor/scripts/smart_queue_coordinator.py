@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Protocol, runtime_checkable
 
-from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueueJob, SmartJobQueue
+from jobapply_agent.smart_queue import QueueAction, QueueCandidate, SmartJobQueue
 
 
 @runtime_checkable
@@ -31,15 +31,24 @@ class QueueCoordinatorError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class QueueCycle:
-    """URL-only observations and data-only actions from one bounded cycle."""
+    """Redacted public outcome from one bounded reconciliation cycle.
 
-    initial_snapshot: tuple[str, ...]
-    follow_up_snapshot: tuple[str, ...]
-    initial_action: QueueAction
-    refill_action: QueueAction
-    requested_action: QueueAction
+    Browser URLs are private reconciliation inputs. Callers receive only
+    counts and opaque queue IDs, never snapshots or URL-bearing actions.
+    """
+
+    requested_open_job_ids: tuple[str, ...]
     opened_job_ids: tuple[str, ...]
     open_failed_job_ids: tuple[str, ...]
+    search_needed: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueueOutcome:
+    """A candidate-confirmed outcome without recommendation or URL data."""
+
+    job_id: str
+    state: str
 
 
 class SmartQueueCoordinator:
@@ -61,6 +70,8 @@ class SmartQueueCoordinator:
 
     @staticmethod
     def _combine_actions(initial: QueueAction, refill: QueueAction) -> QueueAction:
+        """Combine private queue actions for this skill-boundary call only."""
+
         return QueueAction(
             job_ids=(*initial.job_ids, *refill.job_ids),
             urls_to_open=(*initial.urls_to_open, *refill.urls_to_open),
@@ -88,7 +99,7 @@ class SmartQueueCoordinator:
             refill_action = initial_action
             requested_action = initial_action
 
-        opened_job_ids: list[str] = []
+        attempted_job_ids: list[str] = []
         open_failed_job_ids: list[str] = []
         for job_id, url in zip(requested_action.job_ids, requested_action.urls_to_open, strict=True):
             try:
@@ -97,25 +108,28 @@ class SmartQueueCoordinator:
                 self._queue.record_open_failure(job_id, actor="browser-bridge")
                 open_failed_job_ids.append(job_id)
             else:
-                opened_job_ids.append(job_id)
+                attempted_job_ids.append(job_id)
 
         try:
             follow_up_snapshot = self._snapshot()
         except QueueCoordinatorError:
-            self._release_unverified_open_reservations(opened_job_ids, open_failed_job_ids)
+            self._release_unverified_open_reservations(attempted_job_ids, open_failed_job_ids)
             raise
 
         self._queue.record_visible_snapshot(follow_up_snapshot, actor="browser-bridge")
-        self._release_unverified_open_reservations(opened_job_ids, open_failed_job_ids)
+        self._release_unverified_open_reservations(attempted_job_ids, open_failed_job_ids)
+        open_failed_ids = set(open_failed_job_ids)
+        opened_job_ids = tuple(
+            job_id
+            for job_id in attempted_job_ids
+            if job_id not in open_failed_ids and self._queue.get(job_id).state == "open"
+        )
 
         return QueueCycle(
-            initial_snapshot=initial_snapshot,
-            follow_up_snapshot=follow_up_snapshot,
-            initial_action=initial_action,
-            refill_action=refill_action,
-            requested_action=requested_action,
-            opened_job_ids=tuple(opened_job_ids),
-            open_failed_job_ids=tuple(open_failed_job_ids),
+            requested_open_job_ids=requested_action.job_ids,
+            opened_job_ids=opened_job_ids,
+            open_failed_job_ids=tuple(dict.fromkeys(open_failed_job_ids)),
+            search_needed=refill_action.search_needed,
         )
 
     def _release_unverified_open_reservations(
@@ -126,10 +140,11 @@ class SmartQueueCoordinator:
                 self._queue.record_open_failure(job_id, actor="browser-bridge")
                 open_failed_job_ids.append(job_id)
 
-    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueJob:
-        """Forward only an explicit candidate-owned queue outcome."""
+    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueOutcome:
+        """Record a candidate-owned outcome and return its opaque public view."""
 
-        return self._queue.confirm_outcome(job_id, outcome, actor=actor)
+        confirmed = self._queue.confirm_outcome(job_id, outcome, actor=actor)
+        return QueueOutcome(job_id=confirmed.job_id, state=confirmed.state)
 
 
-__all__ = ["BrowserTabAdapter", "QueueCoordinatorError", "QueueCycle", "SmartQueueCoordinator"]
+__all__ = ["BrowserTabAdapter", "QueueCoordinatorError", "QueueCycle", "QueueOutcome", "SmartQueueCoordinator"]

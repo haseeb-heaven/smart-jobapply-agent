@@ -209,7 +209,12 @@ def create_adapter(
     runner: Runner = subprocess.run,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> BrowserTabAdapter:
-    """Create an explicitly selected browser adapter."""
+    """Create an adapter for the legacy fixed-round watcher only.
+
+    The Smart Queue coordinator does not call this factory: its host supplies
+    an already-bounded adapter directly. The optional AppleScript path is
+    therefore unavailable to live Smart Queue execution.
+    """
 
     if adapter == "external":
         if command is None:
