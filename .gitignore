@@ -34,3 +34,4 @@ venv/
 # Candidate-supplied material and local job-search notes must never be staged.
 resumes/
 codex-apply-*.*
+.job-tab-monitor.json

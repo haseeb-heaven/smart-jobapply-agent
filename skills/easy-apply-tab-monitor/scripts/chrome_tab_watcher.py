@@ -54,7 +54,9 @@ _SAFE_TRACKING_QUERY_KEYS = frozenset(
 
 _LIST_TAB_URLS = """
 set allUrls to {}
+if application "Google Chrome" is not running then error "Chrome is not running"
 tell application "Google Chrome"
+    if (count of windows) = 0 then error "Chrome has no existing window"
     repeat with aWindow in windows
         repeat with aTab in tabs of aWindow
             set end of allUrls to (URL of aTab)
@@ -68,10 +70,10 @@ return allUrls as text
 _OPEN_LISTING = """
 on run argv
     set targetUrl to item 1 of argv
+    if application "Google Chrome" is not running then error "Chrome is not running"
     tell application "Google Chrome"
-        if (count of windows) = 0 then make new window
+        if (count of windows) = 0 then error "Chrome has no existing window"
         tell front window to make new tab at end of tabs with properties {URL:targetUrl}
-        activate
     end tell
 end run
 """

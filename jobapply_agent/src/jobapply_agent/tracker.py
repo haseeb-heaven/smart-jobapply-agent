@@ -96,8 +96,8 @@ def _is_user_actor(actor: str) -> bool:
 def transition_application(application: ApplicationRecord, target: ReviewState, actor: str) -> ApplicationRecord:
     """Validate a pure review-state transition without performing any action.
 
-    ``submitted`` only records that a user says they submitted elsewhere. It
-    does not visit a source URL, fill a form, or click a submission control.
+    ``submitted`` and ``rejected`` only record an explicit user-reported
+    outcome. They do not visit a source URL, fill a form, or click a control.
     """
 
     actor = _require_actor(actor)
@@ -105,8 +105,8 @@ def transition_application(application: ApplicationRecord, target: ReviewState, 
         raise InvalidTransition(f"unknown review state: {target!r}")
     if target not in _ALLOWED_TRANSITIONS[application.status]:
         raise InvalidTransition(f"cannot move {application.status!r} to {target!r}")
-    if target == "submitted" and not _is_user_actor(actor):
-        raise InvalidTransition("submitted status requires a user actor")
+    if target in {"submitted", "rejected"} and not _is_user_actor(actor):
+        raise InvalidTransition("submitted and rejected statuses require the exact user actor")
     if target == "submitted":
         return replace(application, status=target, submitted_at=_utc_now(), submitted_by=actor)
     return replace(application, status=target)

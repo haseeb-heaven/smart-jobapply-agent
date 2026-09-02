@@ -577,11 +577,20 @@ class SmartJobQueue:
     def _known_visible_urls(
         self,
         rows: Iterable[sqlite3.Row],
-        visible_urls: set[str],
+        visible_urls: Iterable[str],
     ) -> set[str]:
-        """Validate the fixed capacity using only known canonical listings."""
+        """Validate the fixed capacity using only known canonical listings.
 
-        known_visible = {str(row["source_url"]) for row in rows} & visible_urls
+        Unrelated tabs, including unrelated listing pages, cannot consume queue
+        capacity. Duplicate URLs for a managed listing make the physical-slot
+        state ambiguous, so they are rejected rather than silently collapsed.
+        """
+
+        managed_urls = {str(row["source_url"]) for row in rows}
+        known_visible_values = [url for url in visible_urls if url in managed_urls]
+        known_visible = set(known_visible_values)
+        if len(known_visible) != len(known_visible_values):
+            raise QueuePolicyError("visible queue listings must not contain duplicate managed URLs")
         if len(known_visible) > self.target_size:
             raise QueuePolicyError("visible queue listings cannot exceed five jobs")
         return known_visible
@@ -817,60 +826,27 @@ class SmartJobQueue:
 
         connection = self._transaction()
         try:
-            rows = connection.execute(
-                """
-                SELECT
-                    jobs.job_id,
-                    jobs.source_url,
-                    jobs.fit_score,
-                    jobs.eligible,
-                    jobs.decision,
-                    jobs.evidence_json,
-                    jobs.profile_revision,
-                    jobs.matcher_policy_revision,
-                    jobs.rowid AS insertion_order,
-                    events.name AS latest_event,
-                    EXISTS(
-                        SELECT 1 FROM smart_queue_events AS prior
-                        WHERE prior.job_id = jobs.job_id
-                          AND prior.name IN ('submitted', 'rejected', 'skipped')
-                    ) AS has_outcome,
-                    (
-                        SELECT prior.name FROM smart_queue_events AS prior
-                        WHERE prior.job_id = jobs.job_id
-                          AND prior.name IN ('submitted', 'rejected', 'skipped')
-                        ORDER BY prior.event_id DESC LIMIT 1
-                    ) AS outcome
-                FROM smart_queue_jobs AS jobs
-                JOIN smart_queue_events AS events ON events.event_id = (
-                    SELECT MAX(latest.event_id) FROM smart_queue_events AS latest
-                    WHERE latest.job_id = jobs.job_id
-                )
-                WHERE jobs.job_id = ?
-                """,
-                (job_id,),
-            ).fetchone()
-            if rows is None:
+            row = next((item for item in self._rows(connection) if item["job_id"] == job_id), None)
+            if row is None:
                 raise KeyError("unknown job id")
-            prior_outcome = str(rows["outcome"]) if rows["has_outcome"] else None
-            if prior_outcome is not None and prior_outcome != outcome:
-                raise QueuePolicyError("a confirmed application outcome cannot be replaced")
-            if prior_outcome is None:
-                self._append_event(connection, job_id, outcome, actor)
-            connection.commit()
-            result = self._job_from_row(rows)
-            if prior_outcome is None:
-                result = QueueJob(
-                    job_id=result.job_id,
-                    source_url=result.source_url,
-                    fit_score=result.fit_score,
-                    eligible=result.eligible,
-                    decision=result.decision,
-                    evidence=result.evidence,
-                    state=outcome,  # type: ignore[arg-type]
-                    profile_revision=result.profile_revision,
-                    matcher_policy_revision=result.matcher_policy_revision,
+            if self._state(row) not in {"open", "awaiting_outcome"}:
+                raise QueuePolicyError(
+                    "an application outcome may be confirmed only for an open or awaiting_outcome listing"
                 )
+            self._append_event(connection, job_id, outcome, actor)
+            connection.commit()
+            result = self._job_from_row(row)
+            result = QueueJob(
+                job_id=result.job_id,
+                source_url=result.source_url,
+                fit_score=result.fit_score,
+                eligible=result.eligible,
+                decision=result.decision,
+                evidence=result.evidence,
+                state=outcome,  # type: ignore[arg-type]
+                profile_revision=result.profile_revision,
+                matcher_policy_revision=result.matcher_policy_revision,
+            )
         except (QueuePolicyError, KeyError):
             connection.rollback()
             raise
@@ -984,21 +960,21 @@ class SmartJobQueue:
             self._close(connection)
 
     @staticmethod
-    def _normalize_snapshot(urls: Iterable[str]) -> set[str]:
+    def _normalize_snapshot(urls: Iterable[str]) -> tuple[str, ...]:
         if isinstance(urls, (str, bytes)):
             raise QueuePolicyError("visible URLs must be an iterable of listing URLs")
         try:
             values = tuple(urls)
         except TypeError:
             raise QueuePolicyError("visible URLs must be an iterable of listing URLs") from None
-        normalized: set[str] = set()
+        normalized: list[str] = []
         for url in values:
             if not isinstance(url, str):
                 raise QueuePolicyError("visible URLs must contain only strings")
             try:
-                normalized.add(_require_listing_url(url))
+                normalized.append(_require_listing_url(url))
             except QueuePolicyError:
                 # Browser snapshots naturally include unrelated tabs. They do
                 # not count toward queue capacity and cannot mutate queue state.
                 continue
-        return normalized
+        return tuple(normalized)
