@@ -232,6 +232,20 @@ def test_apple_script_client_lists_and_opens_supported_urls():
         chrome.open_listing("https://example.test")
 
 
+def test_chrome_compatibility_open_script_never_creates_a_window_without_an_existing_session():
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    ChromeAppleScript(runner=runner).open_listing(LINKEDIN)
+
+    script = calls[0][2]
+    assert "count of windows" in script
+    assert "make new window" not in script.casefold()
+
+
 def test_apple_script_error_is_redacted():
     def runner(_command: list[str], **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=1, stdout="")
