@@ -56,7 +56,8 @@ def _confirmed_queue_outcome(
             )
         ]
     )
-    queue.plan_refill(open_urls=[])
+    planned = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
     queue.confirm_outcome(job_id, outcome, actor="user")
     return queue, queue.confirmed_outcome_events()[0].event_id
 
@@ -389,7 +390,8 @@ def test_queue_and_reconciliation_identities_survive_restart(tmp_path: Path):
         ]
     )
     queue_id = queue.queue_id
-    queue.plan_refill(open_urls=[])
+    planned = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
     queue.confirm_outcome("job-durable", "skipped", actor="user")
 
     reloaded = SmartJobQueue(queue_database)
@@ -445,7 +447,7 @@ def test_legacy_reconciliation_rows_are_migrated_and_replay_is_fail_closed(tmp_p
                 'job-legacy', 'lifecycle', 'shortlisted', 'agent', '{{}}', '2026-09-01T00:00:00+00:00'
             );
             INSERT INTO lifecycle_queue_reconciliations VALUES (
-                3, 'job-legacy', '{source_url}', 'skipped', 'user', '2026-09-01T00:00:01+00:00'
+                4, 'job-legacy', '{source_url}', 'skipped', 'user', '2026-09-01T00:00:01+00:00'
             );
             """
         )
@@ -462,14 +464,14 @@ def test_legacy_reconciliation_rows_are_migrated_and_replay_is_fail_closed(tmp_p
         ).fetchone()
 
     assert columns[:2] == ["queue_id", "queue_event_id"]
-    assert migrated == ("legacy-unscoped", 3, "job-legacy", "skipped")
+    assert migrated == ("legacy-unscoped", 4, "job-legacy", "skipped")
     queue, queue_event_id = _confirmed_queue_outcome(
         tmp_path,
         job_id="job-legacy",
         source_url=source_url,
         outcome="skipped",
     )
-    assert queue_event_id == 3
+    assert queue_event_id == 4
     with pytest.raises(InvalidLifecycleTransition, match="unscoped legacy"):
         tracker.reconcile_queue_outcome(
             queue=queue,
@@ -560,7 +562,8 @@ def test_confirmed_queue_submission_replays_into_lifecycle_after_crash_without_d
         matcher_policy_revision="lifecycle-policy-v1",
     )
     queue.add_recommendations([candidate])
-    queue.plan_refill(open_urls=[])
+    planned = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
     queue.confirm_outcome(candidate.job_id, "submitted", actor="user")
 
     # Simulate a restart after the queue commit but before lifecycle received it.
