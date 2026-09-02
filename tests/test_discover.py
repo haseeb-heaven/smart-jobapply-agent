@@ -115,6 +115,58 @@ def write_onboarding_draft(path: Path, unknown_fields: list[str]) -> bytes:
     return path.read_bytes()
 
 
+def rich_review_payload(*, unknown_fields: list[str] | None = None) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "documents": [
+            {
+                "document_id": "PRIVATE_DOCUMENT_ID",
+                "path": "/private/candidate/resume.pdf",
+                "sha256": "a" * 64,
+                "media_type": "application/pdf",
+                "review_state": "untrusted",
+            }
+        ],
+        "approved_facts": {
+            "experience": {
+                "roles_and_dates": [
+                    {
+                        "title": "Backend Engineer",
+                        "company": "Example Systems",
+                        "dates": "2022-2024",
+                    }
+                ],
+                "achievements_and_metrics": [
+                    {
+                        "achievement": "Reduced API latency",
+                        "metric": "35 percent",
+                    }
+                ],
+            },
+            "education": [
+                {
+                    "degree": "B.Tech in Computer Science",
+                    "institution": "Example University",
+                    "year": 2020,
+                }
+            ],
+            "projects": [
+                {
+                    "name": "Queue Planner",
+                    "summary": "Bounded candidate review queue",
+                    "technologies": "Python and SQLite",
+                }
+            ],
+            "identity": {"contact": "PRIVATE_CONTACT@example.test"},
+            "resume": {"extracted_text": "RAW_RESUME_TEXT_MUST_NEVER_RENDER"},
+            "private": {"notes": "PRIVATE_CANDIDATE_NOTE"},
+        },
+        "unknown_fields": unknown_fields or [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+
+
 def run_discover_cli(intake_path: Path, *arguments: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -165,6 +217,27 @@ def test_interactive_onboarding_cli_keeps_blank_answer_unresolved_and_does_not_p
     assert "candidate_profile" in completed.stdout
     assert intake_path.read_bytes() == original
     assert json.loads(intake_path.read_text(encoding="utf-8"))["state"] == "draft"
+
+
+@pytest.mark.parametrize("terminal_answer", ("unknown", "uncertain", "ambiguous"))
+def test_interactive_onboarding_terminal_uncertainty_stays_unresolved_and_unpersisted(
+    tmp_path: Path, terminal_answer: str
+):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, ["candidate_profile"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin=f"{terminal_answer}\nyes\n",
+    )
+
+    assert completed.returncode == 2
+    assert intake_path.read_bytes() == original
+    persisted = json.loads(intake_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "draft"
+    assert persisted["unknown_fields"] == ["candidate_profile"]
+    assert "candidate_profile" not in persisted["approved_facts"]
 
 
 def test_interactive_onboarding_cli_declined_confirmation_does_not_overwrite_draft(tmp_path: Path):
@@ -375,7 +448,7 @@ def test_interactive_onboarding_cli_fails_closed_for_invalid_active_target(tmp_p
     assert intake_path.read_bytes() == original
 
 
-def test_interactive_confirmation_summarizes_safe_fields_without_answer_values(tmp_path: Path):
+def test_interactive_confirmation_summarizes_safe_fields_with_review_values(tmp_path: Path):
     intake_path = tmp_path / "private" / "candidate_intake.json"
     write_onboarding_draft(intake_path, ["candidate_profile", "education"])
 
@@ -396,8 +469,8 @@ def test_interactive_confirmation_summarizes_safe_fields_without_answer_values(t
     assert "candidate_profile" in confirmation
     assert "education" in confirmation
     assert "2" in confirmation
-    for answer in ("Backend profile", "Example University"):
-        assert answer not in completed.stdout + completed.stderr
+    assert "Backend profile" not in completed.stdout + completed.stderr
+    assert "Example University" in completed.stdout
 
 
 def test_interactive_onboarding_cli_accepts_whitespace_around_literal_yes(tmp_path: Path):
@@ -856,6 +929,65 @@ def test_discover_intake_questions_mode_can_emit_json_bundle(
         assert private_value not in rendered
 
 
+def test_candidate_facing_onboarding_summary_omits_raw_document_text(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import validate_candidate_intake
+
+    raw_document_text = "RAW_DOCUMENT_TEXT_MUST_NEVER_BE_RENDERED_TO_CANDIDATE"
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [
+                {
+                    "document_id": "resume-primary",
+                    "path": "resume.pdf",
+                    "sha256": "a" * 64,
+                    "media_type": "application/pdf",
+                    "review_state": "untrusted",
+                }
+            ],
+            "approved_facts": {"resume.extracted_text": raw_document_text},
+            "unknown_fields": ["work_authorization"],
+            "contradictions": [
+                {
+                    "field": "experience.current_title",
+                    "status": "VERIFY",
+                    "values": [raw_document_text, "Python Developer"],
+                    "evidence_ids": ["resume-primary", "candidate-note-1"],
+                }
+            ],
+            "pending_facts": [
+                {
+                    "field": "location_preferences",
+                    "status": "VERIFY",
+                    "question": f"Document excerpt: {raw_document_text}",
+                    "reason": f"Source text contains {raw_document_text}",
+                }
+            ],
+        }
+    )
+    intake_path = tmp_path / "candidate_intake.json"
+    intake_path.write_text(json.dumps(draft), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 2
+    assert payload["questions"]
+    assert raw_document_text not in captured.out + captured.err
+
+
 def test_discover_intake_questions_mode_can_emit_ready_json_bundle(
     tmp_path: Path, capsys
 ):
@@ -903,6 +1035,355 @@ def test_discover_intake_questions_mode_can_emit_ready_json_bundle(
     assert payload["pending_verification_batch"]["unknown_fields"] == []
     assert payload["pending_verification_batch"]["contradictions"] == []
     assert payload["pending_verification_batch"]["pending_facts"] == []
+
+
+def test_discover_intake_questions_mode_requires_confirmation_for_resolved_draft(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import validate_candidate_intake
+
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": {"experience": {"total_years": 3}},
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    intake_path = tmp_path / "candidate_intake.json"
+    intake_path.write_text(json.dumps({"state": "draft", **draft}), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["requires_user_confirmation"] is True
+    assert payload["candidate_review"]["status"] == "ready-for-confirmation"
+    assert payload["candidate_review"]["facts"] == [
+        {
+            "field": "experience.total_years",
+            "source": "candidate-provided-structured-intake",
+            "uncertainty": "requires-candidate-confirmation",
+            "value": 3,
+        }
+    ]
+
+
+def test_candidate_review_renders_safe_values_and_active_provenance_labels(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+
+    document = {
+        "document_id": "resume-primary",
+        "path": "resume.pdf",
+        "sha256": "a" * 64,
+        "media_type": "application/pdf",
+        "review_state": "untrusted",
+    }
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [document],
+            "approved_facts": {
+                "roles": {"include": ["Backend Developer"]},
+                "resume.extracted_text": "RAW_DOCUMENT_TEXT_MUST_NOT_RENDER",
+            },
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    draft_path = tmp_path / "draft.json"
+    draft_path.write_text(json.dumps(draft), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(draft_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+    draft_payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert draft_payload["candidate_review"]["facts"] == [
+        {
+            "field": "roles.include",
+            "source": "source-unattributed",
+            "uncertainty": "requires-candidate-confirmation",
+            "value": ["Backend Developer"],
+        }
+    ]
+    assert "RAW_DOCUMENT_TEXT_MUST_NOT_RENDER" not in json.dumps(draft_payload)
+
+    active_path = tmp_path / "active.json"
+    active_path.write_text(
+        json.dumps(activate_candidate_profile(draft, actor="user")), encoding="utf-8"
+    )
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(active_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+    active_payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert active_payload["candidate_review"]["status"] == "active"
+    assert active_payload["candidate_review"]["facts"] == [
+        {
+            "field": "roles.include",
+            "source": "candidate-approved",
+            "uncertainty": "confirmed",
+            "value": ["Backend Developer"],
+        }
+    ]
+
+
+def test_candidate_review_renders_allowlisted_rich_facts_as_bounded_structured_values(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import validate_candidate_intake
+
+    draft = validate_candidate_intake(rich_review_payload())
+    intake_path = tmp_path / "draft.json"
+    intake_path.write_text(json.dumps(draft), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    facts = {
+        item["field"]: item for item in payload["candidate_review"]["facts"]
+    }
+    expected_values = {
+        "education": [
+            {
+                "degree": "B.Tech in Computer Science",
+                "institution": "Example University",
+                "year": 2020,
+            }
+        ],
+        "experience.achievements_and_metrics": [
+            {
+                "achievement": "Reduced API latency",
+                "metric": "35 percent",
+            }
+        ],
+        "experience.roles_and_dates": [
+            {
+                "title": "Backend Engineer",
+                "company": "Example Systems",
+                "dates": "2022-2024",
+            }
+        ],
+        "projects": [
+            {
+                "name": "Queue Planner",
+                "summary": "Bounded candidate review queue",
+                "technologies": "Python and SQLite",
+            }
+        ],
+    }
+
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["candidate_review"]["status"] == "ready-for-confirmation"
+    assert set(facts) == set(expected_values)
+    assert payload["candidate_review"]["fact_count"] == len(expected_values)
+    for field, expected_value in expected_values.items():
+        assert facts[field]["value"] == expected_value
+        assert isinstance(facts[field]["value"], list)
+        assert all(isinstance(item, dict) for item in facts[field]["value"])
+
+    rendered = json.dumps(payload)
+    for private_value in (
+        "PRIVATE_DOCUMENT_ID",
+        "/private/candidate/resume.pdf",
+        "identity.contact",
+        "PRIVATE_CONTACT@example.test",
+        "resume.extracted_text",
+        "RAW_RESUME_TEXT_MUST_NEVER_RENDER",
+        "private.notes",
+        "PRIVATE_CANDIDATE_NOTE",
+    ):
+        assert private_value not in rendered
+
+
+def test_active_candidate_review_labels_allowlisted_rich_facts_candidate_approved(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+
+    draft = validate_candidate_intake(rich_review_payload())
+    active = activate_candidate_profile(draft, actor="user")
+    intake_path = tmp_path / "active.json"
+    intake_path.write_text(json.dumps(active), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    facts = payload["candidate_review"]["facts"]
+
+    assert exit_code == 0
+    assert payload["status"] == "ready"
+    assert payload["candidate_review"]["status"] == "active"
+    assert payload["candidate_review"]["required_before_activation"] is False
+    assert {item["field"] for item in facts} == {
+        "education",
+        "experience.achievements_and_metrics",
+        "experience.roles_and_dates",
+        "projects",
+    }
+    assert all(item["source"] == "candidate-approved" for item in facts)
+    assert all(item["uncertainty"] == "confirmed" for item in facts)
+    assert "RAW_RESUME_TEXT_MUST_NEVER_RENDER" not in json.dumps(payload)
+    assert "PRIVATE_CONTACT@example.test" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("state", "unknown_fields", "revision_hash", "review_status"),
+    [
+        ("draft", ["work_authorization"], None, "blocked"),
+        ("active", [], "0" * 64, "ready-for-confirmation"),
+    ],
+    ids=["incomplete-draft", "invalid-active-revision"],
+)
+def test_candidate_review_keeps_incomplete_or_invalid_intake_blocked(
+    tmp_path: Path,
+    capsys,
+    state: str,
+    unknown_fields: list[str],
+    revision_hash: str | None,
+    review_status: str,
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+
+    draft = validate_candidate_intake(
+        rich_review_payload(unknown_fields=unknown_fields)
+    )
+    if state == "active":
+        payload_to_write = activate_candidate_profile(draft, actor="user")
+        payload_to_write["revision_hash"] = revision_hash
+    else:
+        payload_to_write = {"state": state, **draft}
+    intake_path = tmp_path / f"{state}.json"
+    intake_path.write_text(json.dumps(payload_to_write), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["requires_user_confirmation"] is True
+    assert payload["candidate_review"]["status"] == review_status
+
+
+def test_candidate_review_never_trusts_an_unvalidated_active_state(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import validate_candidate_intake
+
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": {"experience": {"total_years": 3}},
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    intake_path = tmp_path / "claimed-active.json"
+    intake_path.write_text(json.dumps({"state": "active", **draft}), encoding="utf-8")
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(intake_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["requires_user_confirmation"] is True
+    assert payload["candidate_review"]["status"] == "ready-for-confirmation"
+
+
+def test_text_intake_questions_mode_blocks_resolved_inactive_draft(
+    tmp_path: Path, capsys
+):
+    discover = load_discover_module()
+    from jobapply_agent.intake import validate_candidate_intake
+
+    draft = validate_candidate_intake(
+        {
+            "schema_version": 1,
+            "documents": [],
+            "approved_facts": {"experience": {"total_years": 3}},
+            "unknown_fields": [],
+            "contradictions": [],
+            "pending_facts": [],
+        }
+    )
+    intake_path = tmp_path / "resolved-draft.json"
+    intake_path.write_text(json.dumps({"state": "draft", **draft}), encoding="utf-8")
+
+    exit_code = discover.main(
+        ["--candidate-intake", str(intake_path), "--show-intake-questions"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "final candidate confirmation" in captured.out
 
 
 def test_discover_intake_questions_mode_can_parse_state_wrapped_draft(

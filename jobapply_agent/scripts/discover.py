@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -47,6 +48,250 @@ _JSON_STRING_LIST_FIELDS = frozenset(
         "skills.professional",
         "skills.personal_open_source",
         "skills.learning_or_exposure",
+    }
+)
+_SAFE_REVIEW_VALUE_FIELDS = frozenset(
+    {
+        "experience.current_title",
+        "experience.title",
+        "experience.years_experience",
+        "experience.total_years",
+        "experience.roles_and_dates",
+        "experience.achievements_and_metrics",
+        "education",
+        "certifications",
+        "projects",
+        "open_source",
+        "volunteer_work",
+        "languages",
+        "roles.include",
+        "roles.exclude_title_terms",
+        "hard_exclusions.mandatory_requirements",
+        "skills.professional",
+        "skills.personal_open_source",
+        "skills.learning_or_exposure",
+        "targets.roles_and_levels",
+        "targets.locations_and_work_modes",
+        "targets.employment_types",
+        "targets.employment_types_and_industries",
+        "targets.exclusions",
+        "location_preferences.locations",
+        "location_preferences.work_modes",
+    }
+)
+_SAFE_REVIEW_STRUCTURED_FIELDS = {
+    "experience.roles_and_dates": frozenset(
+        {
+            "title",
+            "role",
+            "company",
+            "employer",
+            "organization",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "start_year",
+            "end_year",
+            "dates",
+            "period",
+            "current",
+            "status",
+            "employment_type",
+            "location",
+            "work_mode",
+        }
+    ),
+    "experience.achievements_and_metrics": frozenset(
+        {
+            "achievement",
+            "summary",
+            "description",
+            "impact",
+            "result",
+            "metric",
+            "metrics",
+            "role",
+            "date",
+            "dates",
+            "technologies",
+            "skills",
+        }
+    ),
+    "education": frozenset(
+        {
+            "institution",
+            "school",
+            "university",
+            "degree",
+            "field",
+            "subject",
+            "program",
+            "area",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "start_year",
+            "end_year",
+            "year",
+            "graduation_date",
+            "dates",
+            "percentage",
+            "gpa",
+            "gpa_scale",
+            "score",
+            "score_obtained",
+            "score_total",
+            "division",
+            "board",
+            "stream",
+            "level",
+            "status",
+            "honors",
+        }
+    ),
+    "certifications": frozenset(
+        {
+            "name",
+            "title",
+            "issuer",
+            "organization",
+            "date",
+            "issue_date",
+            "expiry_date",
+            "expiration_date",
+            "status",
+        }
+    ),
+    "projects": frozenset(
+        {
+            "name",
+            "title",
+            "role",
+            "summary",
+            "description",
+            "impact",
+            "result",
+            "metric",
+            "metrics",
+            "technologies",
+            "skills",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "dates",
+            "status",
+            "type",
+        }
+    ),
+    "open_source": frozenset(
+        {
+            "name",
+            "project",
+            "title",
+            "role",
+            "summary",
+            "description",
+            "contribution",
+            "impact",
+            "result",
+            "metric",
+            "metrics",
+            "technologies",
+            "skills",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "dates",
+            "status",
+            "type",
+        }
+    ),
+    "volunteer_work": frozenset(
+        {
+            "name",
+            "organization",
+            "project",
+            "title",
+            "role",
+            "summary",
+            "description",
+            "contribution",
+            "impact",
+            "result",
+            "metric",
+            "metrics",
+            "start",
+            "end",
+            "start_date",
+            "end_date",
+            "dates",
+            "status",
+            "type",
+        }
+    ),
+    "languages": frozenset(
+        {
+            "name",
+            "language",
+            "proficiency",
+            "fluency",
+            "level",
+            "reading",
+            "writing",
+            "speaking",
+            "listening",
+        }
+    ),
+}
+_REVIEW_FACT_METADATA_FIELDS = frozenset({"value", "source", "uncertainty"})
+_REVIEW_SOURCE_DOCUMENT_TERMS = frozenset({"document", "resume", "cv", "upload", "file"})
+_REVIEW_SOURCE_ANSWER_TERMS = frozenset({"answer", "conversation", "manual", "candidate"})
+_REVIEW_UNCERTAINTY_LABELS = frozenset(
+    {"unknown", "uncertain", "ambiguous", "pending", "verify", "unverified"}
+)
+_ACTIVE_REVIEW_SOURCE_LABEL = "candidate-approved"
+_ACTIVE_REVIEW_UNCERTAINTY_LABEL = "confirmed"
+_UNATTRIBUTED_REVIEW_SOURCE_LABEL = "source-unattributed"
+_REVIEW_REDACTIONS = (
+    "raw_document_text",
+    "document_metadata",
+    "contact_details",
+    "compensation",
+    "visa_or_authorization",
+    "eeo",
+    "screening_answers",
+    "identifiers",
+    "paths",
+)
+_REVIEW_MAX_ITEMS = 20
+_REVIEW_MAX_OBJECT_KEYS = 20
+_REVIEW_MAX_DEPTH = 3
+_REVIEW_MAX_NUMBER = 1_000_000_000_000
+_REVIEW_DATE_LIKE_PATTERN = re.compile(
+    r"^(?:\d{4}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?(?:\s*[-–]\s*(?:\d{4}|present))?|"
+    r"(?:present|current))$",
+    re.IGNORECASE,
+)
+_REVIEW_PHONE_PATTERN = re.compile(
+    r"(?<!\w)\+?[0-9][0-9 .()\-]{6,}[0-9](?!\w)"
+)
+_UNRESOLVED_INTERACTIVE_ANSWERS = frozenset(
+    {
+        "unknown",
+        "uncertain",
+        "ambiguous",
+        "unsure",
+        "unclear",
+        "pending",
+        "verify",
+        "needs verification",
+        "not sure",
+        "n/a",
+        "na",
     }
 )
 _APPROVED_SKILL_SECTIONS = frozenset({"professional", "personal_open_source", "learning_or_exposure"})
@@ -361,13 +606,257 @@ def _question_draft_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
+def _review_fact_entries(
+    value: Any,
+    field: str,
+    *,
+    source_hint: str | None = None,
+    uncertainty_hint: str | None = None,
+) -> list[tuple[str, Any, str | None, str | None]]:
+    """Find allowlisted fact roots while retaining only optional safe labels."""
+
+    if isinstance(value, Mapping):
+        if "value" in value and set(value).issubset(_REVIEW_FACT_METADATA_FIELDS):
+            return _review_fact_entries(
+                value["value"],
+                field,
+                source_hint=value.get("source") if isinstance(value.get("source"), str) else None,
+                uncertainty_hint=(
+                    value.get("uncertainty")
+                    if isinstance(value.get("uncertainty"), str)
+                    else None
+                ),
+            )
+        if _review_field_is_safe(field):
+            return [(field, value, source_hint, uncertainty_hint)]
+        entries: list[tuple[str, Any, str | None, str | None]] = []
+        for nested_field, nested_value in value.items():
+            if not isinstance(nested_field, str) or not nested_field.strip():
+                continue
+            child_field = f"{field}.{nested_field}" if field else nested_field
+            entries.extend(
+                _review_fact_entries(
+                    nested_value,
+                    child_field,
+                    source_hint=source_hint,
+                    uncertainty_hint=uncertainty_hint,
+                )
+            )
+        return entries
+    return [(field, value, source_hint, uncertainty_hint)]
+
+
+def _review_field_is_safe(field: str) -> bool:
+    """Allow only known matching or non-sensitive onboarding fact fields."""
+
+    return field in _SAFE_REVIEW_VALUE_FIELDS
+
+
+def _safe_review_scalar(value: Any) -> tuple[bool, Any]:
+    """Return a bounded scalar that cannot carry contact or document metadata."""
+
+    if isinstance(value, bool):
+        return True, value
+    if isinstance(value, int):
+        return (
+            (True, value)
+            if abs(value) <= _REVIEW_MAX_NUMBER
+            else (False, None)
+        )
+    if isinstance(value, float):
+        return (
+            (True, value)
+            if math.isfinite(value) and abs(value) <= _REVIEW_MAX_NUMBER
+            else (False, None)
+        )
+    if not isinstance(value, str):
+        return False, None
+    normalized = " ".join(value.split())
+    if not normalized or len(normalized) > 120 or len(normalized.split()) > 16:
+        return False, None
+    if "@" in normalized or "://" in normalized:
+        return False, None
+    if not _REVIEW_DATE_LIKE_PATTERN.fullmatch(normalized) and _REVIEW_PHONE_PATTERN.search(normalized):
+        return False, None
+    return True, normalized
+
+
+def _safe_review_mapping(
+    value: Mapping[str, Any],
+    allowed_keys: frozenset[str],
+    *,
+    depth: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Render only allowlisted keys from one bounded structured fact object."""
+
+    if depth > _REVIEW_MAX_DEPTH or len(value) > _REVIEW_MAX_OBJECT_KEYS:
+        return False, {}
+    rendered: dict[str, Any] = {}
+    for key, nested_value in value.items():
+        if not isinstance(key, str):
+            continue
+        normalized_key = key.strip().casefold()
+        if normalized_key not in allowed_keys:
+            continue
+        valid, safe_value = _safe_review_value(
+            nested_value,
+            allowed_keys=allowed_keys,
+            depth=depth + 1,
+        )
+        if valid:
+            rendered[normalized_key] = safe_value
+    return bool(rendered), rendered
+
+
+def _safe_review_value(
+    value: Any,
+    *,
+    allowed_keys: frozenset[str] | None = None,
+    depth: int = 0,
+) -> tuple[bool, Any]:
+    """Render bounded JSON scalars/lists or an allowlisted structured object."""
+
+    if depth > _REVIEW_MAX_DEPTH:
+        return False, None
+    if isinstance(value, Mapping):
+        if allowed_keys is None:
+            return False, None
+        return _safe_review_mapping(value, allowed_keys, depth=depth)
+
+    if isinstance(value, list):
+        if not value or len(value) > _REVIEW_MAX_ITEMS:
+            return False, None
+        rendered: list[Any] = []
+        for item in value:
+            valid, safe_item = _safe_review_value(
+                item,
+                allowed_keys=allowed_keys,
+                depth=depth + 1,
+            )
+            if not valid:
+                return False, None
+            rendered.append(safe_item)
+        return True, rendered
+    return _safe_review_scalar(value)
+
+
+def _review_source_label(
+    source_hint: str | None,
+    *,
+    has_documents: bool,
+    candidate_confirmed: bool,
+) -> str:
+    """Map untrusted source text to a small, non-identifying label set."""
+
+    if candidate_confirmed:
+        return "candidate-provided-answer"
+    source_terms = set(re.findall(r"[a-z0-9]+", (source_hint or "").casefold()))
+    if source_terms & _REVIEW_SOURCE_DOCUMENT_TERMS:
+        return "candidate-uploaded-document"
+    if source_terms & _REVIEW_SOURCE_ANSWER_TERMS:
+        return "candidate-provided-answer"
+    if has_documents:
+        return _UNATTRIBUTED_REVIEW_SOURCE_LABEL
+    return "candidate-provided-structured-intake"
+
+
+def _review_uncertainty_label(
+    uncertainty_hint: str | None,
+    *,
+    candidate_confirmed: bool,
+) -> str:
+    """Map untrusted uncertainty text to deterministic review labels."""
+
+    if candidate_confirmed:
+        return "candidate-confirmed-pending-activation"
+    normalized = " ".join((uncertainty_hint or "").casefold().split())
+    if normalized in _REVIEW_UNCERTAINTY_LABELS:
+        return normalized
+    if normalized in {"confirmed", "candidate-confirmed", "verified"}:
+        return "candidate-confirmed-pending-activation"
+    return "requires-candidate-confirmation"
+
+
+def _candidate_review_rendering(
+    draft: Mapping[str, Any],
+    *,
+    active: bool = False,
+    candidate_confirmed_fields: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Build the only structured fact rendering permitted before activation."""
+
+    safe_batch = pending_verification_batch(draft)
+    requires_confirmation = bool(
+        draft["unknown_fields"] or draft["contradictions"] or draft["pending_facts"]
+    )
+    facts: list[dict[str, Any]] = []
+    has_documents = bool(draft["documents"])
+    for field, value in draft["approved_facts"].items():
+        for fact_field, fact_value, source_hint, uncertainty_hint in _review_fact_entries(value, field):
+            if not _review_field_is_safe(fact_field):
+                continue
+            structured_keys = _SAFE_REVIEW_STRUCTURED_FIELDS.get(fact_field)
+            valid, safe_value = _safe_review_value(
+                fact_value,
+                allowed_keys=structured_keys,
+            )
+            if not valid:
+                continue
+            facts.append(
+                {
+                    "field": fact_field,
+                    "value": safe_value,
+                    "uncertainty": _review_uncertainty_label(
+                        uncertainty_hint,
+                        candidate_confirmed=fact_field in candidate_confirmed_fields,
+                    ),
+                    "source": _review_source_label(
+                        source_hint,
+                        has_documents=has_documents,
+                        candidate_confirmed=fact_field in candidate_confirmed_fields,
+                    ),
+                }
+            )
+    facts.sort(key=lambda item: item["field"])
+    if active:
+        for fact in facts:
+            fact["source"] = _ACTIVE_REVIEW_SOURCE_LABEL
+            fact["uncertainty"] = _ACTIVE_REVIEW_UNCERTAINTY_LABEL
+    return {
+        "status": "active" if active else ("blocked" if requires_confirmation else "ready-for-confirmation"),
+        "required_before_activation": not active,
+        "facts": facts,
+        "fact_count": len(facts),
+        "unresolved": safe_batch,
+        "redactions": list(_REVIEW_REDACTIONS),
+    }
+
+
+def _valid_active_intake_payload(payload: Mapping[str, Any]) -> bool:
+    """Return whether a payload proves an active user-confirmed revision."""
+
+    if payload.get("state") != "active":
+        return False
+    try:
+        validate_active_candidate_profile(payload)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _print_pending_intake_questions(payload: Mapping[str, Any]) -> tuple[int, str]:
     draft = validate_candidate_intake(_question_draft_payload(payload))
     questions = completion_questions(draft)
     if not questions:
+        if not _valid_active_intake_payload(payload):
+            return (
+                2,
+                "Candidate intake has no unresolved items. Show the privacy-safe structured review, "
+                "obtain final candidate confirmation, activate with actor='user', and rerun discovery.",
+            )
         return (
             0,
-            "Candidate intake has no unresolved items. Activate with actor='user' and rerun discovery.",
+            "Candidate intake is active and has no unresolved items.",
         )
     rendered = ["Candidate onboarding questions (ask all at once):"]
     rendered.extend(f"- {question}" for question in questions)
@@ -381,9 +870,13 @@ def _intake_question_bundle(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Build a machine-readable onboarding payload for host orchestration."""
 
     draft = validate_candidate_intake(_question_draft_payload(payload))
-    requires_confirmation = bool(
+    has_unresolved_items = bool(
         draft["unknown_fields"] or draft["contradictions"] or draft["pending_facts"]
     )
+    # A resolved draft is still inactive. It must be shown to the candidate
+    # for one final confirmation before the host may call the activation gate.
+    active = _valid_active_intake_payload(payload) and not has_unresolved_items
+    requires_confirmation = not active
     questions = completion_questions(draft)
     safe_batch = pending_verification_batch(draft)
     contradiction_questions = iter(questions)
@@ -438,6 +931,7 @@ def _intake_question_bundle(payload: Mapping[str, Any]) -> dict[str, Any]:
         "pending_verification_batch": {
             **safe_batch,
         },
+        "candidate_review": _candidate_review_rendering(draft, active=active),
         "requires_user_confirmation": requires_confirmation,
     }
 
@@ -475,6 +969,34 @@ def _parse_interactive_answer(answer: str) -> Any:
         return json.loads(answer)
     except json.JSONDecodeError:
         return answer
+
+
+def _is_unresolved_interactive_answer(answer: Any) -> bool:
+    """Keep explicit uncertainty markers in the draft review state."""
+
+    if answer is None or answer == [] or answer == {}:
+        return True
+    if not isinstance(answer, str):
+        return False
+    normalized = " ".join(answer.casefold().strip(" .,!?;:").split())
+    if normalized in _UNRESOLVED_INTERACTIVE_ANSWERS or normalized in {
+        "i don't know",
+        "i do not know",
+        "i'm unsure",
+        "i am unsure",
+        "i'm uncertain",
+        "i am uncertain",
+        "cannot confirm",
+        "can't confirm",
+        "need to verify",
+    }:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:i(?:'m| am)\s+)?(?:unknown|uncertain|ambiguous|unsure|unclear|not sure)",
+            normalized,
+        )
+    )
 
 
 def _interactive_answer_prompt(field: str) -> str:
@@ -542,13 +1064,17 @@ def _sync_parent_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _interactive_confirmation_prompt(collected_safe_fields: Sequence[str]) -> str:
+def _interactive_confirmation_prompt(
+    collected_safe_fields: Sequence[str], unresolved_safe_fields: Sequence[str]
+) -> str:
     """Describe the exact lowercase confirmation token without exposing values."""
 
     fields = ", ".join(collected_safe_fields) if collected_safe_fields else "none"
+    unresolved = ", ".join(unresolved_safe_fields) if unresolved_safe_fields else "none"
     return (
-        f"All supplied answers are candidate-approved facts. Collected "
+        f"Privacy-safe structured candidate review is shown above. Collected "
         f"{len(collected_safe_fields)} field(s): {fields}. "
+        f"Unresolved field(s): {unresolved}. "
         f"Type exactly {INTERACTIVE_CONFIRMATION_TOKEN!r} to confirm activation; every other response declines: "
     )
 
@@ -569,19 +1095,40 @@ def _run_interactive_onboarding(intake_path: Path) -> int:
 
     draft = _interactive_onboarding_draft(intake_path)
     collected_safe_fields: list[str] = []
+    unresolved_safe_fields: list[str] = []
+    candidate_confirmed_fields: set[str] = set()
     try:
         for group, field, safe_field, question in _interactive_review_items(draft):
             answer = input(f"{question}\n{_interactive_answer_prompt(field)}").strip()
-            if answer:
-                _record_interactive_answer(
-                    draft,
-                    group=group,
-                    field=field,
-                    answer=_parse_interactive_answer(answer),
-                )
-                collected_safe_fields.append(safe_field)
+            if not answer:
+                continue
+            parsed_answer = _parse_interactive_answer(answer)
+            if _is_unresolved_interactive_answer(parsed_answer):
+                unresolved_safe_fields.append(safe_field)
+                continue
+            _record_interactive_answer(
+                draft,
+                group=group,
+                field=field,
+                answer=parsed_answer,
+            )
+            candidate_confirmed_fields.add(field)
+            collected_safe_fields.append(safe_field)
 
-        confirmation = input(_interactive_confirmation_prompt(collected_safe_fields)).strip()
+        print("Privacy-safe structured candidate review (values are limited to safe fields):")
+        print(
+            json.dumps(
+                _candidate_review_rendering(
+                    draft,
+                    candidate_confirmed_fields=candidate_confirmed_fields,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        confirmation = input(
+            _interactive_confirmation_prompt(collected_safe_fields, unresolved_safe_fields)
+        ).strip()
     except (EOFError, KeyboardInterrupt):
         print("Interactive onboarding ended before confirmation; intake was not changed.", file=sys.stderr)
         return 2
