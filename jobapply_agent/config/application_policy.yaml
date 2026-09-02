@@ -19,7 +19,7 @@ application_policy:
       - compose_evidence_grounded_explanations
       - prepare_local_field_suggestions_for_candidate_review
       - record_missing_answer_prompts
-      - plan_five_listing_smart_queue_replenishment
+      - plan_candidate_selected_one_to_ten_listing_smart_queue_replenishment
       - mark_missing_tabs_as_awaiting_outcome
       - track_candidate_recorded_review_state
 

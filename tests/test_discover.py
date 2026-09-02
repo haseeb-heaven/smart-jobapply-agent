@@ -1557,3 +1557,42 @@ def test_active_intake_projects_only_candidate_approved_employment_and_authoriza
 
     assert profile.employment_type_preferences == ("full-time",)
     assert profile.work_authorizations == ("india",)
+
+
+def test_active_intake_queue_factory_requires_integrity_checked_candidate_capacity(tmp_path: Path):
+    discover = load_discover_module()
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.smart_queue import QueuePolicyError
+
+    payload = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {"targets.smart_queue_capacity": 3},
+        "unknown_fields": [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+    active_path = tmp_path / "private" / "candidate_intake.json"
+    active_path.parent.mkdir()
+    active_path.write_text(
+        json.dumps(activate_candidate_profile(validate_candidate_intake(payload), actor="user")),
+        encoding="utf-8",
+    )
+
+    queue = discover.smart_queue_for_active_intake(active_path, tmp_path / "queue.sqlite3")
+
+    assert queue.target_size == 3
+    with pytest.raises(QueuePolicyError, match="conflict|target_size|capacity"):
+        discover.smart_queue_for_active_intake(
+            active_path,
+            tmp_path / "queue.sqlite3",
+            target_size=5,
+        )
+
+    tampered = json.loads(active_path.read_text(encoding="utf-8"))
+    tampered["approved_facts"]["targets.smart_queue_capacity"] = 5
+    tampered_path = tmp_path / "private" / "tampered.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="revision|integrity|active"):
+        discover.smart_queue_for_active_intake(tampered_path, tmp_path / "tampered.sqlite3")
+    assert not (tmp_path / "tampered.sqlite3").exists()

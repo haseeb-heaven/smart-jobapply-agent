@@ -43,6 +43,13 @@ it does not replace the host agent's conversation.
    displayed facts with source `candidate-approved` and uncertainty `confirmed`.
    Record the revision hash and confirmation time without storing raw resume or
    details-file text in the active matching projection.
+9. Ask and confirm the Smart Job Queue capacity separately: “How many managed
+   job listing tabs do you want open? (1–10; default 5.)” Accept only an
+   explicit integer in that range. This preference counts only canonical
+   approved tabs managed by Smart Job Queue; it never counts unrelated browser
+   tabs, searches, account pages, or application flows. An absent answer uses
+   the product default of 5 without inventing a candidate fact. A later decrease
+   never authorizes the agent to close tabs, alter outcomes, or revoke history.
 
 The host/LLM runtime may read candidate uploads, but the core package never
 reads, parses, stores raw candidate documents, or uploads them. The core

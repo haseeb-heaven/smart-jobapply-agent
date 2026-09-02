@@ -15,6 +15,11 @@ storage, resume contents, or form data through that bridge. A remote LLM may
 receive context supplied by its host, so document the actual data flow instead
 of claiming all processing is local.
 
+Smart Queue capacity is a candidate-selected limit of 1–10 managed approved
+listing tabs (default 5), not permission to enumerate, count, or affect
+unrelated browser tabs. A capacity change never grants close, form, upload, or
+submission authority.
+
 If you find a security issue, do not publish private data in a public issue.
 Contact the repository owner privately with a minimal reproduction and avoid
 including credentials or personal documents.

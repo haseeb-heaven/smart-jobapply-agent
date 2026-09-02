@@ -37,6 +37,9 @@ _PENDING_FACT_FIELDS = frozenset({"field", "status", "question", "reason"})
 _DRAFT_FIELDS = _TOP_LEVEL_FIELDS | {"state"}
 _ACTIVE_FIELDS = _DRAFT_FIELDS | {"activated_by", "confirmed_at", "revision_hash"}
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
+_SMART_QUEUE_CAPACITY_FIELD = "targets.smart_queue_capacity"
+_MIN_SMART_QUEUE_CAPACITY = 1
+_MAX_SMART_QUEUE_CAPACITY = 10
 
 # Candidate intake keeps arbitrary fact keys so the validator can preserve a
 # candidate-controlled draft without inventing a schema.  Candidate-facing
@@ -64,6 +67,7 @@ _PUBLIC_INTAKE_FIELDS = frozenset(
         "targets.locations_and_work_modes",
         "targets.employment_types_and_industries",
         "targets.exclusions",
+        "targets.smart_queue_capacity",
         "work_authorization",
         "sponsorship",
         "compensation",
@@ -333,6 +337,19 @@ def _approved_fact(value: Mapping[str, Any], dotted_path: str) -> Any:
     return current
 
 
+def _approved_fact_with_presence(value: Mapping[str, Any], dotted_path: str) -> tuple[bool, Any]:
+    """Return whether an approved fact exists without treating ``null`` as absent."""
+
+    if dotted_path in value:
+        return True, value[dotted_path]
+    current: Any = value
+    for segment in dotted_path.split("."):
+        if not isinstance(current, Mapping) or segment not in current:
+            return False, None
+        current = current[segment]
+    return True, current
+
+
 def _normalized_skill_values(value: object, *, location: str) -> set[str]:
     if value is None:
         return set()
@@ -387,6 +404,25 @@ def _ensure_skill_evidence_is_consistent(approved_facts: Mapping[str, Any]) -> N
         normalized_labels[skill] = raw_label
 
 
+def _ensure_smart_queue_capacity_is_valid(approved_facts: Mapping[str, Any]) -> None:
+    """Validate an optional, explicitly candidate-approved queue preference."""
+
+    is_present, capacity = _approved_fact_with_presence(
+        approved_facts, _SMART_QUEUE_CAPACITY_FIELD
+    )
+    if not is_present:
+        return
+    if isinstance(capacity, bool) or not isinstance(capacity, int):
+        raise CandidateIntakeValidationError(
+            f"approved_facts.{_SMART_QUEUE_CAPACITY_FIELD} must be an integer"
+        )
+    if not _MIN_SMART_QUEUE_CAPACITY <= capacity <= _MAX_SMART_QUEUE_CAPACITY:
+        raise CandidateIntakeValidationError(
+            f"approved_facts.{_SMART_QUEUE_CAPACITY_FIELD} must be between "
+            f"{_MIN_SMART_QUEUE_CAPACITY} and {_MAX_SMART_QUEUE_CAPACITY}"
+        )
+
+
 def validate_candidate_intake(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate candidate-provided intake data and return an inactive draft.
 
@@ -412,6 +448,7 @@ def validate_candidate_intake(payload: Mapping[str, Any]) -> dict[str, Any]:
         approved_facts, unknown_fields, contradictions, pending_facts
     )
     _ensure_skill_evidence_is_consistent(approved_facts)
+    _ensure_smart_queue_capacity_is_valid(approved_facts)
     return {
         "schema_version": 1,
         "documents": _validate_documents(intake["documents"]),
@@ -498,6 +535,8 @@ def _public_review_target(field: str, *, group: str, index: int) -> str:
 def _safe_completion_question(field: str, *, group: str, index: int) -> str:
     """Build a prompt without copying any candidate-controlled text."""
 
+    if group == "pending" and field == _SMART_QUEUE_CAPACITY_FIELD:
+        return "How many managed job tabs do you want open at once? Choose 1 to 10; default is 5."
     target = _public_review_target(field, group=group, index=index)
     if group == "contradiction":
         return (

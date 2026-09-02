@@ -1,4 +1,4 @@
-"""Persistent, candidate-controlled five-listing review queue.
+"""Persistent, candidate-controlled listing review queue.
 
 The queue is deliberately a data-only coordination primitive.  It has no
 browser, network, form, upload, login, or application-submission authority.
@@ -30,7 +30,22 @@ QueueState = Literal[
     "skipped",
 ]
 
-_TARGET_SIZE = 5
+_DEFAULT_TARGET_SIZE = 5
+_MAX_TARGET_SIZE = 10
+_UNSET_TARGET_SIZE = object()
+_CAPACITY_PROVENANCE_DEFAULT = "default"
+_CAPACITY_PROVENANCE_ACTIVE_INTAKE = "active-candidate-intake"
+_CAPACITY_PROVENANCE_HOST_CONFIGURED = "host-configured"
+_CAPACITY_PROVENANCE_LEGACY_UNVERIFIED = "legacy-unverified"
+_CAPACITY_PROVENANCE_VALUES = frozenset(
+    {
+        _CAPACITY_PROVENANCE_DEFAULT,
+        _CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+        _CAPACITY_PROVENANCE_HOST_CONFIGURED,
+        _CAPACITY_PROVENANCE_LEGACY_UNVERIFIED,
+    }
+)
+_INTAKE_REVISION_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _DECISIONS = frozenset({"recommended", "review", "reject"})
 _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
 # A missing tab still reserves its physical slot until the user confirms an outcome.
@@ -116,6 +131,18 @@ class QueueEvent:
     occurred_at: str
     # Event IDs are local to one queue database.  The persisted queue ID is
     # required alongside them whenever an event crosses that database boundary.
+    queue_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityPolicyEvent:
+    """One immutable, attributable managed-listing capacity change."""
+
+    event_id: int
+    prior_target_size: int
+    target_size: int
+    actor: str
+    occurred_at: str
     queue_id: str
 
 
@@ -212,25 +239,83 @@ def _require_listing_url(value: object) -> str:
     return canonical
 
 
+def _require_target_size(value: object) -> int:
+    """Require a candidate-selected bounded number of managed listing tabs."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise QueuePolicyError("target_size must be an integer")
+    if not 1 <= value <= _MAX_TARGET_SIZE:
+        raise QueuePolicyError(f"target_size must be between 1 and {_MAX_TARGET_SIZE}")
+    return value
+
+
+def _require_capacity_provenance(value: object) -> str:
+    """Require a bounded, non-sensitive capacity-policy source label."""
+
+    if not isinstance(value, str) or value not in _CAPACITY_PROVENANCE_VALUES:
+        raise QueuePolicyError("capacity provenance is invalid")
+    return value
+
+
+def _require_intake_revision_hash(value: object) -> str:
+    """Require the active-intake digest without persisting intake facts."""
+
+    if not isinstance(value, str) or _INTAKE_REVISION_HASH.fullmatch(value) is None:
+        raise QueuePolicyError("active candidate intake revision is invalid")
+    return value
+
+
 class SmartJobQueue:
-    """SQLite-backed queue whose fixed physical review capacity is five.
+    """SQLite-backed queue with candidate-selected physical review capacity.
 
     Recommendation facts never change after insertion and queue history is
     append-only.  Logical state is derived from that history.  Planning holds
     an immediate SQLite transaction, so concurrent planners cannot reserve the
-    same vacancy or grow the reserved queue beyond its fixed capacity.
+    same vacancy or grow the reserved queue beyond the configured capacity.
     """
 
-    def __init__(self, database_path: Path | str, *, target_size: int = _TARGET_SIZE):
-        if isinstance(target_size, bool) or not isinstance(target_size, int) or target_size != _TARGET_SIZE:
-            raise QueuePolicyError("the smart review queue is fixed at five jobs")
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        target_size: int | object = _UNSET_TARGET_SIZE,
+        _capacity_provenance: str | None = None,
+        _capacity_intake_revision: str | None = None,
+    ):
+        requested_target_size = (
+            None if target_size is _UNSET_TARGET_SIZE else _require_target_size(target_size)
+        )
+        if _capacity_provenance is None:
+            requested_capacity_provenance = (
+                _CAPACITY_PROVENANCE_DEFAULT
+                if requested_target_size in (None, _DEFAULT_TARGET_SIZE)
+                else _CAPACITY_PROVENANCE_HOST_CONFIGURED
+            )
+        else:
+            requested_capacity_provenance = _require_capacity_provenance(_capacity_provenance)
+        if requested_capacity_provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE:
+            requested_capacity_intake_revision = _require_intake_revision_hash(
+                _capacity_intake_revision
+            )
+        elif _capacity_intake_revision is not None:
+            raise QueuePolicyError("only active intake capacity provenance may include an intake revision")
+        else:
+            requested_capacity_intake_revision = None
+        if (
+            requested_capacity_provenance == _CAPACITY_PROVENANCE_DEFAULT
+            and requested_target_size not in (None, _DEFAULT_TARGET_SIZE)
+        ):
+            raise QueuePolicyError("default capacity provenance requires the default target_size")
         if not isinstance(database_path, (str, Path)):
             raise QueuePolicyError("database_path must be a path")
         raw_path = str(database_path)
         if not raw_path.strip():
             raise QueuePolicyError("database_path must be non-empty")
         self.database_path = Path(raw_path)
-        self.target_size = _TARGET_SIZE
+        self._requested_target_size = requested_target_size
+        self._requested_capacity_provenance = requested_capacity_provenance
+        self._requested_capacity_intake_revision = requested_capacity_intake_revision
+        self._target_size = _DEFAULT_TARGET_SIZE
         self._queue_id: str | None = None
         self._memory_connection: sqlite3.Connection | None = None
         try:
@@ -244,6 +329,27 @@ class SmartJobQueue:
                 self._memory_connection.close()
                 self._memory_connection = None
             raise QueueStorageError("smart queue storage initialization failed") from None
+
+    @classmethod
+    def for_active_candidate_intake(
+        cls,
+        database_path: Path | str,
+        *,
+        target_size: int,
+        intake_revision_hash: str,
+    ) -> "SmartJobQueue":
+        """Create a live queue whose non-default capacity has intake proof.
+
+        Only the active intake's SHA-256 revision is stored. Candidate facts,
+        document paths, and browser state never enter queue metadata.
+        """
+
+        return cls(
+            database_path,
+            target_size=target_size,
+            _capacity_provenance=_CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+            _capacity_intake_revision=intake_revision_hash,
+        )
 
     @staticmethod
     def _new_connection(database: str | Path) -> sqlite3.Connection:
@@ -275,6 +381,49 @@ class SmartJobQueue:
         connection = self._connect()
         try:
             return self._read_active_revisions(connection)
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    @property
+    def target_size(self) -> int:
+        """Return the durable candidate-selected managed-listing capacity."""
+
+        connection = self._connect()
+        try:
+            target_size = self._read_target_size(connection)
+            self._target_size = target_size
+            return target_size
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    @property
+    def capacity_provenance(self) -> str:
+        """Return the durable, URL-free source of the current capacity policy."""
+
+        connection = self._connect()
+        try:
+            provenance, _ = self._read_capacity_provenance(connection)
+            return provenance
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    @property
+    def has_active_intake_capacity_provenance(self) -> bool:
+        """Whether live non-default capacity is bound to an active intake digest."""
+
+        connection = self._connect()
+        try:
+            provenance, intake_revision = self._read_capacity_provenance(connection)
+            return (
+                provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE
+                and intake_revision is not None
+            )
         except sqlite3.Error:
             raise QueueStorageError("smart queue storage operation failed") from None
         finally:
@@ -313,6 +462,48 @@ class SmartJobQueue:
             raise QueueStorageError("smart queue active revisions are invalid") from None
 
     @staticmethod
+    def _read_target_size(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT target_size FROM smart_queue_metadata WHERE metadata_id = 1"
+        ).fetchone()
+        if row is None:
+            raise QueueStorageError("smart queue target size is unavailable")
+        try:
+            return _require_target_size(row["target_size"])
+        except QueuePolicyError:
+            raise QueueStorageError("smart queue target size is invalid") from None
+
+    @staticmethod
+    def _read_capacity_provenance(connection: sqlite3.Connection) -> tuple[str, str | None]:
+        row = connection.execute(
+            """
+            SELECT capacity_provenance, capacity_intake_revision
+            FROM smart_queue_metadata WHERE metadata_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise QueueStorageError("smart queue capacity provenance is unavailable")
+        try:
+            provenance = _require_capacity_provenance(row["capacity_provenance"])
+            intake_revision = row["capacity_intake_revision"]
+            if provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE:
+                return provenance, _require_intake_revision_hash(intake_revision)
+            if intake_revision is not None:
+                raise QueuePolicyError("capacity provenance contains an unexpected intake revision")
+            return provenance, None
+        except QueuePolicyError:
+            raise QueueStorageError("smart queue capacity provenance is invalid") from None
+
+    @staticmethod
+    def _write_target_size(connection: sqlite3.Connection, target_size: int) -> None:
+        cursor = connection.execute(
+            "UPDATE smart_queue_metadata SET target_size = ? WHERE metadata_id = 1",
+            (target_size,),
+        )
+        if cursor.rowcount != 1:
+            raise QueueStorageError("smart queue target size could not be persisted")
+
+    @staticmethod
     def _write_active_revisions(
         connection: sqlite3.Connection, revisions: tuple[str, str]
     ) -> None:
@@ -348,7 +539,13 @@ class SmartJobQueue:
                     metadata_id INTEGER PRIMARY KEY CHECK(metadata_id = 1),
                     queue_id TEXT NOT NULL UNIQUE CHECK(length(queue_id) = 32),
                     active_profile_revision TEXT,
-                    active_matcher_policy_revision TEXT
+                    active_matcher_policy_revision TEXT,
+                    target_size INTEGER NOT NULL DEFAULT 5 CHECK(target_size BETWEEN 1 AND 10),
+                    capacity_provenance TEXT NOT NULL DEFAULT 'default'
+                        CHECK(capacity_provenance IN (
+                            'default', 'active-candidate-intake', 'host-configured', 'legacy-unverified'
+                        )),
+                    capacity_intake_revision TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS smart_queue_events (
@@ -362,11 +559,22 @@ class SmartJobQueue:
                     occurred_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS smart_queue_capacity_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prior_target_size INTEGER NOT NULL
+                        CHECK(prior_target_size BETWEEN 1 AND 10),
+                    target_size INTEGER NOT NULL CHECK(target_size BETWEEN 1 AND 10),
+                    actor TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_smart_queue_events_job
                     ON smart_queue_events(job_id, event_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_queue_one_outcome
                     ON smart_queue_events(job_id)
                     WHERE name IN ('submitted', 'rejected', 'skipped');
+                CREATE INDEX IF NOT EXISTS idx_smart_queue_capacity_events
+                    ON smart_queue_capacity_events(event_id);
 
                 CREATE TRIGGER IF NOT EXISTS smart_queue_jobs_no_update
                 BEFORE UPDATE ON smart_queue_jobs
@@ -391,25 +599,102 @@ class SmartJobQueue:
                 BEGIN
                     SELECT RAISE(ABORT, 'smart queue events are append-only');
                 END;
+
+                CREATE TRIGGER IF NOT EXISTS smart_queue_capacity_events_no_update
+                BEFORE UPDATE ON smart_queue_capacity_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'smart queue capacity events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS smart_queue_capacity_events_no_delete
+                BEFORE DELETE ON smart_queue_capacity_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'smart queue capacity events are append-only');
+                END;
                 """
             )
             self._ensure_column(connection, "smart_queue_jobs", "profile_revision", "TEXT")
             self._ensure_column(connection, "smart_queue_jobs", "matcher_policy_revision", "TEXT")
             self._ensure_column(connection, "smart_queue_metadata", "active_profile_revision", "TEXT")
             self._ensure_column(connection, "smart_queue_metadata", "active_matcher_policy_revision", "TEXT")
+            self._ensure_column(
+                connection,
+                "smart_queue_metadata",
+                "target_size",
+                "INTEGER NOT NULL DEFAULT 5",
+            )
+            self._ensure_column(
+                connection,
+                "smart_queue_metadata",
+                "capacity_provenance",
+                "TEXT NOT NULL DEFAULT 'default'",
+            )
+            self._ensure_column(
+                connection,
+                "smart_queue_metadata",
+                "capacity_intake_revision",
+                "TEXT",
+            )
             connection.execute(
                 """
-                INSERT OR IGNORE INTO smart_queue_metadata (metadata_id, queue_id)
-                VALUES (1, ?)
+                INSERT OR IGNORE INTO smart_queue_metadata
+                    (metadata_id, queue_id, target_size, capacity_provenance, capacity_intake_revision)
+                VALUES (1, ?, ?, ?, ?)
                 """,
-                (self._new_queue_id(),),
+                (
+                    self._new_queue_id(),
+                    self._requested_target_size or _DEFAULT_TARGET_SIZE,
+                    self._requested_capacity_provenance,
+                    self._requested_capacity_intake_revision,
+                ),
             )
             metadata = connection.execute(
-                "SELECT queue_id FROM smart_queue_metadata WHERE metadata_id = 1"
+                """
+                SELECT queue_id, target_size, capacity_provenance, capacity_intake_revision
+                FROM smart_queue_metadata WHERE metadata_id = 1
+                """
             ).fetchone()
             if metadata is None:
                 raise QueueStorageError("smart queue identity could not be persisted")
             self._queue_id = self._require_stored_queue_id(metadata["queue_id"])
+            stored_target_size = self._read_target_size(connection)
+            stored_capacity_provenance, stored_capacity_intake_revision = (
+                self._read_capacity_provenance(connection)
+            )
+            # A database created before provenance tracking may already have a
+            # non-default target. It must not silently become live-authorized.
+            if (
+                stored_target_size != _DEFAULT_TARGET_SIZE
+                and stored_capacity_provenance == _CAPACITY_PROVENANCE_DEFAULT
+                and stored_capacity_intake_revision is None
+            ):
+                connection.execute(
+                    """
+                    UPDATE smart_queue_metadata
+                    SET capacity_provenance = ?
+                    WHERE metadata_id = 1
+                    """,
+                    (_CAPACITY_PROVENANCE_LEGACY_UNVERIFIED,),
+                )
+                stored_capacity_provenance = _CAPACITY_PROVENANCE_LEGACY_UNVERIFIED
+            if (
+                self._requested_target_size is not None
+                and self._requested_target_size != stored_target_size
+            ):
+                raise QueuePolicyError(
+                    "configured target_size conflicts with the persisted candidate-selected target_size"
+                )
+            if (
+                self._requested_capacity_provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE
+                and (
+                    stored_capacity_provenance != _CAPACITY_PROVENANCE_ACTIVE_INTAKE
+                    or stored_capacity_intake_revision != self._requested_capacity_intake_revision
+                )
+            ):
+                raise QueuePolicyError(
+                    "active candidate intake capacity provenance conflicts with persisted queue metadata"
+                )
+            self._target_size = stored_target_size
             connection.commit()
         except QueueStorageError:
             connection.rollback()
@@ -447,6 +732,23 @@ class SmartJobQueue:
             (job_id, name, actor, _utc_now()),
         )
 
+    @staticmethod
+    def _append_capacity_policy_event(
+        connection: sqlite3.Connection,
+        *,
+        prior_target_size: int,
+        target_size: int,
+        actor: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO smart_queue_capacity_events
+                (prior_target_size, target_size, actor, occurred_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (prior_target_size, target_size, actor, _utc_now()),
+        )
+
     def set_active_revisions(
         self,
         profile_revision: str,
@@ -481,6 +783,90 @@ class SmartJobQueue:
         finally:
             self._close(connection)
         return active_pair
+
+    def set_target_size(self, target_size: int, *, actor: str) -> int:
+        """Persist a user-selected capacity without changing jobs or outcomes.
+
+        Reducing capacity never closes visible tabs, releases reservations, or
+        infers an application outcome. Refill planning simply remains idle
+        until candidate-controlled activity naturally creates a vacancy.
+        """
+
+        target_size = _require_target_size(target_size)
+        actor = _require_actor(actor)
+        if actor != "user":
+            raise QueuePolicyError("target_size may be changed only by the exact user actor")
+        connection = self._transaction()
+        try:
+            previous_target_size = self._read_target_size(connection)
+            if target_size != previous_target_size:
+                self._write_target_size(connection, target_size)
+                self._append_capacity_policy_event(
+                    connection,
+                    prior_target_size=previous_target_size,
+                    target_size=target_size,
+                    actor=actor,
+                )
+            connection.commit()
+            self._target_size = target_size
+            return target_size
+        except QueueStorageError:
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    def capacity_history(self, *, after_event_id: int = 0) -> tuple[CapacityPolicyEvent, ...]:
+        """Return the append-only, candidate-attributed capacity policy stream.
+
+        This exposes no listing URLs, candidate facts, or browser state.  A
+        capacity event is written only when the exact ``user`` actor changes
+        the durable capacity; retrying the current value does not fabricate a
+        policy revision.
+        """
+
+        if (
+            isinstance(after_event_id, bool)
+            or not isinstance(after_event_id, int)
+            or after_event_id < 0
+        ):
+            raise QueuePolicyError("after_event_id must be a non-negative integer")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_id, prior_target_size, target_size, actor, occurred_at
+                FROM smart_queue_capacity_events
+                WHERE event_id > ?
+                ORDER BY event_id
+                """,
+                (after_event_id,),
+            ).fetchall()
+            return tuple(
+                CapacityPolicyEvent(
+                    event_id=int(row["event_id"]),
+                    prior_target_size=_require_target_size(row["prior_target_size"]),
+                    target_size=_require_target_size(row["target_size"]),
+                    actor=_require_actor(row["actor"]),
+                    occurred_at=str(row["occurred_at"]),
+                    queue_id=self.queue_id,
+                )
+                for row in rows
+            )
+        except QueuePolicyError:
+            raise QueueStorageError("smart queue capacity history is invalid") from None
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    def capacity_policy_history(self, *, after_event_id: int = 0) -> tuple[CapacityPolicyEvent, ...]:
+        """Compatibility alias for the read-only capacity-policy event stream."""
+
+        return self.capacity_history(after_event_id=after_event_id)
 
     @staticmethod
     def _rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -594,7 +980,7 @@ class SmartJobQueue:
         rows: Iterable[sqlite3.Row],
         visible_urls: Iterable[str],
     ) -> set[str]:
-        """Validate the fixed capacity using only known canonical listings.
+        """Validate the bounded capacity using only known canonical listings.
 
         Unrelated tabs, including unrelated listing pages, cannot consume queue
         capacity. Duplicate URLs for a managed listing make the physical-slot
@@ -606,8 +992,10 @@ class SmartJobQueue:
         known_visible = set(known_visible_values)
         if len(known_visible) != len(known_visible_values):
             raise QueuePolicyError("visible queue listings must not contain duplicate managed URLs")
-        if len(known_visible) > self.target_size:
-            raise QueuePolicyError("visible queue listings cannot exceed five jobs")
+        if len(known_visible) > _MAX_TARGET_SIZE:
+            raise QueuePolicyError(
+                f"visible queue listings cannot exceed {_MAX_TARGET_SIZE} managed jobs"
+            )
         return known_visible
 
     def add_recommendations(self, candidates: Iterable[QueueCandidate]) -> None:
@@ -728,6 +1116,7 @@ class SmartJobQueue:
         try:
             rows = self._rows(connection)
             active_revisions = self._read_active_revisions(connection)
+            target_size = self._read_target_size(connection)
             known_visible = self._known_visible_urls(rows, visible_urls)
             occupied_urls = set(known_visible)
             occupied_urls.update(
@@ -735,7 +1124,7 @@ class SmartJobQueue:
                 for row in rows
                 if self._state(row) in _ACTIVE_STATES
             )
-            vacancies = max(0, self.target_size - len(occupied_urls))
+            vacancies = max(0, target_size - len(occupied_urls))
             selectable = [
                 row
                 for row in rows

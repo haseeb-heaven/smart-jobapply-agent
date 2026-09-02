@@ -49,7 +49,7 @@ Compared to nearby alternatives:
 - `neonwatty/job-apply-plugin` and `privacydied/job-application-skill` are
   more form-oriented in parts of their stacks.
 - `DanielPan12/JobHuntBot` is close, but uses a local dashboard model with more
-  active application orchestration than this fixed-slot browser-queue model.
+  active application orchestration than this candidate-sized browser-queue model.
 - `vaibhavarora14/job-application-agent` and `mattohan567/job-application-agent`
   include broader application lifecycle surfaces; this repo keeps that surface
   minimal and candidate-led.
@@ -62,14 +62,15 @@ signals, not safety or correctness scores.
 
 | Project | Primary surface | Application boundary | Tracking model | What is unique here by comparison |
 | --- | --- | --- | --- | --- |
-| **Smart JobApply Agent** | Bring your own agent, browser, and tools | The agent never fills or submits; the candidate applies manually | Exactly five reserved listing tabs, append-only history, and user-confirmed outcomes replenish open slots | A fixed-slot live browser queue makes the candidate’s current tabs the work queue while deterministic eligibility and evidence ranking remain in the core package |
+| **Smart JobApply Agent** | Bring your own agent, browser, and tools | The agent never fills or submits; the candidate applies manually | Candidate-selected 1–10 managed listing tabs (default 5), append-only history, and user-confirmed outcomes replenish open slots | A live browser queue makes candidate-selected listing tabs the work queue while deterministic eligibility and evidence ranking remain in the core package |
 | [JobHuntBot](https://github.com/DanielPan12/JobHuntBot) | Any capable coding agent plus a local progress dashboard | Broader application workflow with a pause before final submission | Dashboard and local application lifecycle tracking | This project is narrower: no dashboard, no form workflow, and no agent-led application interaction |
 | [Job Apply Plugin](https://github.com/neonwatty/job-apply-plugin) | Claude Code/Codex plugin for supported job boards | Form-oriented assistance for LinkedIn, Greenhouse, Ashby, and Workday | Plugin answer memory and application-flow state | This project is board-agnostic at the core and limits browser authority to approved listing URLs only |
-| [CareerForge / AI Job Search](https://github.com/suraj-davariya/ai-job-search) | Claude Code search/apply commands, document generation, and a local dashboard | Prepares tailored application materials but does not submit | Local dashboard tracks applications and generated artifacts | This project optimizes the live five-tab decision queue rather than document generation or dashboard management |
+| [CareerForge / AI Job Search](https://github.com/suraj-davariya/ai-job-search) | Claude Code search/apply commands, document generation, and a local dashboard | Prepares tailored application materials but does not submit | Local dashboard tracks applications and generated artifacts | This project optimizes a live candidate-sized decision queue rather than document generation or dashboard management |
 
 The differentiator is therefore the **Smart Job Queue**: an agent-managed,
-candidate-controlled set of five evidence-ranked listing tabs that is refilled
-only after the candidate confirms an outcome and a tab is actually vacated.
+candidate-controlled set of 1–10 evidence-ranked managed listing tabs (default
+5) that is refilled only after the candidate confirms an outcome and a tab is
+actually vacated.
 
 ### What is distinctive in this repo
 
@@ -97,7 +98,7 @@ Find + rank jobs
       ↓
 Avoid duplicates
       ↓
-Maintain 5 best open browser jobs
+Maintain the candidate-selected number of open job tabs (default 5)
       ↓
 You apply manually
       ↓
@@ -116,8 +117,12 @@ Repeat
 
 ## SMART JOB QUEUE
 
-This five-tab loop is the primary product behavior. The agent maintains an
-evidence-ranked work queue; the candidate performs every application action.
+This candidate-sized loop is the primary product behavior. The candidate chooses
+how many managed listing tabs to keep open (an integer from 1 through 10;
+default 5). The agent maintains that evidence-ranked work queue; the candidate
+performs every application action. This capacity counts only canonical,
+approved listing tabs managed by Smart Job Queue—not unrelated personal, search,
+account, or application-flow tabs in the browser.
 
 ![Smart Job Queue replenishment loop](docs/assets/smart-job-queue.png)
 
@@ -125,7 +130,7 @@ evidence-ranked work queue; the candidate performs every application action.
 verified profile + preferences + application history
                         |
                         v
-             five best eligible job tabs
+       candidate-selected eligible job tabs (1–10; default 5)
                         |
           candidate applies, skips, or closes tabs
                         |
@@ -141,7 +146,7 @@ verified profile + preferences + application history
           deterministic queue selects the best unseen jobs
                         |
                         v
-        browser adapter opens exact listing URLs; back to five
+ browser adapter opens exact listing URLs; back to selected capacity
 ```
 
 That is the intended cadence in practice:
@@ -156,7 +161,8 @@ Agent knows:
 - jobs still waiting for your confirmation
 
 Agent keeps:
-5 good jobs open
+the candidate-selected number of good managed job tabs open
+(1–10; default 5)
 
 You apply to 2
       ↓
@@ -170,7 +176,7 @@ Finds 2 best replacements
       ↓
 Opens them in your browser
       ↓
-Queue is back to 5
+Queue is back to the selected capacity
       ↓
 Repeat
 ```
@@ -187,9 +193,13 @@ location. `record_visible_snapshot` observes only URLs. A missing tab enters
 `submitted`, `rejected`, or `skipped`; it never records an application.
 `plan_refill` returns data-only exact URLs and a `search_needed` count only for
 legitimate confirmed vacancies. The host LLM searches when needed, constructs
-only prevalidated deterministic `QueueCandidate` values, and passes them
-directly to the skill-level `SmartQueueCoordinator(queue, browser)`. That
-coordinator accepts a host-provided listing-only adapter; the optional Codex
+only prevalidated deterministic `QueueCandidate` values, creates the live queue
+with `discover.smart_queue_for_active_intake(intake_path, database_path)`, and
+then passes that integrity-bound queue to the skill-level
+`SmartQueueCoordinator(queue, browser)`. A non-default live capacity is rejected
+unless its durable metadata is bound to the active candidate intake revision;
+the default of five remains compatible. That coordinator accepts a host-provided
+listing-only adapter; the optional Codex
 Chrome bridge is a reference implementation for an already-connected session,
 requires its durable queue database to resolve inside the ignored
 `jobapply_agent/private/` runtime directory, and exposes counts and opaque
@@ -197,8 +207,11 @@ queue IDs only; URLs never leave its reconciliation boundary. Only
 `confirm_outcome(..., actor="user")` records an outcome.
 
 An outcome-confirmed tab that remains physically open still occupies one of the
-five slots. The agent never closes it; replacement waits until the candidate
-closes it. This keeps the visible browser queue bounded without granting close
+managed slots. The agent never closes it; replacement waits until the candidate
+closes it. If the candidate lowers capacity below already managed tabs, the
+agent opens nothing and never closes, revokes, or reclassifies any tab; the
+queue returns to capacity only through candidate-controlled outcomes and tab
+closures. This keeps the visible browser queue bounded without granting close
 or form authority.
 
 In contrast to full-automation tools, this implementation is opinionated toward
@@ -211,7 +224,8 @@ submission, and no replacement work until a slot is legitimately vacated.
 ```yaml
 application_actions: 0
 candidate_owns_all_application_actions: true
-max_open_listing_tabs: 5
+smart_queue_capacity: candidate_selected_integer_1_to_10_default_5
+smart_queue_capacity_counts: managed_approved_listing_tabs_only
 supported_listing_hosts: [linkedin.com, indeed.com]
 professional_evidence_must_remain_separate: true
 append_only_audit_history: true
@@ -509,13 +523,16 @@ python jobapply_agent/scripts/discover.py \
   jobapply_agent/output/Current_Profile_Recommended_Queue.csv
 ```
 
-For Smart Job Queue operation, feed the visible tab URLs into
+For Smart Job Queue operation, ask the candidate during onboarding: “How many
+managed job listing tabs do you want open? (1–10; default 5.)” Store only an
+explicit candidate choice; an absent choice uses the documented default without
+being inferred from unrelated browser tabs. Feed the visible tab URLs into
 `record_visible_snapshot`, call `plan_refill`, then open only its returned URLs
 through the bounded browser adapter. The legacy watcher below preserves one
-fixed round by reopening the same URLs; use it only when the candidate
-explicitly asks to hold that exact round rather than replenish it. For any
-operating system or browser, supply a conforming external bridge as an argv
-prefix:
+fixed five-tab round by reopening the same URLs; it is separate legacy tooling,
+not a Smart Queue capacity authority. Use it only when the candidate explicitly
+asks to hold that exact round rather than replenish it. For any operating system
+or browser, supply a conforming external bridge as an argv prefix:
 
 ```sh
 python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \

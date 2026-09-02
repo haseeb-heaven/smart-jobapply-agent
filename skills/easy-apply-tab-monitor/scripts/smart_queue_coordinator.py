@@ -16,6 +16,7 @@ from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJo
 
 
 _PRIVATE_RUNTIME_DIRECTORY = Path(__file__).resolve().parents[3] / "jobapply_agent" / "private"
+_DEFAULT_TARGET_SIZE = 5
 
 
 @runtime_checkable
@@ -62,6 +63,7 @@ class SmartQueueCoordinator:
         if not isinstance(queue, SmartJobQueue):
             raise TypeError("queue must be a SmartJobQueue")
         self._require_private_runtime_database(queue)
+        self._require_live_capacity_provenance(queue)
         if not isinstance(browser, BrowserTabAdapter):
             raise TypeError("browser must implement the listing-only BrowserTabAdapter protocol")
         self._queue = queue
@@ -81,6 +83,20 @@ class SmartQueueCoordinator:
             database_path.relative_to(private_runtime)
         except (OSError, RuntimeError, ValueError):
             raise QueueCoordinatorError("live Smart Queue requires a private runtime database") from None
+
+    @staticmethod
+    def _require_live_capacity_provenance(queue: SmartJobQueue) -> None:
+        """Require active-intake proof before a live host may open extra tabs.
+
+        The documented default of five remains compatible for legacy and
+        test-only queues. Any other live capacity must be durably bound to the
+        integrity-checked active candidate intake by the discover factory.
+        """
+
+        if queue.target_size != _DEFAULT_TARGET_SIZE and not queue.has_active_intake_capacity_provenance:
+            raise QueueCoordinatorError(
+                "non-default live Smart Queue capacity requires active candidate intake provenance"
+            )
 
     def _snapshot(self) -> tuple[str, ...]:
         try:

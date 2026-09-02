@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
 import pytest
 
+from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueuePolicyError, SmartJobQueue
 
 
@@ -97,7 +99,9 @@ class FollowUpUnavailableBrowser(SnapshotBrowser):
         return tuple(self.visible_urls)
 
 
-def _coordinator(tmp_path: Path, browser: SnapshotBrowser) -> tuple[SmartJobQueue, SmartQueueCoordinator]:
+def _coordinator(
+    tmp_path: Path, browser: SnapshotBrowser, *, target_size: int = 5
+) -> tuple[SmartJobQueue, SmartQueueCoordinator]:
     runtime_name = f"{tmp_path.parent.name}-{tmp_path.name}"
     runtime_directory = (
         Path(__file__).parents[1]
@@ -106,8 +110,60 @@ def _coordinator(tmp_path: Path, browser: SnapshotBrowser) -> tuple[SmartJobQueu
         / "test-smart-queue-coordinator"
         / runtime_name
     )
-    queue = SmartJobQueue(runtime_directory / "smart-queue.sqlite3")
+    database = runtime_directory / "smart-queue.sqlite3"
+    if target_size == 5:
+        queue = SmartJobQueue(database)
+    else:
+        queue = _load_discover_module().smart_queue_for_active_intake(
+            _active_intake_with_capacity(tmp_path, target_size),
+            database,
+        )
     return queue, SmartQueueCoordinator(queue, browser)
+
+
+def _private_runtime_database(tmp_path: Path, name: str) -> Path:
+    """Return an ignored runtime database path accepted by the live coordinator."""
+
+    runtime_name = f"{tmp_path.parent.name}-{tmp_path.name}-{name}"
+    return (
+        Path(__file__).parents[1]
+        / "jobapply_agent"
+        / "private"
+        / "test-smart-queue-coordinator"
+        / runtime_name
+        / "smart-queue.sqlite3"
+    )
+
+
+def _load_discover_module():
+    """Load the public active-intake queue factory without using a CLI host."""
+
+    script_path = Path(__file__).parents[1] / "jobapply_agent" / "scripts" / "discover.py"
+    spec = importlib.util.spec_from_file_location("discover_for_live_queue_provenance", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _active_intake_with_capacity(tmp_path: Path, target_size: int) -> Path:
+    """Create only synthetic, candidate-confirmed active capacity evidence."""
+
+    payload = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {"targets.smart_queue_capacity": target_size},
+        "unknown_fields": [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir(parents=True)
+    intake_path.write_text(
+        json.dumps(activate_candidate_profile(validate_candidate_intake(payload), actor="user")),
+        encoding="utf-8",
+    )
+    return intake_path
 
 
 def _assert_redacted_public_cycle(result: object, *, search_needed: int) -> None:
@@ -136,6 +192,52 @@ def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recom
     assert browser.list_calls >= 2  # A post-open snapshot verifies every claimed open.
     assert [queue.get(candidate.job_id).state for candidate in candidates[:5]] == ["open"] * 5
     assert [queue.get(candidate.job_id).state for candidate in candidates[5:]] == ["recommended"] * 2
+
+
+@pytest.mark.parametrize("target_size", (1, 3, 10))
+def test_cycle_opens_exactly_the_candidate_selected_number_of_listing_tabs(
+    tmp_path: Path, target_size: int
+):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser, target_size=target_size)
+    candidates = [_candidate(number) for number in range(1, 13)]
+
+    result = coordinator.cycle(candidates)
+
+    expected = candidates[:target_size]
+    assert result.requested_open_job_ids == tuple(candidate.job_id for candidate in expected)
+    assert result.opened_job_ids == tuple(candidate.job_id for candidate in expected)
+    assert browser.opened_urls == [candidate.source_url for candidate in expected]
+    assert len(browser.visible_urls) == target_size
+    assert {queue.get(candidate.job_id).state for candidate in expected} == {"open"}
+
+
+def test_manual_close_then_candidate_outcomes_reopens_exactly_the_number_of_replacements_needed(
+    tmp_path: Path,
+):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser, target_size=3)
+    candidates = [_candidate(number) for number in range(1, 6)]
+    coordinator.cycle(candidates)
+
+    manually_closed = candidates[:2]
+    for candidate in manually_closed:
+        browser.visible_urls.remove(candidate.source_url)
+    browser.opened_urls.clear()
+    pending = coordinator.cycle(())
+
+    assert pending.opened_job_ids == ()
+    assert browser.opened_urls == []
+    assert {queue.get(candidate.job_id).state for candidate in manually_closed} == {"awaiting_outcome"}
+
+    for candidate in manually_closed:
+        coordinator.confirm_outcome(candidate.job_id, "submitted", actor="user")
+    refilled = coordinator.cycle(())
+
+    expected_replacements = candidates[3:5]
+    assert refilled.opened_job_ids == tuple(candidate.job_id for candidate in expected_replacements)
+    assert browser.opened_urls == [candidate.source_url for candidate in expected_replacements]
+    assert len(browser.visible_urls) == 3
 
 
 def test_missing_tab_reserves_slot_as_awaiting_outcome_and_is_not_reopened(tmp_path: Path):
@@ -291,6 +393,73 @@ def test_live_coordinator_requires_a_queue_database_in_repository_private_runtim
     assert queue.database_path.resolve().is_relative_to(
         (Path(__file__).parents[1] / "jobapply_agent" / "private").resolve()
     )
+
+
+def test_live_coordinator_rejects_direct_nondefault_queue_without_verified_intake_provenance(
+    tmp_path: Path,
+):
+    """A host cannot invent a 3-tab live queue by calling SmartJobQueue directly."""
+
+    browser = SnapshotBrowser()
+    direct_queue = SmartJobQueue(_private_runtime_database(tmp_path, "direct-nondefault"), target_size=3)
+
+    with pytest.raises(QueueCoordinatorError, match="provenance|active intake|candidate"):
+        SmartQueueCoordinator(direct_queue, browser)
+
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_live_coordinator_accepts_default_queue_without_nondefault_intake_provenance(tmp_path: Path):
+    """The documented default remains usable when capacity is not explicitly selected."""
+
+    browser = SnapshotBrowser()
+    default_queue = SmartJobQueue(_private_runtime_database(tmp_path, "direct-default"))
+
+    coordinator = SmartQueueCoordinator(default_queue, browser)
+
+    assert default_queue.target_size == 5
+    assert coordinator is not None
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_live_coordinator_accepts_verified_active_intake_capacity_and_opens_exactly_three_tabs(
+    tmp_path: Path,
+):
+    """A candidate-confirmed active profile is the authority for a 3-tab live queue."""
+
+    discover = _load_discover_module()
+    browser = SnapshotBrowser()
+    queue = discover.smart_queue_for_active_intake(
+        _active_intake_with_capacity(tmp_path, 3),
+        _private_runtime_database(tmp_path, "verified-three"),
+    )
+    coordinator = SmartQueueCoordinator(queue, browser)
+    candidates = [_candidate(number) for number in range(1, 5)]
+
+    cycle = coordinator.cycle(candidates)
+
+    assert queue.target_size == 3
+    assert cycle.opened_job_ids == tuple(candidate.job_id for candidate in candidates[:3])
+    assert browser.opened_urls == [candidate.source_url for candidate in candidates[:3]]
+    assert len(browser.visible_urls) == 3
+
+
+def test_verified_capacity_provenance_persists_and_direct_host_cannot_overwrite_it(tmp_path: Path):
+    """Restarting may reuse verified policy, but cannot replace it with host configuration."""
+
+    discover = _load_discover_module()
+    database = _private_runtime_database(tmp_path, "persisted-provenance")
+    discover.smart_queue_for_active_intake(_active_intake_with_capacity(tmp_path, 3), database)
+
+    restarted = SmartJobQueue(database)
+    restarted_coordinator = SmartQueueCoordinator(restarted, SnapshotBrowser())
+
+    assert restarted.target_size == 3
+    assert restarted_coordinator is not None
+    with pytest.raises(QueuePolicyError, match="conflict|target_size|capacity"):
+        SmartJobQueue(database, target_size=5)
 
 
 def test_live_coordinator_rejects_a_database_path_that_escapes_private_runtime_via_symlink(tmp_path: Path):

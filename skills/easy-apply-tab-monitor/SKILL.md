@@ -9,8 +9,10 @@ Use this skill when the candidate wants job listings opened for manual applicati
 
 ## Safety contract
 
-- Open at most five job tabs per round through an explicitly configured browser
-  adapter. The browser and operating system are supplied by the host agent.
+- In Smart Queue mode, maintain the candidate-selected number of managed,
+  approved listing tabs: an integer from 1 through 10, default 5. This is not a
+  count of unrelated browser tabs, searches, account pages, or application
+  flows. The browser and operating system are supplied by the host agent.
 - LinkedIn and Indeed are the only supported hosts. Keep the exact canonical listing URL in the manifest.
 - Never click Apply, Easy Apply, Continue, Next, Submit, or any equivalent control. Do not fill, upload, or transmit candidate data.
 - Do not handle credentials, CAPTCHA, MFA, consent, or account creation. Pause if the board requests them.
@@ -32,7 +34,10 @@ Use this skill when the candidate wants job listings opened for manual applicati
 
 ## Workflow
 
-1. Select up to five recommendations from the supplied research queue. Prefer the strongest profile matches, exclude roles already marked submitted/filled, and mix LinkedIn/Indeed only when both have suitable listings.
+1. Ask the candidate how many managed listing tabs to keep open (1–10, default
+   5), then select up to that capacity from the supplied research queue. Prefer
+   the strongest profile matches, exclude roles already marked submitted/filled,
+   and mix LinkedIn/Indeed only when both have suitable listings.
 2. Create a local manifest with title, company, platform, exact URL, fit rationale, and visible apply path (`easy_apply`, `apply_with_indeed`, or `external`). Do not include email contents, resume text, credentials, or screening answers.
 3. Open each exact URL in a separate visible browser tab. Use only supplied
    listing metadata and candidate review to verify title, company, location,
@@ -41,10 +46,13 @@ Use this skill when the candidate wants job listings opened for manual applicati
 4. Read prior-application state from the local tracker. Anything not explicitly
    candidate-confirmed remains `unknown`.
 5. In Smart Queue mode, the host gives `SmartQueueCoordinator(queue, browser)`
-   up to five prevalidated candidates directly. It compares visible URLs and
-   records missing jobs as `awaiting_outcome`. Wait for candidate-confirmed
-   outcomes before planning replacements, then open only returned exact listing
-   URLs. If the pool is short, report `search_needed` to the host agent.
+   up to the candidate-selected capacity of prevalidated candidates directly.
+   It compares visible managed listing URLs and records missing jobs as
+   `awaiting_outcome`. Wait for candidate-confirmed outcomes before planning
+   replacements, then open only returned exact listing URLs. If the pool is
+   short, report `search_needed` to the host agent. A capacity reduction never
+   grants close authority: the agent opens no replacements until natural,
+   candidate-controlled vacancies bring the managed queue below capacity.
 6. The coordinator result contains counts and opaque queue IDs only; URLs and
    snapshots remain inside the skill. Stop after the requested monitoring cycle
    unless the candidate asks for another cycle.
@@ -81,4 +89,7 @@ python3 skills/easy-apply-tab-monitor/scripts/tab_manifest.py missing \
   --manifest .job-tab-monitor.json --observed-url https://www.linkedin.com/jobs/view/123
 ```
 
-The helper rejects non-LinkedIn/Indeed hosts, duplicate URLs, more than five jobs, and unsupported apply-path values. It stores no credentials or message content.
+The helper is legacy fixed-round tooling: it rejects non-LinkedIn/Indeed hosts,
+duplicate URLs, more than five jobs, and unsupported apply-path values. It is
+not the Smart Queue capacity authority. It stores no credentials or message
+content.

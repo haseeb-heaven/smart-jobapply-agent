@@ -29,6 +29,7 @@ else:
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from jobapply_agent.models import CandidateProfile  # noqa: E402
+from jobapply_agent.smart_queue import QueuePolicyError, SmartJobQueue  # noqa: E402
 from jobapply_agent.intake import activate_candidate_profile, validate_active_candidate_profile  # noqa: E402
 from jobapply_agent.intake import (  # noqa: E402
     completion_questions,
@@ -43,6 +44,7 @@ DEFAULT_CANDIDATE_PROFILE_PATH = PROJECT_ROOT / "private" / "candidate_profile.y
 DEFAULT_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private" / "candidate_intake.json"
 REDACTED_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private.example" / "candidate_intake.json"
 INTERACTIVE_CONFIRMATION_TOKEN = "yes"
+_UNSET_QUEUE_CAPACITY = object()
 _JSON_STRING_LIST_FIELDS = frozenset(
     {
         "skills.professional",
@@ -543,13 +545,76 @@ def _active_intake_profile_mapping(active_intake: Mapping[str, Any]) -> dict[str
 def active_candidate_profile(intake_path: Path) -> CandidateProfile:
     """Load only an integrity-checked, explicitly user-confirmed intake."""
 
+    active_intake = _active_candidate_intake(intake_path)
+    return CandidateProfile.from_mapping(_active_intake_profile_mapping(active_intake))
+
+
+def _active_candidate_intake(intake_path: Path) -> Mapping[str, Any]:
+    """Read one active intake only through its integrity-check boundary."""
+
     if not intake_path.exists():
         raise ValueError("Candidate intake is missing")
     payload = json.loads(intake_path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("Candidate intake JSON must be an object")
-    active_intake = validate_active_candidate_profile(payload)
-    return CandidateProfile.from_mapping(_active_intake_profile_mapping(active_intake))
+    return validate_active_candidate_profile(payload)
+
+
+def smart_queue_for_active_intake(
+    intake_path: Path,
+    database_path: Path | str,
+    *,
+    target_size: int | object = _UNSET_QUEUE_CAPACITY,
+) -> SmartJobQueue:
+    """Construct a queue from the active candidate's confirmed capacity.
+
+    This is the live-host construction seam. The active, integrity-checked
+    intake is the source of the capacity. A caller may repeat that exact value
+    for defensive configuration checks, but a different value fails closed;
+    it cannot invent a non-default live capacity. An absent optional preference
+    uses the documented default of five without mutating candidate facts.
+    """
+
+    requested_target_size = target_size
+    if requested_target_size is not _UNSET_QUEUE_CAPACITY:
+        if (
+            isinstance(requested_target_size, bool)
+            or not isinstance(requested_target_size, int)
+            or not 1 <= requested_target_size <= 10
+        ):
+            raise QueuePolicyError("target_size must be an integer between 1 and 10")
+
+    active_intake = _active_candidate_intake(intake_path)
+    confirmed_capacity = _approved_fact(
+        active_intake["approved_facts"], "targets.smart_queue_capacity"
+    )
+    if confirmed_capacity is None:
+        active_target_size = 5
+    elif isinstance(confirmed_capacity, bool) or not isinstance(confirmed_capacity, int):
+        # validate_active_candidate_profile normally makes this unreachable.
+        # Keep the construction seam fail-closed if a future validator changes.
+        raise ValueError("Active candidate smart queue capacity is invalid")
+    else:
+        active_target_size = confirmed_capacity
+    if (
+        requested_target_size is not _UNSET_QUEUE_CAPACITY
+        and requested_target_size != active_target_size
+    ):
+        raise QueuePolicyError("configured target_size conflicts with the active candidate capacity")
+    if active_target_size == 5:
+        # The default never needs extra provenance to be accepted by a live
+        # coordinator, which preserves existing default-capacity queues.
+        return SmartJobQueue(database_path, target_size=active_target_size)
+    return SmartJobQueue.for_active_candidate_intake(
+        database_path,
+        target_size=active_target_size,
+        intake_revision_hash=str(active_intake["revision_hash"]),
+    )
+
+
+# The longer name remains a harmless discover-module alias for host code that
+# adopted it before the public construction seam was stabilized.
+active_smart_job_queue = smart_queue_for_active_intake
 
 
 def _load_visible_payloads(path: Path | None) -> Mapping[str, Sequence[Mapping[str, Any]]]:
