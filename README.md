@@ -282,13 +282,54 @@ Use `pending_verification_batch` and `completion_questions` as helper outputs fo
 this candidate-facing round. Never fabricate work authorization, sponsorship,
 compensation, availability, location, or screening answers.
 
-Use the onboarding helper before discovery if needed:
+### Conversational host-agent onboarding (primary)
+
+The host agent conducts the complete onboarding interview in chat. It asks the
+candidate every unresolved question in one grouped pass, records only explicit
+candidate-confirmed answers, preserves unanswered items as unresolved, asks for
+final confirmation, then activates and persists the returned revision with
+`actor="user"`. Do not tell a conversational candidate to run a CLI command
+before answering the onboarding questions.
+
+### Prompt-plan helper (read-only)
+
+`--show-intake-questions` is an optional host-agent helper: it produces the
+privacy-safe prompt plan the agent can use to conduct the chat interview. It is
+not an onboarding interview and never reads answers, writes the intake, or
+activates a profile:
 
 ```sh
 python jobapply_agent/scripts/discover.py \
   --candidate-intake jobapply_agent/private/candidate_intake.json \
   --show-intake-questions
 ```
+
+Use `--onboarding-format json` when the host needs the same plan as a
+machine-readable bundle.
+
+### Terminal fallback only
+
+Use this only when a conversational host-agent interview is unavailable. The
+command asks every unresolved item once, accepts blank answers as still unknown,
+asks for final confirmation, and atomically replaces the supplied intake only
+after a literal affirmative response. A declined or incomplete interview exits
+non-zero and leaves the target unchanged:
+
+```sh
+python jobapply_agent/scripts/discover.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --interactive-onboarding
+```
+
+Interactive onboarding starts from the repository's redacted draft shape when
+the target does not exist. It stores only explicit candidate-approved facts and
+never parses resumes, invents defaults, performs lookups, or activates an
+intake without the existing `actor="user"` validation gate.
+
+Neither onboarding mode browses, logs in, accesses browser state, fills forms,
+uploads documents, clicks application controls, accepts attestations, submits
+applications, or sends messages. The candidate remains the sole owner of every
+application action.
 
 Read job facts only from a caller-supplied, already-visible payload through the
 visible-page adapter. Unknown values remain `unknown`. Required provenance:
@@ -389,6 +430,10 @@ python jobapply_agent/scripts/discover.py \
   --visible-payloads jobapply_agent/private/visible_listings.json \
   --output-dir jobapply_agent/data
 ```
+
+When the intake is a draft, the host agent completes the conversational
+onboarding interview above before discovery. Use the terminal fallback only
+when chat-based onboarding is unavailable.
 
 Export the active-profile queue from the append-only local results:
 

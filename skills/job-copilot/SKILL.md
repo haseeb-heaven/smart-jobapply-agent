@@ -47,6 +47,34 @@ Do not assume a model vendor, browser brand, desktop API, or agent tool name.
 8. Record submission or later outcomes only from explicit candidate input.
    Report unknowns and blockers instead of guessing.
 
+## Candidate-facing onboarding protocol
+
+The host agent, not the Python CLI, owns the candidate conversation. When the
+intake is missing, draft, or has unresolved review state:
+
+1. Load the privacy-safe question bundle from the intake helpers and ask every
+   unresolved `unknown`, `contradiction`, and `pending` item in one organized
+   conversational round. Do not tell the candidate to run a script as a
+   substitute for asking them.
+2. Collect only explicit candidate-confirmed answers. A blank, uncertain, or
+   ambiguous response remains unresolved; never infer from a resume, prior
+   chat, browsing result, or common default.
+3. Ask one final confirmation before activation. Summarize only safe field
+   labels/counts, not resume text, contact details, document contents, or
+   screening answers.
+4. After the candidate confirms, use the deterministic intake API to validate
+   the complete draft, activate it with the attributable `actor="user"` gate,
+   and atomically persist the returned active revision. If any item remains
+   unresolved or persistence fails, report `blocked` and do not discover jobs.
+5. Only after an active revision exists may the host agent proceed to visible
+   listing discovery and ranking.
+
+`--interactive-onboarding` is a safe terminal fallback for hosts that cannot
+conduct a conversation. It is not the primary agent experience and must not be
+used to bypass the candidate-facing confirmation or the deterministic
+`actor="user"` validation boundary. `--show-intake-questions` is a read-only
+helper for host orchestration and never collects or activates answers.
+
 ## Runtime contract
 
 The deterministic Python package owns validation, eligibility, scoring,

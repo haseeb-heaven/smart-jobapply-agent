@@ -7,9 +7,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
+DISCOVER_SCRIPT = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
 
 
 def load_discover_module():
@@ -91,6 +95,323 @@ def write_active_candidate_intake(path: Path) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(activate_candidate_profile(draft, actor="user")), encoding="utf-8")
+
+
+def write_onboarding_draft(path: Path, unknown_fields: list[str]) -> bytes:
+    draft = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {
+            "experience": {"total_years": 3},
+            "roles": {"include": ["Backend Developer"]},
+        },
+        "unknown_fields": unknown_fields,
+        "contradictions": [],
+        "pending_facts": [],
+        "state": "draft",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(draft), encoding="utf-8")
+    return path.read_bytes()
+
+
+def run_discover_cli(intake_path: Path, *arguments: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DISCOVER_SCRIPT),
+            "--candidate-intake",
+            str(intake_path),
+            *arguments,
+        ],
+        cwd=intake_path.parent,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_interactive_onboarding_cli_activates_after_all_answers_and_confirmation(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    write_onboarding_draft(intake_path, ["candidate_profile", "education"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nExample University\nyes\n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "candidate_profile" in completed.stdout
+    assert "education" in completed.stdout
+    persisted = json.loads(intake_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "active"
+    assert persisted["activated_by"] == "user"
+    assert persisted["unknown_fields"] == []
+    assert persisted["approved_facts"]["candidate_profile"] == "Backend profile"
+    assert persisted["approved_facts"]["education"] == "Example University"
+    assert len([path for path in tmp_path.rglob("*") if path.is_file()]) == 1
+
+
+def test_interactive_onboarding_cli_keeps_blank_answer_unresolved_and_does_not_persist(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, ["candidate_profile"])
+
+    completed = run_discover_cli(intake_path, "--interactive-onboarding", stdin="\n")
+
+    assert completed.returncode != 0
+    assert "candidate_profile" in completed.stdout
+    assert intake_path.read_bytes() == original
+    assert json.loads(intake_path.read_text(encoding="utf-8"))["state"] == "draft"
+
+
+def test_interactive_onboarding_cli_declined_confirmation_does_not_overwrite_draft(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, ["candidate_profile"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nno\n",
+    )
+
+    assert completed.returncode != 0
+    assert intake_path.read_bytes() == original
+    assert "Backend profile" not in completed.stderr
+    assert json.loads(intake_path.read_text(encoding="utf-8"))["state"] == "draft"
+
+
+def test_public_question_modes_remain_backward_compatible_and_privacy_safe(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, ["private.candidate.secret"])
+
+    text_mode = run_discover_cli(intake_path, "--show-intake-questions")
+    assert text_mode.returncode == 2
+    assert "review reference 'review-unknown-1'" in text_mode.stdout
+    assert "private.candidate.secret" not in text_mode.stdout
+    assert intake_path.read_bytes() == original
+
+    json_mode = run_discover_cli(
+        intake_path,
+        "--show-intake-questions",
+        "--onboarding-format",
+        "json",
+    )
+    assert json_mode.returncode == 2
+    payload = json.loads(json_mode.stdout)
+    assert payload["status"] == "blocked"
+    assert payload["question_count"] == 1
+    assert "private.candidate.secret" not in json_mode.stdout
+    assert intake_path.read_bytes() == original
+
+
+def test_interactive_onboarding_cli_absent_target_uses_redacted_starter(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir(parents=True)
+    starter_path = PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json"
+    starter = json.loads(starter_path.read_text(encoding="utf-8"))
+    unresolved_count = len(starter["unknown_fields"]) + len(starter["pending_facts"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="\n" * unresolved_count,
+    )
+
+    assert completed.returncode == 2
+    assert "identity.contact" in completed.stdout
+    assert "candidate_profile" in completed.stdout
+    assert "resume-primary" not in completed.stdout
+    assert "Interactive onboarding ended before confirmation" in completed.stderr
+    assert not intake_path.exists()
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
+def test_interactive_onboarding_cli_activates_absent_redacted_starter_with_skill_arrays(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir()
+    starter = json.loads(
+        (PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    answers = {
+        "skills.professional": ["Python", "FastAPI"],
+        "skills.personal_open_source": ["OpenAI"],
+        "skills.learning_or_exposure": ["Docker"],
+    }
+    answer_lines = [
+        json.dumps(answers[field]) if field in answers else f"candidate-confirmed {field}"
+        for field in starter["unknown_fields"]
+    ]
+    answer_lines.extend(
+        f"candidate-confirmed {item['field']}" for item in starter["pending_facts"]
+    )
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="\n".join([*answer_lines, "yes", ""]),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    persisted = json.loads(intake_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "active"
+    assert persisted["activated_by"] == "user"
+    assert persisted["unknown_fields"] == []
+    assert persisted["pending_facts"] == []
+    assert persisted["approved_facts"]["skills.professional"] == ["Python", "FastAPI"]
+    assert persisted["approved_facts"]["skills.personal_open_source"] == ["OpenAI"]
+    assert persisted["approved_facts"]["skills.learning_or_exposure"] == ["Docker"]
+
+
+def test_missing_intake_question_mode_returns_safe_redacted_question_bundle(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir()
+
+    completed = run_discover_cli(
+        intake_path,
+        "--show-intake-questions",
+        "--onboarding-format",
+        "json",
+    )
+
+    assert completed.returncode == 2
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "blocked"
+    assert payload["requires_user_confirmation"] is True
+    assert payload["question_count"] > 0
+    assert "identity.contact" in payload["pending_verification_batch"]["unknown_fields"]
+    rendered = completed.stdout + completed.stderr
+    assert "resume-primary" not in rendered
+    assert "documents/resume.pdf" not in rendered
+    assert not intake_path.exists()
+
+
+def test_interactive_onboarding_invalid_json_skill_answer_fails_without_writing(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir()
+    starter = json.loads(
+        (PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    answer_lines = [
+        "[not valid JSON" if field == "skills.professional" else "candidate-confirmed"
+        for field in starter["unknown_fields"]
+    ]
+    answer_lines.extend("candidate-confirmed" for _ in starter["pending_facts"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="\n".join([*answer_lines, "yes", ""]),
+    )
+
+    assert completed.returncode == 2
+    assert "not valid JSON" not in completed.stdout + completed.stderr
+    assert not intake_path.exists()
+
+
+def test_noninteractive_missing_intake_still_fails_without_creating_a_target(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir()
+
+    completed = run_discover_cli(intake_path)
+
+    assert completed.returncode == 2
+    assert "candidate intake is missing" in completed.stderr.casefold()
+    assert not intake_path.exists()
+
+
+def test_interactive_onboarding_cli_leaves_existing_active_intake_unchanged(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    write_active_candidate_intake(intake_path)
+    original = intake_path.read_bytes()
+
+    completed = run_discover_cli(intake_path, "--interactive-onboarding")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "already active" in completed.stdout
+    assert intake_path.read_bytes() == original
+    assert len([path for path in tmp_path.rglob("*") if path.is_file()]) == 1
+
+
+@pytest.mark.parametrize("raised_exception", [KeyboardInterrupt, OSError])
+def test_active_intake_persistence_cleans_temp_files_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised_exception: type[BaseException]
+):
+    discover = load_discover_module()
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, [])
+
+    def fail_during_flush(_file_descriptor: int) -> None:
+        raise raised_exception()
+
+    monkeypatch.setattr(discover.os, "fsync", fail_during_flush)
+
+    with pytest.raises(raised_exception):
+        discover._persist_active_candidate_intake(intake_path, {"state": "active"})
+
+    assert intake_path.read_bytes() == original
+    assert [path for path in intake_path.parent.iterdir() if path != intake_path] == []
+
+
+def test_interactive_onboarding_cli_fails_closed_for_invalid_active_target(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    write_active_candidate_intake(intake_path)
+    invalid_active = json.loads(intake_path.read_text(encoding="utf-8"))
+    invalid_active["revision_hash"] = "0" * 64
+    intake_path.write_text(json.dumps(invalid_active), encoding="utf-8")
+    original = intake_path.read_bytes()
+
+    completed = run_discover_cli(intake_path, "--interactive-onboarding")
+
+    assert completed.returncode != 0
+    assert "Candidate-approved answer" not in completed.stdout
+    assert "Type yes to confirm activation" not in completed.stdout
+    assert intake_path.read_bytes() == original
+
+
+def test_interactive_confirmation_summarizes_safe_fields_without_answer_values(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    write_onboarding_draft(intake_path, ["candidate_profile", "education"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nExample University\nyes\n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    confirmation_lines = [
+        line
+        for line in completed.stdout.splitlines()
+        if "candidate_profile" in line and "education" in line
+    ]
+    assert len(confirmation_lines) == 1
+    confirmation = confirmation_lines[0]
+    assert "candidate_profile" in confirmation
+    assert "education" in confirmation
+    assert "2" in confirmation
+    for answer in ("Backend profile", "Example University"):
+        assert answer not in completed.stdout + completed.stderr
+
+
+def test_interactive_onboarding_cli_accepts_whitespace_around_literal_yes(tmp_path: Path):
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    write_onboarding_draft(intake_path, ["candidate_profile"])
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\n  yes  \n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(intake_path.read_text(encoding="utf-8"))["state"] == "active"
 
 
 def test_profile_loader_reloads_approved_skill_revisions_for_matching(tmp_path: Path):
@@ -703,7 +1024,7 @@ def test_discover_onboarding_uses_opaque_references_for_unallowlisted_fields(
     assert "review-pending-1" in rendered
 
 
-def test_discover_onboarding_errors_do_not_echo_private_intake_path(
+def test_discover_missing_intake_question_mode_does_not_echo_private_intake_path(
     tmp_path: Path, capsys
 ):
     discover = load_discover_module()
@@ -720,7 +1041,8 @@ def test_discover_onboarding_errors_do_not_echo_private_intake_path(
     captured = capsys.readouterr()
     assert exit_code == 2
     assert str(missing_path) not in captured.out + captured.err
-    assert "candidate intake is missing" in captured.err.casefold()
+    assert "Candidate onboarding questions (ask all at once)" in captured.out
+    assert "identity.contact" in captured.out
 
 
 def test_active_intake_projects_only_candidate_approved_employment_and_authorization(

@@ -28,7 +28,7 @@ else:
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from jobapply_agent.models import CandidateProfile  # noqa: E402
-from jobapply_agent.intake import validate_active_candidate_profile  # noqa: E402
+from jobapply_agent.intake import activate_candidate_profile, validate_active_candidate_profile  # noqa: E402
 from jobapply_agent.intake import (  # noqa: E402
     completion_questions,
     pending_verification_batch,
@@ -40,6 +40,15 @@ from jobapply_agent.sources import MappingVisiblePageAdapter, load_search_profil
 
 DEFAULT_CANDIDATE_PROFILE_PATH = PROJECT_ROOT / "private" / "candidate_profile.yaml"
 DEFAULT_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private" / "candidate_intake.json"
+REDACTED_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private.example" / "candidate_intake.json"
+INTERACTIVE_CONFIRMATION_TOKEN = "yes"
+_JSON_STRING_LIST_FIELDS = frozenset(
+    {
+        "skills.professional",
+        "skills.personal_open_source",
+        "skills.learning_or_exposure",
+    }
+)
 _APPROVED_SKILL_SECTIONS = frozenset({"professional", "personal_open_source", "learning_or_exposure"})
 _APPROVED_ROLE_SECTIONS = frozenset({"include", "exclude_title_terms"})
 _APPROVED_HARD_EXCLUSION_SECTIONS = frozenset({"mandatory_requirements"})
@@ -433,6 +442,167 @@ def _intake_question_bundle(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _interactive_onboarding_draft(intake_path: Path) -> dict[str, Any]:
+    """Load the explicit target or the redacted starter without creating either."""
+
+    payload = (
+        _read_candidate_intake(intake_path)
+        if intake_path.exists()
+        else _read_candidate_intake(REDACTED_CANDIDATE_INTAKE_PATH)
+    )
+    return validate_candidate_intake(_question_draft_payload(payload))
+
+
+def _interactive_review_items(draft: Mapping[str, Any]) -> list[tuple[str, str, str, str]]:
+    """Pair each private storage key with its safe, deterministic prompt."""
+
+    questions = iter(completion_questions(draft))
+    safe_batch = pending_verification_batch(draft)
+    items: list[tuple[str, str, str, str]] = []
+    for contradiction, safe_item in zip(draft["contradictions"], safe_batch["contradictions"]):
+        items.append(("contradiction", contradiction["field"], safe_item["field"], next(questions)))
+    for field, safe_field in zip(draft["unknown_fields"], safe_batch["unknown_fields"]):
+        items.append(("unknown", field, safe_field, next(questions)))
+    for pending, safe_item in zip(draft["pending_facts"], safe_batch["pending_facts"]):
+        items.append(("pending", pending["field"], safe_item["field"], next(questions)))
+    return items
+
+
+def _parse_interactive_answer(answer: str) -> Any:
+    """Preserve a candidate's explicit JSON value, with text as a safe fallback."""
+
+    try:
+        return json.loads(answer)
+    except json.JSONDecodeError:
+        return answer
+
+
+def _interactive_answer_prompt(field: str) -> str:
+    """Describe required structure without reflecting any candidate-provided value."""
+
+    if field in _JSON_STRING_LIST_FIELDS:
+        return (
+            "Expected value shape: a JSON array of strings.\n"
+            "Candidate-approved answer (leave blank to keep this item unresolved): "
+        )
+    return (
+        "Candidate-approved answer (leave blank to keep this item unresolved; "
+        "use JSON for a list, object, number, or boolean): "
+    )
+
+
+def _record_interactive_answer(draft: dict[str, Any], *, group: str, field: str, answer: Any) -> None:
+    """Record exactly one supplied answer and clear its corresponding review item."""
+
+    draft["approved_facts"][field] = answer
+    if group == "unknown":
+        draft["unknown_fields"].remove(field)
+    elif group == "contradiction":
+        draft["contradictions"] = [item for item in draft["contradictions"] if item["field"] != field]
+    else:
+        draft["pending_facts"] = [item for item in draft["pending_facts"] if item["field"] != field]
+
+
+def _persist_active_candidate_intake(intake_path: Path, active_intake: Mapping[str, Any]) -> None:
+    """Atomically replace only the explicitly supplied local intake path."""
+
+    intake_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=intake_path.parent, delete=False) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(active_intake, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(intake_path)
+        temporary_path = None
+        _sync_parent_directory(intake_path.parent)
+    except BaseException:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
+
+def _sync_parent_directory(directory: Path) -> None:
+    """Persist a replacement's directory entry when the platform supports it."""
+
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        return
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | directory_flag)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _interactive_confirmation_prompt(collected_safe_fields: Sequence[str]) -> str:
+    """Describe the exact lowercase confirmation token without exposing values."""
+
+    fields = ", ".join(collected_safe_fields) if collected_safe_fields else "none"
+    return (
+        f"All supplied answers are candidate-approved facts. Collected "
+        f"{len(collected_safe_fields)} field(s): {fields}. "
+        f"Type exactly {INTERACTIVE_CONFIRMATION_TOKEN!r} to confirm activation; every other response declines: "
+    )
+
+
+def _run_interactive_onboarding(intake_path: Path) -> int:
+    """Collect explicit candidate answers and activate only after final confirmation."""
+
+    if intake_path.exists():
+        existing_intake = _read_candidate_intake(intake_path)
+        if existing_intake.get("state") == "active":
+            try:
+                validate_active_candidate_profile(existing_intake)
+            except ValueError:
+                print("Existing active candidate intake failed validation; interactive onboarding made no changes.", file=sys.stderr)
+                return 2
+            print("Candidate intake is already active; interactive onboarding made no changes.")
+            return 0
+
+    draft = _interactive_onboarding_draft(intake_path)
+    collected_safe_fields: list[str] = []
+    try:
+        for group, field, safe_field, question in _interactive_review_items(draft):
+            answer = input(f"{question}\n{_interactive_answer_prompt(field)}").strip()
+            if answer:
+                _record_interactive_answer(
+                    draft,
+                    group=group,
+                    field=field,
+                    answer=_parse_interactive_answer(answer),
+                )
+                collected_safe_fields.append(safe_field)
+
+        confirmation = input(_interactive_confirmation_prompt(collected_safe_fields)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("Interactive onboarding ended before confirmation; intake was not changed.", file=sys.stderr)
+        return 2
+
+    if confirmation != INTERACTIVE_CONFIRMATION_TOKEN:
+        print("Interactive onboarding was not confirmed; intake was not changed.", file=sys.stderr)
+        return 2
+    if draft["unknown_fields"] or draft["contradictions"] or draft["pending_facts"]:
+        print("Interactive onboarding is incomplete; intake was not changed.", file=sys.stderr)
+        return 2
+
+    active_intake = activate_candidate_profile(draft, actor="user")
+    try:
+        _persist_active_candidate_intake(intake_path, active_intake)
+    except KeyboardInterrupt:
+        print("Interactive onboarding was interrupted while saving; inspect the intake before retrying.", file=sys.stderr)
+        return 2
+    print("Candidate intake activated after explicit user confirmation.")
+    return 0
+
+
 def export_current_profile_recommendation_queue(
     profile: CandidateProfile, recommendation_export_path: Path, queue_path: Path
 ) -> int:
@@ -498,6 +668,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Validate a draft intake and print unresolved onboarding questions before discovery.",
     )
     parser.add_argument(
+        "--interactive-onboarding",
+        action="store_true",
+        help="Collect explicit candidate answers locally and activate only after exact lowercase 'yes' confirmation.",
+    )
+    parser.add_argument(
         "--onboarding-format",
         choices=("text", "json"),
         default="text",
@@ -519,8 +694,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.candidate_intake is None:
             raise ValueError("--candidate-intake is required and must reference an active user-confirmed intake")
-        raw_candidate_intake = _read_candidate_intake(arguments.candidate_intake)
+        if arguments.interactive_onboarding and arguments.show_intake_questions:
+            raise ValueError("interactive onboarding and question-display modes cannot be combined")
+        if arguments.interactive_onboarding:
+            return _run_interactive_onboarding(arguments.candidate_intake)
         if arguments.show_intake_questions:
+            raw_candidate_intake = (
+                _read_candidate_intake(arguments.candidate_intake)
+                if arguments.candidate_intake.exists()
+                else _read_candidate_intake(REDACTED_CANDIDATE_INTAKE_PATH)
+            )
             if arguments.onboarding_format == "json":
                 bundle = _intake_question_bundle(raw_candidate_intake)
                 print(json.dumps(bundle, indent=2, sort_keys=True))
@@ -530,6 +713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(message)
             return status
 
+        raw_candidate_intake = _read_candidate_intake(arguments.candidate_intake)
         try:
             active_intake = validate_active_candidate_profile(raw_candidate_intake)
         except ValueError:
