@@ -23,8 +23,12 @@ Use this skill when the candidate wants job listings opened for manual applicati
   candidate explicitly requests that behavior.
 - The live Smart Queue host supplies already-validated `QueueCandidate` values
   directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
-  recommendation-file CLI. Its local queue database must be under
-  `jobapply_agent/private/`, which is ignored, never at repository root.
+  recommendation-file CLI. It accepts any host-supplied adapter that implements
+  exactly the two bounded tab operations. The optional Codex Chrome extension
+  bridge is a reference integration for an already-connected session, not a
+  claim that the core can prove a host browser identity. Its local queue
+  database must resolve under `jobapply_agent/private/`, which is ignored,
+  never at repository root.
 
 ## Workflow
 
@@ -53,9 +57,9 @@ use
 external --adapter-command <bridge-argv...>`. The legacy filename is retained
 for compatibility; the external bridge supports any browser and operating
 system through the `list-tabs`/`open-listing` argv/JSON protocol. The optional
-`chrome-applescript` adapter supports only an already-running macOS Chrome
-session with an existing window; it fails closed when unavailable. It is legacy
-fixed-round compatibility, not a Smart Queue adapter. The monitor reopens
+`chrome-applescript` adapter is legacy fixed-round compatibility only. Its
+scripts refuse to create a Chrome window, but it cannot provide the live
+queue's atomic session boundary and is never a Smart Queue adapter. The monitor reopens
 only missing listing URLs and writes one counts-only, redacted JSON status line
 per cycle; exact approved/browser URLs remain internal to reconciliation and are
 never included in CLI status output.

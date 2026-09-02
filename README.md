@@ -189,8 +189,11 @@ location. `record_visible_snapshot` observes only URLs. A missing tab enters
 legitimate confirmed vacancies. The host LLM searches when needed, constructs
 only prevalidated deterministic `QueueCandidate` values, and passes them
 directly to the skill-level `SmartQueueCoordinator(queue, browser)`. That
-coordinator is the only live browser orchestration path and exposes counts and
-opaque queue IDs only; URLs never leave its reconciliation boundary. Only
+coordinator accepts a host-provided listing-only adapter; the optional Codex
+Chrome bridge is a reference implementation for an already-connected session,
+requires its durable queue database to resolve inside the ignored
+`jobapply_agent/private/` runtime directory, and exposes counts and opaque
+queue IDs only; URLs never leave its reconciliation boundary. Only
 `confirm_outcome(..., actor="user")` records an outcome.
 
 An outcome-confirmed tab that remains physically open still occupies one of the
@@ -525,11 +528,12 @@ python skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py \
 `--adapter-command` must be last; all remaining tokens are passed as argv without
 a shell. The legacy script name is retained for compatibility. On macOS only, agents may
 explicitly select the optional built-in bridge with
-`--adapter chrome-applescript` and omit `--adapter-command`. It requires an
-already-running Chrome session with an existing window and fails closed when
-that session is unavailable. It is for the legacy fixed-round watcher only;
-Smart Queue hosts provide their own URL-only adapter directly and never receive
-a generic AppleScript capability. Neither route performs a form action.
+`--adapter chrome-applescript` and omit `--adapter-command`. Its legacy watcher
+scripts refuse to create a Chrome window, but it cannot provide the atomic
+session boundary required by live Smart Queue. It is therefore legacy
+fixed-round compatibility only. Live Smart Queue remains browser-neutral and
+requires a host adapter limited to listing URLs and exact approved listing
+opens. Neither route performs a form action.
 
 ## MANDATORY MULTI-AGENT DELIVERY
 

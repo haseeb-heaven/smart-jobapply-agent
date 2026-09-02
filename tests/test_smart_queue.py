@@ -87,6 +87,52 @@ def test_queue_candidate_revision_fields_are_required_for_new_values():
         )
 
 
+@pytest.mark.parametrize(
+    "job_id",
+    (
+        "https://www.linkedin.com/jobs/view/123",
+        "//www.linkedin.com/jobs/view/123",
+        "www.linkedin.com/jobs/view/123",
+        "/jobs/view/123",
+        r"\\private\\candidate-data",
+        "job id",
+        " job-1",
+        "job-1 ",
+        "job\t1",
+        "job\n1",
+        "candidate@example.test",
+        "+15551234567",
+        "job.id",
+    ),
+)
+def test_queue_candidate_job_id_is_a_bounded_opaque_identifier(job_id: str):
+    with pytest.raises(QueuePolicyError, match="opaque"):
+        QueueCandidate(
+            job_id=job_id,
+            source_url="https://www.linkedin.com/jobs/view/10001",
+            fit_score=99,
+            eligible=True,
+            decision="recommended",
+            evidence=("verified professional evidence",),
+            profile_revision="profile-v1",
+            matcher_policy_revision="policy-v1",
+        )
+
+
+def test_queue_candidate_job_id_has_a_strict_bounded_length():
+    with pytest.raises(QueuePolicyError, match="opaque"):
+        QueueCandidate(
+            job_id="a" * 129,
+            source_url="https://www.linkedin.com/jobs/view/10001",
+            fit_score=99,
+            eligible=True,
+            decision="recommended",
+            evidence=("verified professional evidence",),
+            profile_revision="profile-v1",
+            matcher_policy_revision="policy-v1",
+        )
+
+
 def test_versioned_recommendation_revisions_are_durable_and_initialize_active_pair(tmp_path: Path):
     database = tmp_path / "queue.sqlite3"
     candidate = _candidate(1, 99, profile_revision="profile-v1", matcher_policy_revision="policy-v1")

@@ -116,6 +116,23 @@ def test_pure_transition_records_manual_submission_for_exact_user_actor():
     assert submitted.submitted_at is not None
 
 
+@pytest.mark.parametrize("actor", ("user", "agent"))
+def test_candidate_owned_rejection_is_terminal(actor: str):
+    rejected = ApplicationRecord(job_id="job-1", status="rejected")
+
+    with pytest.raises(InvalidTransition, match="cannot move"):
+        transition_application(rejected, "reviewed", actor=actor)
+
+
+def test_tracker_does_not_allow_an_agent_to_reverse_a_candidate_rejection(tmp_path: Path):
+    tracker = Tracker(tmp_path / "jobs.sqlite3")
+    application = tracker.record_listing(_listing(), _match())
+    rejected = tracker.transition_application(application.job_id, "rejected", actor="user")
+
+    with pytest.raises(InvalidTransition, match="cannot move"):
+        tracker.transition_application(rejected.job_id, "reviewed", actor="agent")
+
+
 def test_csv_export_contains_auditable_tracker_columns(tmp_path: Path):
     database = tmp_path / "jobs.sqlite3"
     tracker = Tracker(database)

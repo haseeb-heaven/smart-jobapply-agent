@@ -9,9 +9,13 @@ or form actions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Protocol, runtime_checkable
 
-from jobapply_agent.smart_queue import QueueAction, QueueCandidate, SmartJobQueue
+from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
+
+
+_PRIVATE_RUNTIME_DIRECTORY = Path(__file__).resolve().parents[3] / "jobapply_agent" / "private"
 
 
 @runtime_checkable
@@ -52,31 +56,37 @@ class QueueOutcome:
 
 
 class SmartQueueCoordinator:
-    """Coordinate queue state with a listing-only browser tab adapter."""
+    """Coordinate a private live queue through a bounded host tab adapter."""
 
     def __init__(self, queue: SmartJobQueue, browser: BrowserTabAdapter) -> None:
         if not isinstance(queue, SmartJobQueue):
             raise TypeError("queue must be a SmartJobQueue")
+        self._require_private_runtime_database(queue)
         if not isinstance(browser, BrowserTabAdapter):
             raise TypeError("browser must implement the listing-only BrowserTabAdapter protocol")
         self._queue = queue
         self._browser = browser
+
+    @staticmethod
+    def _require_private_runtime_database(queue: SmartJobQueue) -> None:
+        """Fail closed if the durable live queue leaves the ignored runtime root."""
+
+        if str(queue.database_path) == ":memory:":
+            raise QueueCoordinatorError("live Smart Queue requires a private runtime database")
+        try:
+            if _PRIVATE_RUNTIME_DIRECTORY.is_symlink():
+                raise ValueError("private runtime directory must not be a symlink")
+            private_runtime = _PRIVATE_RUNTIME_DIRECTORY.resolve()
+            database_path = queue.database_path.resolve()
+            database_path.relative_to(private_runtime)
+        except (OSError, RuntimeError, ValueError):
+            raise QueueCoordinatorError("live Smart Queue requires a private runtime database") from None
 
     def _snapshot(self) -> tuple[str, ...]:
         try:
             return tuple(self._browser.list_tab_urls())
         except Exception:
             raise QueueCoordinatorError("browser tab snapshot failed") from None
-
-    @staticmethod
-    def _combine_actions(initial: QueueAction, refill: QueueAction) -> QueueAction:
-        """Combine private queue actions for this skill-boundary call only."""
-
-        return QueueAction(
-            job_ids=(*initial.job_ids, *refill.job_ids),
-            urls_to_open=(*initial.urls_to_open, *refill.urls_to_open),
-            search_needed=refill.search_needed,
-        )
 
     def cycle(self, recommendations: Iterable[QueueCandidate] = ()) -> QueueCycle:
         """Run snapshot → plan → optional recommendations → open → snapshot.
@@ -86,59 +96,48 @@ class SmartQueueCoordinator:
         required before the queue plans a replacement.
         """
 
-        initial_snapshot = self._snapshot()
-        self._queue.record_visible_snapshot(initial_snapshot, actor="browser-bridge")
-        initial_action = self._queue.plan_refill(open_urls=initial_snapshot)
-
-        supplied_recommendations = tuple(recommendations)
+        if isinstance(recommendations, (str, bytes)):
+            raise QueuePolicyError("recommendations must be an iterable of QueueCandidate values")
+        try:
+            supplied_recommendations = tuple(recommendations)
+        except TypeError:
+            raise QueuePolicyError("recommendations must be an iterable of QueueCandidate values") from None
         if supplied_recommendations:
             self._queue.add_recommendations(supplied_recommendations)
-            refill_action = self._queue.plan_refill(open_urls=initial_snapshot)
-            requested_action = self._combine_actions(initial_action, refill_action)
-        else:
-            refill_action = initial_action
-            requested_action = initial_action
+
+        initial_snapshot = self._snapshot()
+        self._queue.record_visible_snapshot(initial_snapshot, actor="browser-bridge")
+        requested_action = self._queue.plan_refill(open_urls=initial_snapshot)
 
         attempted_job_ids: list[str] = []
-        open_failed_job_ids: list[str] = []
         for job_id, url in zip(requested_action.job_ids, requested_action.urls_to_open, strict=True):
+            attempted_job_ids.append(job_id)
             try:
                 self._browser.open_listing(url)
             except Exception:
+                # A bridge can open the tab before timing out. Wait for a
+                # successful URL-only snapshot before classifying this slot.
+                pass
+
+        follow_up_snapshot = self._snapshot()
+        self._queue.record_visible_snapshot(follow_up_snapshot, actor="browser-bridge")
+        open_failed_job_ids: list[str] = []
+        for job_id in attempted_job_ids:
+            if self._queue.get(job_id).state == "waiting":
                 self._queue.record_open_failure(job_id, actor="browser-bridge")
                 open_failed_job_ids.append(job_id)
-            else:
-                attempted_job_ids.append(job_id)
-
-        try:
-            follow_up_snapshot = self._snapshot()
-        except QueueCoordinatorError:
-            self._release_unverified_open_reservations(attempted_job_ids, open_failed_job_ids)
-            raise
-
-        self._queue.record_visible_snapshot(follow_up_snapshot, actor="browser-bridge")
-        self._release_unverified_open_reservations(attempted_job_ids, open_failed_job_ids)
-        open_failed_ids = set(open_failed_job_ids)
         opened_job_ids = tuple(
             job_id
             for job_id in attempted_job_ids
-            if job_id not in open_failed_ids and self._queue.get(job_id).state == "open"
+            if self._queue.get(job_id).state == "open"
         )
 
         return QueueCycle(
             requested_open_job_ids=requested_action.job_ids,
             opened_job_ids=opened_job_ids,
             open_failed_job_ids=tuple(dict.fromkeys(open_failed_job_ids)),
-            search_needed=refill_action.search_needed,
+            search_needed=requested_action.search_needed,
         )
-
-    def _release_unverified_open_reservations(
-        self, opened_job_ids: Iterable[str], open_failed_job_ids: list[str]
-    ) -> None:
-        for job_id in opened_job_ids:
-            if self._queue.get(job_id).state == "waiting":
-                self._queue.record_open_failure(job_id, actor="browser-bridge")
-                open_failed_job_ids.append(job_id)
 
     def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueOutcome:
         """Record a candidate-owned outcome and return its opaque public view."""
@@ -147,4 +146,10 @@ class SmartQueueCoordinator:
         return QueueOutcome(job_id=confirmed.job_id, state=confirmed.state)
 
 
-__all__ = ["BrowserTabAdapter", "QueueCoordinatorError", "QueueCycle", "QueueOutcome", "SmartQueueCoordinator"]
+__all__ = [
+    "BrowserTabAdapter",
+    "QueueCoordinatorError",
+    "QueueCycle",
+    "QueueOutcome",
+    "SmartQueueCoordinator",
+]

@@ -28,7 +28,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "reviewed": frozenset({"ready_to_apply", "rejected"}),
     "ready_to_apply": frozenset({"reviewed", "submitted", "rejected"}),
     "submitted": frozenset(),
-    "rejected": frozenset({"reviewed"}),
+    "rejected": frozenset(),
 }
 
 

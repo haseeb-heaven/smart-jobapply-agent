@@ -33,6 +33,7 @@ _COORDINATOR_MODULE = importlib.util.module_from_spec(_COORDINATOR_SPEC)
 sys.modules[_COORDINATOR_SPEC.name] = _COORDINATOR_MODULE
 _COORDINATOR_SPEC.loader.exec_module(_COORDINATOR_MODULE)
 SmartQueueCoordinator = _COORDINATOR_MODULE.SmartQueueCoordinator
+QueueCoordinatorError = _COORDINATOR_MODULE.QueueCoordinatorError
 
 
 _PROFILE_REVISION = "coordinator-profile-v1"
@@ -58,6 +59,8 @@ def _candidate(number: int, *, score: int | None = None) -> QueueCandidate:
 class SnapshotBrowser:
     """Structural BrowserTabAdapter fake with URL-only observation and opening."""
 
+    smart_queue_adapter = "codex-chrome-extension"
+
     def __init__(self, *, visible_urls: tuple[str, ...] = (), failing_urls: set[str] | None = None) -> None:
         self.visible_urls = list(visible_urls)
         self.failing_urls = failing_urls or set()
@@ -75,8 +78,35 @@ class SnapshotBrowser:
         self.visible_urls.append(url)
 
 
+class OpenThenRaiseBrowser(SnapshotBrowser):
+    """Bridge double for an ambiguous timeout after the browser opened a tab."""
+
+    def open_listing(self, url: str) -> None:
+        self.opened_urls.append(url)
+        self.visible_urls.append(url)
+        raise BrowserAdapterError("synthetic timeout after opening")
+
+
+class FollowUpUnavailableBrowser(SnapshotBrowser):
+    """Bridge double whose post-open snapshot is temporarily unavailable."""
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        self.list_calls += 1
+        if self.list_calls == 2:
+            raise BrowserAdapterError("synthetic unavailable follow-up snapshot")
+        return tuple(self.visible_urls)
+
+
 def _coordinator(tmp_path: Path, browser: SnapshotBrowser) -> tuple[SmartJobQueue, SmartQueueCoordinator]:
-    queue = SmartJobQueue(tmp_path / "smart-queue.sqlite3")
+    runtime_name = f"{tmp_path.parent.name}-{tmp_path.name}"
+    runtime_directory = (
+        Path(__file__).parents[1]
+        / "jobapply_agent"
+        / "private"
+        / "test-smart-queue-coordinator"
+        / runtime_name
+    )
+    queue = SmartJobQueue(runtime_directory / "smart-queue.sqlite3")
     return queue, SmartQueueCoordinator(queue, browser)
 
 
@@ -143,6 +173,40 @@ def test_cycle_uses_follow_up_snapshot_to_record_open_failures_without_waiting_r
     assert not any(queue.get(candidate.job_id).state == "waiting" for candidate in candidates)
 
 
+def test_open_then_raise_is_reconciled_as_open_when_follow_up_snapshot_contains_the_url(tmp_path: Path):
+    browser = OpenThenRaiseBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    candidate = _candidate(1)
+
+    result = coordinator.cycle([candidate])
+
+    assert result.opened_job_ids == (candidate.job_id,)
+    assert result.open_failed_job_ids == ()
+    assert queue.get(candidate.job_id).state == "open"
+    assert [event.name for event in queue.history_for(candidate.job_id)] == ["recommended", "waiting", "open"]
+
+
+def test_unavailable_follow_up_snapshot_preserves_waiting_reservation_until_a_later_snapshot_confirms_it(tmp_path: Path):
+    browser = FollowUpUnavailableBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    candidate = _candidate(1)
+
+    with pytest.raises(QueueCoordinatorError, match="snapshot"):
+        coordinator.cycle([candidate])
+
+    assert queue.get(candidate.job_id).state == "waiting"
+    assert [event.name for event in queue.history_for(candidate.job_id)] == ["recommended", "waiting"]
+    assert queue.confirmed_outcome_events() == ()
+
+    browser.opened_urls.clear()
+    resumed = coordinator.cycle(())
+
+    assert resumed.requested_open_job_ids == ()
+    assert browser.opened_urls == []
+    assert queue.get(candidate.job_id).state == "open"
+    assert [event.name for event in queue.history_for(candidate.job_id)] == ["recommended", "waiting", "open"]
+
+
 def test_failed_initial_open_never_records_an_outcome_and_next_cycle_uses_a_different_candidate(tmp_path: Path):
     candidates = [_candidate(number) for number in range(1, 7)]
     failed_candidate = candidates[0]
@@ -198,7 +262,7 @@ def test_restart_preserves_history_and_opens_one_replacement_for_four_visible_ta
     browser.visible_urls.remove(confirmed.source_url)
     browser.opened_urls.clear()
 
-    restarted = SmartJobQueue(tmp_path / "smart-queue.sqlite3")
+    restarted = SmartJobQueue(queue.database_path)
     restarted_coordinator = SmartQueueCoordinator(restarted, browser)
     restarted_coordinator.cycle(())
 
@@ -212,6 +276,78 @@ def test_restart_preserves_history_and_opens_one_replacement_for_four_visible_ta
     ]
     assert browser.opened_urls == [candidates[5].source_url]
     assert sum(restarted.get(candidate.job_id).state == "open" for candidate in candidates) == 5
+
+
+def test_live_coordinator_requires_a_queue_database_in_repository_private_runtime(tmp_path: Path):
+    browser = SnapshotBrowser()
+
+    with pytest.raises(QueueCoordinatorError, match="private runtime"):
+        SmartQueueCoordinator(SmartJobQueue(tmp_path / "outside.sqlite3"), browser)
+    with pytest.raises(QueueCoordinatorError, match="private runtime"):
+        SmartQueueCoordinator(SmartJobQueue(":memory:"), browser)
+
+    queue, coordinator = _coordinator(tmp_path, browser)
+    assert coordinator is not None
+    assert queue.database_path.resolve().is_relative_to(
+        (Path(__file__).parents[1] / "jobapply_agent" / "private").resolve()
+    )
+
+
+def test_live_coordinator_rejects_a_database_path_that_escapes_private_runtime_via_symlink(tmp_path: Path):
+    runtime_directory = Path(__file__).parents[1] / "jobapply_agent" / "private" / "test-smart-queue-symlink"
+    escape = runtime_directory / tmp_path.parent.name / tmp_path.name / "escaped"
+    escape.parent.mkdir(parents=True, exist_ok=True)
+    escape.symlink_to(tmp_path, target_is_directory=True)
+    queue = SmartJobQueue(escape / "outside.sqlite3")
+
+    with pytest.raises(QueueCoordinatorError, match="private runtime"):
+        SmartQueueCoordinator(queue, SnapshotBrowser())
+
+
+def test_live_coordinator_accepts_any_bounded_listing_adapter(tmp_path: Path):
+    class GenericListingAdapter:
+        def list_tab_urls(self) -> tuple[str, ...]:
+            return ()
+
+        def open_listing(self, _url: str) -> None:
+            pass
+
+    queue, existing_coordinator = _coordinator(tmp_path, SnapshotBrowser())
+    assert existing_coordinator is not None
+    assert SmartQueueCoordinator(queue, GenericListingAdapter()) is not None
+
+    watcher_spec = importlib.util.spec_from_file_location("legacy_watcher_for_coordinator_test", _SCRIPTS_DIR / "chrome_tab_watcher.py")
+    assert watcher_spec and watcher_spec.loader
+    watcher = importlib.util.module_from_spec(watcher_spec)
+    sys.modules[watcher_spec.name] = watcher
+    watcher_spec.loader.exec_module(watcher)
+    assert SmartQueueCoordinator(queue, watcher.ChromeAppleScript(runner=lambda *_args, **_kwargs: None)) is not None
+
+
+def test_live_coordinator_has_no_structural_dependency_on_legacy_adapter_factory():
+    source = _COORDINATOR_PATH.read_text(encoding="utf-8")
+
+    assert "chrome_tab_watcher" not in source
+    assert "create_adapter" not in source
+    assert "ChromeAppleScript" not in source
+
+
+def test_invalid_recommendation_generator_cannot_strand_a_waiting_reservation(tmp_path: Path):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    existing = _candidate(1)
+    queue.add_recommendations([existing])
+
+    def invalid_recommendations():
+        yield _candidate(2)
+        yield object()
+
+    with pytest.raises(QueuePolicyError, match="QueueCandidate"):
+        coordinator.cycle(invalid_recommendations())
+
+    assert queue.get(existing.job_id).state == "recommended"
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
 
 
 def test_insufficient_pool_returns_only_counts_then_exact_caller_recommendations_restore_capacity(tmp_path: Path):

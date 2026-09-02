@@ -211,9 +211,11 @@ def create_adapter(
 ) -> BrowserTabAdapter:
     """Create an adapter for the legacy fixed-round watcher only.
 
-    The Smart Queue coordinator does not call this factory: its host supplies
-    an already-bounded adapter directly. The optional AppleScript path is
-    therefore unavailable to live Smart Queue execution.
+    Live Smart Queue does not call this factory. Its host supplies a
+    browser-neutral adapter with only ``list_tab_urls`` and ``open_listing``
+    directly; the optional Codex Chrome host is one reference integration.
+    This generic factory and the AppleScript path remain legacy fixed-round
+    watcher compatibility only.
     """
 
     if adapter == "external":

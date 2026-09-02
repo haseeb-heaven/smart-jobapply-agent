@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Iterable, Literal
 import uuid
@@ -35,9 +36,11 @@ _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
 # A missing tab still reserves its physical slot until the user confirms an outcome.
 _ACTIVE_STATES = frozenset({"waiting", "open", "awaiting_outcome"})
 _MAX_IDENTIFIER_LENGTH = 256
+_MAX_OPAQUE_JOB_ID_LENGTH = 128
 _MAX_URL_LENGTH = 4096
 _MAX_EVIDENCE_ITEMS = 100
 _MAX_EVIDENCE_LENGTH = 4096
+_OPAQUE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
 
 class QueuePolicyError(ValueError):
@@ -139,12 +142,15 @@ def _require_identifier(value: object, label: str) -> str:
 
 
 def _require_opaque_job_id(value: object) -> str:
-    """Reject URL-like job identifiers before they can reach public results."""
+    """Require a bounded token, never a URL, path, or candidate-data value."""
 
-    job_id = _require_identifier(value, "job_id")
-    if "://" in job_id:
-        raise QueuePolicyError("job_id must be an opaque identifier, not a URL")
-    return job_id
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_OPAQUE_JOB_ID_LENGTH
+        or _OPAQUE_JOB_ID.fullmatch(value) is None
+    ):
+        raise QueuePolicyError("job_id must be a bounded opaque identifier")
+    return value
 
 
 def _require_actor(value: object) -> str:
@@ -792,7 +798,7 @@ class SmartJobQueue:
         A different eligible recommendation can therefore occupy the vacancy.
         """
 
-        job_id = _require_identifier(job_id, "job_id")
+        job_id = _require_opaque_job_id(job_id)
         actor = _require_actor(actor)
         connection = self._transaction()
         try:
@@ -825,7 +831,7 @@ class SmartJobQueue:
             self._close(connection)
 
     def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueJob:
-        job_id = _require_identifier(job_id, "job_id")
+        job_id = _require_opaque_job_id(job_id)
         raw_actor = actor
         actor = _require_actor(actor)
         if raw_actor != "user":
@@ -867,7 +873,7 @@ class SmartJobQueue:
         return result
 
     def get(self, job_id: str) -> QueueJob:
-        job_id = _require_identifier(job_id, "job_id")
+        job_id = _require_opaque_job_id(job_id)
         connection = self._connect()
         try:
             row = next((row for row in self._rows(connection) if row["job_id"] == job_id), None)
@@ -880,7 +886,7 @@ class SmartJobQueue:
             self._close(connection)
 
     def history_for(self, job_id: str) -> tuple[QueueEvent, ...]:
-        job_id = _require_identifier(job_id, "job_id")
+        job_id = _require_opaque_job_id(job_id)
         connection = self._connect()
         try:
             exists = connection.execute("SELECT 1 FROM smart_queue_jobs WHERE job_id = ?", (job_id,)).fetchone()
