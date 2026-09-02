@@ -7,13 +7,14 @@ browser-session authority.  All values below are synthetic listing URLs.
 
 from __future__ import annotations
 
+from dataclasses import asdict, fields
 import importlib.util
 from pathlib import Path
 import sys
 
 import pytest
 
-from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
+from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueuePolicyError, SmartJobQueue
 
 
 _SCRIPTS_DIR = Path(__file__).parents[1] / "skills" / "easy-apply-tab-monitor" / "scripts"
@@ -79,6 +80,19 @@ def _coordinator(tmp_path: Path, browser: SnapshotBrowser) -> tuple[SmartJobQueu
     return queue, SmartQueueCoordinator(queue, browser)
 
 
+def _assert_redacted_public_cycle(result: object, *, search_needed: int) -> None:
+    """Assert that the public coordinator result never leaks private URL work."""
+
+    payload = asdict(result)
+    assert result.search_needed == search_needed
+    assert not {"initial_snapshot", "follow_up_snapshot", "initial_action", "refill_action", "requested_action"} & set(
+        payload
+    )
+    assert not any(isinstance(getattr(result, field.name), QueueAction) for field in fields(result))
+    assert "https://" not in repr(payload)
+    assert "http://" not in repr(payload)
+
+
 def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recommendations(tmp_path: Path):
     browser = SnapshotBrowser()
     queue, coordinator = _coordinator(tmp_path, browser)
@@ -127,6 +141,111 @@ def test_cycle_uses_follow_up_snapshot_to_record_open_failures_without_waiting_r
     assert queue.get(candidates[0].job_id).state == "open_failed"
     assert [queue.get(candidate.job_id).state for candidate in candidates[1:5]] == ["open"] * 4
     assert not any(queue.get(candidate.job_id).state == "waiting" for candidate in candidates)
+
+
+def test_failed_initial_open_never_records_an_outcome_and_next_cycle_uses_a_different_candidate(tmp_path: Path):
+    candidates = [_candidate(number) for number in range(1, 7)]
+    failed_candidate = candidates[0]
+    browser = SnapshotBrowser(failing_urls={failed_candidate.source_url})
+    queue, coordinator = _coordinator(tmp_path, browser)
+
+    coordinator.cycle(candidates)
+
+    assert queue.get(failed_candidate.job_id).state == "open_failed"
+    assert [event.name for event in queue.history_for(failed_candidate.job_id)] == [
+        "recommended",
+        "waiting",
+        "open_failed",
+    ]
+    assert queue.confirmed_outcome_events() == ()
+
+    browser.opened_urls.clear()
+    coordinator.cycle(())
+
+    assert browser.opened_urls == [candidates[5].source_url]
+    assert queue.get(candidates[5].job_id).state == "open"
+    assert sum(queue.get(candidate.job_id).state == "open" for candidate in candidates) == 5
+
+
+def test_confirmed_visible_tab_waits_for_later_url_only_snapshot_before_replacement(tmp_path: Path):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    candidates = [_candidate(number) for number in range(1, 7)]
+    coordinator.cycle(candidates)
+    confirmed = candidates[0]
+
+    coordinator.confirm_outcome(confirmed.job_id, "submitted", actor="user")
+    browser.opened_urls.clear()
+    coordinator.cycle(())
+
+    assert queue.get(confirmed.job_id).state == "submitted"
+    assert browser.opened_urls == []
+
+    browser.visible_urls.remove(confirmed.source_url)
+    coordinator.cycle(())
+
+    assert browser.opened_urls == [candidates[5].source_url]
+    assert queue.get(candidates[5].job_id).state == "open"
+
+
+def test_restart_preserves_history_and_opens_one_replacement_for_four_visible_tabs(tmp_path: Path):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    candidates = [_candidate(number) for number in range(1, 7)]
+    coordinator.cycle(candidates)
+    confirmed = candidates[0]
+    coordinator.confirm_outcome(confirmed.job_id, "submitted", actor="user")
+    browser.visible_urls.remove(confirmed.source_url)
+    browser.opened_urls.clear()
+
+    restarted = SmartJobQueue(tmp_path / "smart-queue.sqlite3")
+    restarted_coordinator = SmartQueueCoordinator(restarted, browser)
+    restarted_coordinator.cycle(())
+
+    assert restarted.get(confirmed.job_id).state == "submitted"
+    assert [event.name for event in restarted.history_for(confirmed.job_id)] == [
+        "recommended",
+        "waiting",
+        "open",
+        "submitted",
+        "missing",
+    ]
+    assert browser.opened_urls == [candidates[5].source_url]
+    assert sum(restarted.get(candidate.job_id).state == "open" for candidate in candidates) == 5
+
+
+def test_insufficient_pool_returns_only_counts_then_exact_caller_recommendations_restore_capacity(tmp_path: Path):
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    initial = [_candidate(number) for number in range(1, 6)]
+    replacements = [_candidate(number) for number in range(6, 8)]
+    coordinator.cycle(initial)
+    for candidate in initial[3:]:
+        browser.visible_urls.remove(candidate.source_url)
+    coordinator.cycle(())
+    for candidate in initial[3:]:
+        coordinator.confirm_outcome(candidate.job_id, "skipped", actor="user")
+
+    browser.opened_urls.clear()
+    insufficient = coordinator.cycle(())
+
+    _assert_redacted_public_cycle(insufficient, search_needed=2)
+    assert browser.opened_urls == []
+
+    restored = coordinator.cycle(replacements)
+
+    _assert_redacted_public_cycle(restored, search_needed=0)
+    assert browser.opened_urls == [candidate.source_url for candidate in replacements]
+    assert sum(queue.get(candidate.job_id).state == "open" for candidate in [*initial, *replacements]) == 5
+
+
+def test_coordinator_public_result_is_count_only_and_contains_no_browser_or_queue_action_data(tmp_path: Path):
+    browser = SnapshotBrowser()
+    _queue, coordinator = _coordinator(tmp_path, browser)
+
+    result = coordinator.cycle([_candidate(1)])
+
+    _assert_redacted_public_cycle(result, search_needed=4)
 
 
 def test_cycle_rejects_duplicate_managed_canonical_listing_urls_in_one_snapshot(tmp_path: Path):

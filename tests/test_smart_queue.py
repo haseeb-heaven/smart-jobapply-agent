@@ -531,7 +531,14 @@ def test_confirmed_outcome_events_are_replayable_user_owned_records(tmp_path: Pa
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     candidates = [_candidate(1, 99), _candidate(2, 98)]
     queue.add_recommendations(candidates)
-    queue.plan_refill(open_urls=[])
+    with pytest.raises(QueuePolicyError, match="open or awaiting_outcome"):
+        queue.confirm_outcome("job-1", "submitted", actor="user")
+
+    waiting = queue.plan_refill(open_urls=[])
+    with pytest.raises(QueuePolicyError, match="open or awaiting_outcome"):
+        queue.confirm_outcome("job-1", "submitted", actor="user")
+
+    queue.record_visible_snapshot(waiting.urls_to_open, actor="agent")
     queue.confirm_outcome("job-1", "submitted", actor="user")
     queue.confirm_outcome("job-2", "skipped", actor="user")
 
