@@ -144,6 +144,32 @@ The daemon never accepts a JSON recommendation file and does not search for or
 invent candidates. It reconciles only the durable queue. When its redacted
 status reports `search_needed`, the host must separately obtain and validate
 candidate-approved `QueueCandidate` values before they enter the queue.
+### Agent admission handoff after `search_needed`
+
+When the daemon reports `search_needed`, the host agent — never the daemon,
+bridge, or CLI — gathers already-visible listing facts with its own tools,
+runs the existing evidence-first discovery, then invokes the deterministic,
+agent-only admission command:
+
+```sh
+python3 jobapply_agent/scripts/discover.py admit-queue \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --discovery-export jobapply_agent/private/discovery.jsonl \
+  --queue-db jobapply_agent/private/smart-queue.sqlite3 \
+  --memory-db jobapply_agent/private/candidate-memory.sqlite3
+```
+
+The next existing-session-only monitor tick opens exactly the admitted
+canonical URLs. The command validates the discovery export all-or-nothing,
+binds revisions only to an empty queue, runs
+`CandidateMemory.filter_unsuppressed_candidates` before `add_recommendations`
+(suppression is the only non-error exclusion), and prints count-only
+validated/suppressed/admitted results — never URLs or candidate facts. The
+intake, queue, and memory paths stay under the ignored
+`jobapply_agent/private/`; the discovery export is an ignored local runtime
+file. The daemon, bridge, and CLI never search, launch a browser, inspect page
+content, fill forms, upload, or submit; the candidate owns every application
+action.
 
 Each persistent cycle starts with a reliable URL-only snapshot against the
 durable Smart Queue database under `jobapply_agent/private/`. On that initial

@@ -1162,3 +1162,45 @@ test("has no HTTP listener dependency", async () => {
   const source = await readFile(new URL("../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /node:http|createServer|\.listen\s*\(/);
 });
+
+test("the direct bridge parent admits no admission payload, recommendation JSON, or browser authority", async () => {
+  const parentSource = await readFile(
+    new URL("../skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs", import.meta.url),
+    "utf8",
+  );
+  // The parent accepts daemon arguments only from the caller and enforces
+  // exactly one bridge flag; documented intake/database paths stay caller-owned
+  // and no admission command, discovery export, or memory flag ever reaches it.
+  assert.match(parentSource, /exactly one --bridge-stdio/);
+  assert.doesNotMatch(parentSource, /admit-queue|discover\.py|--discovery-export|--memory-db|record_candidate_outcome/);
+  assert.doesNotMatch(parentSource, /recommend|admission/i);
+  assert.doesNotMatch(parentSource, /node:http|node:https|createServer|\.listen\s*\(|puppeteer|playwright|webdriver/i);
+
+  // The bounded bridge performs only the two URL operations; no application
+  // action exists because the candidate owns every application action.
+  const bridgeSource = await readFile(
+    new URL("../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(bridgeSource, /operation === "list_tab_urls"/);
+  assert.match(bridgeSource, /operation === "open_listing"/);
+  assert.doesNotMatch(bridgeSource, /operation === "(?!list_tab_urls|open_listing)/);
+  assert.doesNotMatch(bridgeSource, /\bfill\b|\bupload\b|\bsubmit\b|\bclick\b/i);
+});
+
+test("agent handoff docs route search_needed through the private agent-only admit-queue CLI", async () => {
+  const handoffDocs = [
+    "../README.md",
+    "../skills/easy-apply-tab-monitor/SKILL.md",
+  ];
+
+  for (const relativePath of handoffDocs) {
+    const source = await readFile(new URL(relativePath, import.meta.url), "utf8");
+    assert.match(source, /discover\.py admit-queue/, `${relativePath} must document the admit-queue command`);
+    assert.match(source, /jobapply_agent\/private\/candidate_intake\.json/, `${relativePath} must keep intake under jobapply_agent/private/`);
+    assert.match(source, /jobapply_agent\/private\/discovery\.jsonl/, `${relativePath} must keep the discovery export an ignored local runtime file`);
+    assert.match(source, /jobapply_agent\/private\/smart-queue\.sqlite3/, `${relativePath} must keep the queue database under jobapply_agent/private/`);
+    assert.match(source, /jobapply_agent\/private\/candidate-memory\.sqlite3/, `${relativePath} must keep candidate memory under jobapply_agent/private/`);
+    assert.match(source, /filter_unsuppressed_candidates/, `${relativePath} must document suppression before admission`);
+  }
+});

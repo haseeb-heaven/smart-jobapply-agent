@@ -604,6 +604,39 @@ none remain, `search_needed` requires the agent to repeat the
 candidate-approved search, deterministic validation, and suppression check
 before admission. A later dual confirmation records the outcome independently
 of that refill.
+When that refill reports `search_needed`, the host agent — never the daemon,
+bridge, or CLI — closes the loop. The agent gathers already-visible listing
+facts with its own tools, runs the existing evidence-first discovery against
+the current active intake (deterministic eligibility decided before ranking),
+then invokes the deterministic, agent-only admission command:
+
+```sh
+python3 jobapply_agent/scripts/discover.py admit-queue \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --discovery-export jobapply_agent/private/discovery.jsonl \
+  --queue-db jobapply_agent/private/smart-queue.sqlite3 \
+  --memory-db jobapply_agent/private/candidate-memory.sqlite3
+```
+
+The next existing-session-only monitor tick then opens exactly the admitted
+canonical listing URLs.
+
+The command never fetches pages or touches a browser. It validates the
+complete discovery export as one atomic batch — any malformed, stale,
+unsupported, duplicate, below-threshold, non-recommended, or conflicting row
+rejects the entire batch — then binds revisions only to an empty queue,
+suppresses through `CandidateMemory.filter_unsuppressed_candidates` before
+`add_recommendations` (suppression is the only non-error exclusion), and admits
+the surviving candidates. Success output is count-only JSON with validated,
+suppressed, and admitted counts; failure emits a single redacted error object.
+Neither ever includes URLs, candidate facts, or discovery rows. The intake,
+queue, and memory databases must resolve under the
+ignored `jobapply_agent/private/` directory; the discovery export is an ignored
+local runtime file, never committed data.
+
+The daemon, bridge, and admission CLI never search for listings, launch or
+control a browser, inspect page content, fill forms, upload documents, or
+submit applications. The candidate owns every application action.
 
 For persistent Smart Queue monitoring, start the dedicated live entry point;
 do not use the legacy watcher. The host starts it through the Node parent that
