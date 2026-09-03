@@ -10,6 +10,8 @@ recommendations, or candidate outcomes.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 from dataclasses import dataclass
 import importlib.util
 import inspect
@@ -45,10 +47,14 @@ def _load_sibling_module(filename: str) -> object:
     return module
 
 
-_adapter_module = _load_sibling_module("codex_chrome_extension_adapter.py")
+_adapter_module = _load_sibling_module("browser_bridge_adapter.py")
+_tab_adapter_module = _load_sibling_module("browser_tab_adapter.py")
 _monitor_module = _load_sibling_module("persistent_smart_queue_monitor.py")
 BrowserAdapterError = _adapter_module.BrowserAdapterError
-CodexChromeExtensionAdapter = _adapter_module.CodexChromeExtensionAdapter
+StdioBridgeAdapter = _adapter_module.StdioBridgeAdapter
+# Historical import path; the generic stdio bridge is the implementation.
+CodexChromeExtensionAdapter = _adapter_module.StdioBridgeAdapter
+ExternalCommandAdapter = _tab_adapter_module.ExternalCommandAdapter
 PersistentSmartQueueMonitor = _monitor_module.PersistentSmartQueueMonitor
 # Construct the exact coordinator class whose exception identity the monitor
 # catches, including when this daemon is imported directly from its file path.
@@ -73,10 +79,12 @@ class ListingAdapter(Protocol):
 class DaemonConfig:
     """Validated, data-free daemon configuration.
 
-    The production CLI constructs the bounded Codex Chrome stdio adapter. The
-    ``host-provided`` marker is a closed configuration value so tests and
-    alternative hosts can inject the same two-operation adapter without
-    admitting arbitrary commands.
+    The production CLI constructs either the Node-parented stdio adapter or
+    the explicit argv bridge. The ``host-provided`` and ``external`` markers
+    are closed configuration values so tests and alternative hosts can inject
+    the same two-operation adapter without admitting arbitrary commands. An
+    external ``command`` is validated but never stored: it stays outside the
+    redacted config surface.
     """
 
     database_path: Path
@@ -94,10 +102,25 @@ class DaemonConfig:
         bridge = payload.get("bridge")
         if not isinstance(database, str) or not isinstance(intake, str):
             raise DaemonConfigurationError("daemon configuration is invalid")
-        if not isinstance(bridge, Mapping) or set(bridge) != {"adapter"}:
+        if not isinstance(bridge, Mapping) or "adapter" not in bridge:
             raise DaemonConfigurationError("daemon configuration is invalid")
         adapter = bridge.get("adapter")
-        if adapter != "host-provided":
+        if adapter == "host-provided":
+            if set(bridge) != {"adapter"}:
+                raise DaemonConfigurationError("daemon configuration is invalid")
+        elif adapter == "external":
+            if set(bridge) not in ({"adapter"}, {"adapter", "command"}):
+                raise DaemonConfigurationError("daemon configuration is invalid")
+            if "command" in bridge:
+                command = bridge["command"]
+                if (
+                    isinstance(command, (str, bytes))
+                    or not isinstance(command, (list, tuple))
+                    or not command
+                    or not all(isinstance(part, str) and part for part in command)
+                ):
+                    raise DaemonConfigurationError("daemon configuration is invalid")
+        else:
             raise DaemonConfigurationError("daemon configuration is invalid")
         return cls(Path(database), Path(intake), adapter)
 
@@ -196,7 +219,7 @@ class SmartQueueDaemon:
         monitor_factory: Callable[[object], object] = PersistentSmartQueueMonitor,
         queue_factory: Callable[[Path, Path], object] | None = None,
     ) -> "SmartQueueDaemon":
-        if not isinstance(config, DaemonConfig) or config.bridge_adapter != "host-provided":
+        if not isinstance(config, DaemonConfig) or config.bridge_adapter not in ("host-provided", "external"):
             raise DaemonConfigurationError("daemon configuration is invalid")
         if (
             not callable(getattr(adapter, "list_tab_urls", None))
@@ -315,14 +338,60 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument(
         "--bridge-stdio",
-        action="store_true",
-        required=True,
+        action="count",
+        default=0,
         help="use the Node-parented strict NDJSON stdin/stderr bridge",
+    )
+    parser.add_argument(
+        "--adapter",
+        choices=("external",),
+        default=None,
+        help="explicit argv bridge kind; exactly one bridge must be selected",
+    )
+    parser.add_argument(
+        "--adapter-command",
+        nargs="+",
+        default=None,
+        help=(
+            "External adapter argv prefix. Unknown option-like bridge tokens are passed "
+            "as argv without a shell; recognized daemon flags are still parsed. "
+            "Bridge argv must not reuse daemon flag spellings (for example "
+            "--bridge-stdio or --max-ticks): argparse consumes recognized flags "
+            "anywhere, including after this marker, so a colliding bridge token "
+            "is parsed as daemon configuration instead of bridge argv."
+        ),
     )
     parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--max-backoff-seconds", type=float, default=DEFAULT_MAX_BACKOFF_SECONDS)
     parser.add_argument("--max-ticks", type=int)
     return parser
+
+
+def _resolve_stdio_adapter_class() -> type:
+    """Resolve the Node-parented stdio adapter class inside the CLI entry point.
+
+    Module globals are preferred so historical monkeypatch targets keep
+    resolving; otherwise the sibling bridge file is loaded by path.
+    """
+
+    candidate = globals().get("CodexChromeExtensionAdapter")
+    if isinstance(candidate, type):
+        return candidate
+    candidate = globals().get("StdioBridgeAdapter")
+    if isinstance(candidate, type):
+        return candidate
+    module = _load_sibling_module("browser_bridge_adapter.py")
+    return module.StdioBridgeAdapter
+
+
+def _resolve_external_adapter_class() -> type:
+    """Resolve the explicit argv adapter class inside the CLI entry point."""
+
+    candidate = globals().get("ExternalCommandAdapter")
+    if isinstance(candidate, type):
+        return candidate
+    module = _load_sibling_module("browser_tab_adapter.py")
+    return module.ExternalCommandAdapter
 
 
 def _shutdown_event() -> tuple[threading.Event, Callable[[], None]]:
@@ -335,19 +404,110 @@ def _shutdown_event() -> tuple[threading.Event, Callable[[], None]]:
     return stop, lambda: [signal.signal(value, handler) for value, handler in previous.items()]
 
 
+def _bridge_command_from_extras(
+    raw_args: Sequence[str], base_command: Sequence[str] | None, extras: Sequence[str]
+) -> list[str] | None:
+    """Merge unknown bridge argv tokens positioned after ``--adapter-command``.
+
+    Unknown option-like bridge tokens (for example a wrapped browser's
+    ``--browser firefox`` pair) cannot be consumed by ``nargs="+"``, so they
+    arrive via ``parse_known_args`` extras. Tokens after the marker belong to
+    the explicit argv bridge; anything unknown elsewhere is rejected without
+    echoing it. Returns ``None`` when no marker is present.
+
+    Bridge argv must not reuse daemon flag spellings: ``argparse`` consumes
+    recognized flags anywhere on the command line, including after the
+    marker, so a colliding bridge token (for example ``--bridge-stdio``) is
+    parsed as daemon configuration. A collision with a bridge-selection
+    flag surfaces as a redacted configuration error through the normal
+    exactly-one-bridge selection check, never as silent bridge misrouting.
+    """
+
+    marker = None
+    for index, token in enumerate(raw_args):
+        if token == "--adapter-command" or token.startswith("--adapter-command="):
+            marker = index
+            break
+    if marker is None:
+        if extras:
+            raise DaemonConfigurationError("daemon configuration is invalid")
+        return None
+    from collections import Counter
+
+    pending = Counter(extras)
+    merged: list[str] = []
+    # Scan only tokens after the --adapter-command marker. Daemon values
+    # before the marker (for example --database sharing a spelling with a
+    # bridge token) must never consume a pending extras entry and
+    # false-reject the bridge command.
+    for index in range(marker + 1, len(raw_args)):
+        token = raw_args[index]
+        if pending.get(token, 0) <= 0:
+            continue
+        pending[token] -= 1
+        merged.append(token)
+    if any(pending.values()):
+        raise DaemonConfigurationError("daemon configuration is invalid")
+    # Preserve fail-closed rejection of unknown tokens elsewhere: an extras
+    # entry occurring before the marker (outside any daemon flag value)
+    # means an unknown token was passed outside the bridge command.
+    _DAEMON_VALUE_FLAGS = frozenset({
+        "--candidate-intake", "--database", "--adapter", "--adapter-command",
+        "--interval-seconds", "--max-backoff-seconds", "--max-ticks",
+    })
+    _EXTRAS_STRINGS = set(extras)
+    index = 0
+    while index < marker:
+        token = raw_args[index]
+        if token in _DAEMON_VALUE_FLAGS and not token.startswith("--adapter-command="):
+            index += 2
+            continue
+        if token in _EXTRAS_STRINGS:
+            raise DaemonConfigurationError("daemon configuration is invalid")
+        index += 1
+    return [*(base_command or []), *merged]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
     try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            arguments, extras = parser.parse_known_args(argv)
+    except SystemExit as parse_failed:
+        # Argument errors echo untrusted argv; stay redacted with a bare exit code.
+        if parse_failed.code == 2:
+            return 2
+        raise
+    try:
+        raw_args = list(argv) if argv is not None else sys.argv[1:]
+        adapter_command = _bridge_command_from_extras(raw_args, arguments.adapter_command, extras)
         interval = _positive_duration(arguments.interval_seconds, "interval_seconds")
         maximum = _positive_duration(arguments.max_backoff_seconds, "max_backoff_seconds")
         if maximum < interval or arguments.max_ticks is not None and arguments.max_ticks < 0:
             raise DaemonConfigurationError("daemon configuration is invalid")
-        config = DaemonConfig.from_mapping({
-            "database_path": str(arguments.database),
-            "active_intake_path": str(arguments.candidate_intake),
-            "bridge": {"adapter": "host-provided"},
-        })
-        adapter = CodexChromeExtensionAdapter()
+        stdio_count = arguments.bridge_stdio or 0
+        adapter_name = arguments.adapter
+        selections = stdio_count + (1 if adapter_name == "external" else 0)
+        if selections != 1:
+            raise DaemonConfigurationError("daemon configuration is invalid")
+        if adapter_name == "external":
+            if not adapter_command or not all(isinstance(part, str) and part for part in adapter_command):
+                raise DaemonConfigurationError("daemon configuration is invalid")
+            config = DaemonConfig.from_mapping({
+                "database_path": str(arguments.database),
+                "active_intake_path": str(arguments.candidate_intake),
+                "bridge": {"adapter": "external"},
+            })
+            adapter = _resolve_external_adapter_class()(tuple(adapter_command))
+        else:
+            if adapter_command:
+                raise DaemonConfigurationError("daemon configuration is invalid")
+            config = DaemonConfig.from_mapping({
+                "database_path": str(arguments.database),
+                "active_intake_path": str(arguments.candidate_intake),
+                "bridge": {"adapter": "host-provided"},
+            })
+            adapter = _resolve_stdio_adapter_class()()
         daemon = SmartQueueDaemon.from_config(
             config,
             adapter=adapter,

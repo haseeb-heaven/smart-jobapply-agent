@@ -21,6 +21,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
+_MAX_TAB_URLS = 512
+_MAX_TAB_URL_LENGTH = 8_192
 _LINKEDIN_LISTING_PATH = re.compile(r"^/jobs/view/[A-Za-z0-9_-]+/?$")
 _INDEED_JOB_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_TRACKING_QUERY_KEYS = frozenset(
@@ -163,6 +165,14 @@ class ExternalCommandAdapter:
         return completed
 
     def list_tab_urls(self) -> tuple[str, ...]:
+        """Return canonical supported listing URLs, skipping unmanaged tabs.
+
+        Layered contract: this adapter speaks to raw bridge output, so tabs
+        that are not managed listings are skipped as not-observable. The
+        strict stdio adapter (``browser_bridge_adapter.StdioBridgeAdapter``)
+        instead speaks to an already-filtering host, so a non-canonical URL
+        there is a protocol violation and the whole batch fails closed.
+        """
         completed = self._invoke("list-tabs")
         try:
             payload = json.loads(completed.stdout)
@@ -170,7 +180,18 @@ class ExternalCommandAdapter:
             raise BrowserAdapterError("browser adapter returned invalid tab data") from None
         if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
             raise BrowserAdapterError("browser adapter returned invalid tab data")
-        return tuple(payload)
+        if len(payload) > _MAX_TAB_URLS:
+            raise BrowserAdapterError("browser adapter returned invalid tab data")
+        canonical: list[str] = []
+        for item in payload:
+            if not 0 < len(item) <= _MAX_TAB_URL_LENGTH:
+                raise BrowserAdapterError("browser adapter returned invalid tab data")
+            try:
+                canonical.append(canonical_listing_url(item))
+            except ValueError:
+                # Not a managed listing URL; unsupported tabs are not observable.
+                continue
+        return tuple(canonical)
 
     def open_listing(self, url: str) -> None:
         try:
