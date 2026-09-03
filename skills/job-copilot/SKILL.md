@@ -48,11 +48,25 @@ Do not assume a model vendor, browser brand, desktop API, or agent tool name.
    capacity, counting only its canonical approved LinkedIn/Indeed listing tabs,
    never unrelated browser tabs. Feed a URL-only browser snapshot to the queue,
    plan replacements, search for exactly `search_needed` candidates, and open
-   only the returned listing URLs. A closed tab means `awaiting_outcome` and
-   reserves its slot until the candidate confirms an outcome; it never means
-   `submitted`. Lowering capacity never permits the agent to close a tab or
-   infer an outcome.
-8. Record submission or later outcomes only from explicit candidate input.
+   only the returned listing URLs. A missing or closed managed tab means
+   `released`, frees its slot immediately, and never means `submitted`; the
+   daemon may refill only with a distinct already-admitted candidate. A
+   missing/closed tab never creates an outcome or candidate-memory record.
+   On each reliable initial snapshot, recover interruption-stale `waiting`
+   reservations as `open` when visible or `open_failed` when absent, then refill
+   released capacity with distinct admitted candidates. If a post-open snapshot
+   fails, leave current-cycle reservations `waiting` until the next reliable
+   initial snapshot. Lowering capacity never permits the agent to close a tab
+   or infer an outcome.
+8. Before admission, pass each non-empty prevalidated `QueueCandidate` batch and
+   its authenticated `SmartJobQueue` to
+   `CandidateMemory.filter_unsuppressed_candidates`. This binds an outcome-empty
+   memory once to the durable opaque queue ID, validates the candidates' active
+   profile/policy revision pair, and filters exact canonical URLs. The same
+   queue preserves suppression across later revision changes; a different
+   queue-memory pairing fails closed. Populated legacy memory without a durable
+   queue scope fails before migration mutation.
+9. Record submission or later outcomes only from explicit candidate input.
    Report unknowns and blockers instead of guessing.
 
 ## Candidate-facing onboarding protocol

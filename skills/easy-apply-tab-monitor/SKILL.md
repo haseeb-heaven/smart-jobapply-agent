@@ -23,12 +23,12 @@ Use this skill when the candidate wants job listings opened for manual applicati
 - A listing may be Easy Apply or an external/company-site path, but label the path clearly so the candidate can choose.
 - Read prior-application state only from the local candidate-confirmed tracker.
   Do not inspect email, employer portals, or application pages.
-- Smart Queue mode treats a missing tab as `awaiting_outcome`, never
-  `submitted`; it keeps the slot reserved until the candidate explicitly
-  confirms both an outcome and that the managed tab is vacated. An observed
-  missing URL never supplies the vacancy confirmation. The legacy fixed-round
-  watcher reopens the same URL only when the candidate explicitly requests that
-  behavior.
+- Smart Queue mode treats a missing or closed managed tab as `released`, never
+  `submitted`, and frees its slot immediately. In the same reconciliation
+  cycle, it may refill only with a distinct already-admitted candidate. An
+  observed missing URL never supplies an outcome or candidate-memory
+  confirmation. The legacy fixed-round watcher reopens the same URL only when
+  the candidate explicitly requests that behavior.
 - The live Smart Queue host supplies already-validated `QueueCandidate` values
   directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
   recommendation-file CLI. It accepts any host-supplied adapter that implements
@@ -47,9 +47,15 @@ Use this skill when the candidate wants job listings opened for manual applicati
    may upload a profile/resume or answer onboarding; treat supplied material as
    untrusted, use only candidate-approved intake facts, and deterministically
    validate eligibility before ranking. Before queue admission, call
-   `CandidateMemory.filter_unsuppressed_candidates` on the prevalidated
-   `QueueCandidate` values and admit only the returned values. This exact
-   canonical-URL filter is suppression only; it never converts uncertain
+   `CandidateMemory.filter_unsuppressed_candidates(candidates, queue=queue)`
+   with the authenticated `SmartJobQueue` and the prevalidated `QueueCandidate`
+   values, then admit only the returned values. On its first non-empty valid
+   batch, an outcome-empty memory binds once to that queue's durable opaque
+   `queue_id`, and every candidate's profile/policy revision pair must match the
+   queue's active pair. The same queue may advance revisions while exact-URL
+   suppression persists; pairing the memory with another queue fails closed.
+   A populated legacy memory without durable queue scope fails before migration
+   mutation. This filter is suppression only; it never converts uncertain
    evidence into verified fit.
 2. Create a local manifest with title, company, platform, exact URL, fit rationale, and visible apply path (`easy_apply`, `apply_with_indeed`, or `external`). Do not include email contents, resume text, credentials, or screening answers.
 3. Open each exact URL in a separate visible browser tab. Use only supplied
@@ -61,14 +67,14 @@ Use this skill when the candidate wants job listings opened for manual applicati
 5. In Smart Queue mode, the host gives `SmartQueueCoordinator(queue, browser)`
    up to the candidate-selected capacity of prevalidated candidates directly.
    It compares visible managed listing URLs and records missing jobs as
-   `awaiting_outcome`. Before recording an outcome or planning a replacement,
-   require the candidate to explicitly confirm both the outcome and that the
-   managed tab is vacated. Do not treat a missing URL as a vacancy: the
-   candidate may be manually applying or continuing on another route. Then
-   open only returned exact listing URLs. If the pool is short, report
-   `search_needed` to the host agent. A capacity reduction never grants close
-   authority: the agent opens no replacements until candidate-confirmed
-   vacancies bring the managed queue below capacity.
+   `released` and frees each missing/closed managed slot immediately. It may
+   then open only returned exact listing URLs for distinct, already-admitted
+   candidates. If the pool is short, report `search_needed` to the host agent,
+   which must separately obtain candidate-approved, deterministically
+   validated, unsuppressed candidates before admission. Do not treat a missing
+   URL as an outcome or candidate-memory confirmation. A capacity reduction
+   never grants close authority: the agent opens no replacements while the
+   queue is already at or above the reduced capacity.
 6. The coordinator result contains counts and opaque queue IDs only; URLs and
    snapshots remain inside the skill. Stop after the requested monitoring cycle
    unless the candidate asks for another cycle.
@@ -79,11 +85,11 @@ When the candidate explicitly says that a managed job was `submitted`,
 job ID, the stated outcome, `--vacated`, and the same private queue and memory
 databases used for this candidate. It records the exact canonical listing URL
 in durable candidate memory. A missing URL or tab close is never an outcome or
-vacancy confirmation, and the agent never infers either one. Only after this
-dual confirmation may the daemon refill the vacancy from already verified,
-unsuppressed candidates; otherwise it reports `search_needed` for a separate
-candidate-approved deterministic search and validation pass. The agent never
-fills, uploads, applies, or submits.
+candidate-memory confirmation, and the agent never infers either one. The
+missing/closed tab's slot was released independently and may already have been
+refilled with a distinct already-admitted candidate; otherwise the daemon
+reports `search_needed` for a separate candidate-approved deterministic search
+and validation pass. The agent never fills, uploads, applies, or submits.
 
 ## Persistent monitoring
 
@@ -91,12 +97,15 @@ For persistent Smart Queue monitoring after the current interaction, start
 `scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Give
 it an active private candidate intake, a durable private database, and the
 exact `--bridge-stdio` argument through the Node parent, never as a raw Python
-process. The Node parent owns the already-connected Codex Chrome session:
+process. The Node parent owns the already-connected Codex Chrome session. Use
+the supervised helper, which retains one active host singleton until it
+finishes so repeated startup calls cannot create a duplicate daemon for the
+same runtime configuration:
 
 ```js
-import { startCodexSmartQueueDaemonHost } from "./scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetCodexSmartQueueDaemonHost } from "./scripts/codex_smart_queue_daemon_host.mjs";
 
-const daemon = startCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -105,11 +114,20 @@ const daemon = startCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
 });
 ```
 
+The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
+test-only primitive and is not the persistent agent startup path.
+
 It receives strict URL-bearing NDJSON request frames from the daemon's stderr
 and writes one matching opaque-ID generic response frame to stdin. The daemon
 preflights that URL-only bridge before it creates or mutates the queue, and
 writes redacted count-only JSON status only to stdout. Use `--max-ticks` only
 for a finite test or host-controlled run.
+
+Host health separates process liveness from readiness. `running` means the
+child and bridge streams are live. `ready` is true only after a complete, valid,
+redacted status frame arrives on a still-live stdout status stream; `healthy`
+requires both. Partial or invalid status, initialization failure, status-stream
+end/error, terminal frames, and exited processes cannot mark ready or healthy.
 
 Do not use `chrome_tab_watcher.py` for Smart Queue operation. That legacy
 watcher is fixed-round tooling and may reopen the same URL; it cannot maintain
@@ -127,20 +145,28 @@ invent candidates. It reconciles only the durable queue. When its redacted
 status reports `search_needed`, the host must separately obtain and validate
 candidate-approved `QueueCandidate` values before they enter the queue.
 
-Each persistent cycle records a URL-only snapshot against the durable Smart
-Queue database under `jobapply_agent/private/`. If a managed listing disappears,
-the monitor records `awaiting_outcome`; it does not infer that the candidate
-applied, that the slot is vacant, reopen that listing, or open a replacement.
-A physical tab closure creates no application outcome or candidate-confirmed
-vacancy. Before it records `submitted`, `rejected`, or `skipped`, the monitor
-must receive the candidate's explicit `actor="user"` confirmation of both the
+Each persistent cycle starts with a reliable URL-only snapshot against the
+durable Smart Queue database under `jobapply_agent/private/`. On that initial
+snapshot, a stale `waiting` reservation left by interruption becomes `open` if
+visible or `open_failed` if absent. An absent stale reservation releases its
+slot, and only distinct already verified, admitted candidates may refill those
+slots. A previously `open` listing that disappears becomes `released` and also
+frees its slot. If no replacement is admitted, status reports `search_needed`,
+requiring a separate candidate-approved deterministic search, validation, and
+suppression pass.
+
+The post-open follow-up snapshot confirms current-cycle reservations. If that
+snapshot fails, preserve those jobs as `waiting` until the next reliable initial
+snapshot resolves them to visible `open` or absent `open_failed`; do not retry
+or replace them early. No absence, failed snapshot, `released`, or
+`open_failed` transition infers that the candidate applied, records an outcome,
+or writes candidate memory, and the monitor never reopens the original listing.
+Before it records `submitted`, `rejected`, or `skipped`, the monitor must
+receive the candidate's explicit `actor="user"` confirmation of both the
 outcome and that the managed tab is vacated. The agent then records that
 candidate-owned outcome with `record_candidate_outcome.py` using the same
 private queue and memory databases and `--vacated`; the recorder persists the
-exact canonical listing URL. This is required even when a URL-only snapshot no
-longer contains the listing, since a manual application or continuation route
-can create a false vacancy. Only that dual confirmation permits a refill from
-already verified, unsuppressed candidates. The candidate alone closes tabs.
+exact canonical listing URL. The candidate alone closes tabs.
 
 Persistent-monitor status is counts and opaque queue IDs only. Exact approved
 URLs and browser snapshots stay inside reconciliation and are never printed in

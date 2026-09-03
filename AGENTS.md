@@ -129,13 +129,23 @@ remains.
 
 ## Branch protocol
 
-- `main`: releasable, independently reviewed state.
-- `develop`: verified integration state.
-- `feature/**`: isolated task branches created from current `develop`.
+- `develop`: the integration and mainline branch for verified work.
+- `main`: release-only; promote from `develop` only after the Assurance squad
+  passes.
+- `feature/<name>`: an isolated branch from current `develop` for a major
+  feature or bug fix.
 
-Implement on `feature/**`, integrate through `develop`, and promote to `main`
-only after the Assurance squad passes. Never force-push, rewrite shared history,
-merge implicitly, or include unrelated dirty-worktree changes.
+Major feature and bug work MUST use `feature/<name>` and merge through a pull
+request into `develop`. Only small, low-risk, tightly scoped fixes may go
+directly to `develop`. Make small, focused commits that preserve a reviewable
+history; do not bundle unrelated work. Never force-push, rewrite shared
+history, merge implicitly, or include unrelated dirty-worktree changes.
+
+Each handoff and pull request MUST record proportionate unit,
+end-to-end/simulation, and manual-testing evidence. State why a category is
+not applicable rather than fabricating it. A green test is evidence only for
+the cases it executes: never claim unrun tests, manual validation, or coverage
+that the evidence does not establish.
 
 ## Required invariants
 
@@ -155,9 +165,14 @@ merge implicitly, or include unrelated dirty-worktree changes.
 
 For persistent Smart Queue mode, agents MUST start and use
 `skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py` through
-`startCodexSmartQueueDaemonHost` with explicit active-intake, private-database,
-and exactly one `--bridge-stdio` in `daemonArgs`; agents MUST NOT launch the
-Python daemon directly. The Node parent reads strict URL-bearing NDJSON requests
+`startOrGetCodexSmartQueueDaemonHost` with explicit active-intake,
+private-database, and exactly one `--bridge-stdio` in `daemonArgs`; agents MUST
+NOT launch the Python daemon directly. The supervised helper retains the active
+host singleton until it finishes, so repeated startup calls cannot create a
+duplicate daemon for the same runtime configuration. The unsupervised
+`startCodexSmartQueueDaemonHost` function is low-level/test-only and MUST NOT be
+used as the persistent agent startup path. The Node parent reads strict
+URL-bearing NDJSON requests
 from the daemon's stderr and writes one matching generic NDJSON response to
 stdin; stdout remains redacted count-only JSON status. Each request uses an
 opaque `id` and matching responses echo that ID. The daemon preflights the
@@ -167,24 +182,50 @@ compatibility tooling only and can reopen same-URL listings. The daemon never
 accepts recommendation JSON; a `search_needed` count requires separate,
 candidate-approved deterministic queue input.
 
+Persistent-host health has three separate states. `running` means only that the
+child and bridge streams are still live. `ready` becomes true only after the
+host receives one complete, valid, redacted status frame on the still-live
+stdout status stream, and `healthy` requires both `running` and `ready`.
+Partial or invalid status, initialization failure, stream end/error, and any
+terminal frame or process state cannot mark the host ready or healthy.
+
 The agent-only candidate-memory workflow is mandatory. The candidate either
 uploads a profile/resume (or answers onboarding); the agent treats that material
 as untrusted input, obtains candidate-approved intake facts, searches, and
 deterministically validates eligibility before ranking. Before any candidate is
 admitted to the queue, the agent MUST call
-`CandidateMemory.filter_unsuppressed_candidates` on the prevalidated
-`QueueCandidate` values and admit only its returned values. This is exact
-canonical-listing-URL suppression, not a ranking substitute or a way to infer
-candidate facts. When the candidate explicitly states that one managed job was
+`CandidateMemory.filter_unsuppressed_candidates(candidates, queue=queue)` with
+the authenticated `SmartJobQueue` and a prevalidated `QueueCandidate` batch,
+then admit only its returned values. On the first non-empty valid batch, an
+outcome-empty memory is bound once to the queue's durable opaque `queue_id`;
+every candidate's profile/policy revision pair must match that queue's active
+pair. The same durable queue may later advance profile or policy revisions
+without losing exact-canonical-URL suppression. Pairing that memory with a
+different queue fails closed. A legacy memory containing outcomes but no
+durable queue scope fails before migration changes its schema or history. This
+is suppression only, not a ranking substitute or a way to infer candidate
+facts. When the candidate explicitly states that one managed job was
 `submitted`, `skipped`, or `rejected` **and** that its managed tab is vacated,
 the agent runs `jobapply_agent/scripts/record_candidate_outcome.py` with the
 same private queue and candidate-memory databases, the managed queue job ID,
 the stated outcome, and `--vacated`. That operation persists the exact listing
 URL in candidate memory. A tab close alone never supplies either confirmation,
-and agents never infer an outcome, fill a form, or submit an application. The
-next daemon cycle may refill the confirmed vacancy only from candidates already
-verified and admitted through that suppression check; otherwise `search_needed`
-requires another candidate-approved deterministic search-and-validation pass.
+and agents never infer an outcome, fill a form, or submit an application. A
+managed tab missing from a snapshot, including a closed tab, releases its queue
+slot immediately. In that reconciliation cycle, the daemon may refill only
+with a distinct candidate already verified and admitted through the suppression
+check; if none is available, it reports `search_needed` for another
+candidate-approved deterministic search-and-validation pass. A later explicit
+outcome records candidate memory but never retroactively infers an outcome
+from the tab closure.
+
+Each cycle's first complete URL snapshot is the reliable recovery boundary for
+`waiting` reservations left by an interrupted cycle. A visible stale reservation
+becomes `open`; an absent stale reservation becomes `open_failed`, releases its
+slot, and may be replaced only by a distinct already-admitted candidate. If the
+post-open follow-up snapshot fails, preserve all current-cycle `waiting`
+reservations until the next reliable initial snapshot. Snapshot absence never
+supplies an application outcome or a candidate-memory entry.
 
 ## Authoritative gate
 
@@ -196,4 +237,6 @@ Test Runner executes exactly:
 ```
 
 The final Reviewer inspects the actual diff and maps every acceptance criterion
-to code or test evidence. A green suite proves only covered cases.
+to code or test evidence. A green suite proves only covered cases and does not
+replace the required proportionate unit, end-to-end/simulation, and manual
+testing evidence.

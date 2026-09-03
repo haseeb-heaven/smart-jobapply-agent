@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">The nine-step authoritative validation gate</title>
+  <desc id="desc">All nine checks run by scripts verify dot sh, including Python tests, the Node host contract, lint, coverage, compilation, shell analysis, whitespace, and the candidate-data boundary.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#07111d"/><stop offset="1" stop-color="#102847"/></linearGradient>
+    <style>
+      .sans{font-family:Inter,Segoe UI,Arial,sans-serif}.mono{font-family:SFMono-Regular,Consolas,Liberation Mono,monospace}
+      .eyebrow{font-size:18px;font-weight:700;letter-spacing:4px;fill:#5eead4}.title{font-size:44px;font-weight:760;fill:#f1f5f9}.subtitle{font-size:21px;fill:#a9bad2}
+      .num{font-size:17px;font-weight:800;fill:#07111d}.heading{font-size:21px;font-weight:730;fill:#f8fafc}.body{font-size:16px;fill:#b8c6d9}.code{font-size:14px;fill:#8fe9dc}.footer{font-size:16px;font-weight:700;fill:#ffd594}
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="70" y="62" class="sans eyebrow">AUTHORITATIVE LOCAL GATE</text>
+  <text x="70" y="116" class="sans title">All nine stages run through <tspan class="mono" fill="#8fe9dc">./scripts/verify.sh</tspan></text>
+  <text x="70" y="151" class="sans subtitle">One entry point • Python + Node • privacy boundary last</text>
+
+  <g class="sans">
+    <g transform="translate(70 190)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">1</text>
+      <text x="68" y="42" class="heading">Full Python suite</text><text x="24" y="82" class="mono code">python -m pytest</text>
+      <text x="24" y="116" class="body">Complete repository regression suite</text>
+    </g>
+    <g transform="translate(570 190)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">2</text>
+      <text x="68" y="42" class="heading">Node host contract</text><text x="24" y="82" class="mono code">node --test</text>
+      <text x="24" y="108" class="mono code">tests/test_codex_chrome_</text><text x="24" y="132" class="mono code">extension_host.mjs</text>
+      <text x="24" y="158" class="body">Bounded Codex Chrome host behavior</text>
+    </g>
+    <g transform="translate(1070 190)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">3</text>
+      <text x="68" y="42" class="heading">Python lint</text><text x="24" y="82" class="mono code">ruff check --isolated --select E4,E7,E9,F</text>
+      <text x="24" y="112" class="mono code">jobapply_agent/src • jobapply_agent/scripts</text>
+      <text x="24" y="140" class="mono code">tests</text>
+    </g>
+
+    <g transform="translate(70 390)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">4</text>
+      <text x="68" y="42" class="heading">Bounded watcher coverage</text><text x="24" y="82" class="mono code">chrome_tab_watcher.py</text>
+      <text x="24" y="116" class="body">Pytest under coverage</text><text x="24" y="145" class="body">100% line + branch required</text>
+    </g>
+    <g transform="translate(570 390)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">5</text>
+      <text x="68" y="42" class="heading">Browser adapter coverage</text><text x="24" y="82" class="mono code">browser_tab_adapter.py</text>
+      <text x="24" y="116" class="body">Pytest under coverage</text><text x="24" y="145" class="body">100% line + branch required</text>
+    </g>
+    <g transform="translate(1070 390)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">6</text>
+      <text x="68" y="42" class="heading">Python bytecode compilation</text><text x="24" y="82" class="mono code">python -m compileall -q</text>
+      <text x="24" y="109" class="mono code">jobapply_agent/src • jobapply_agent/scripts</text>
+      <text x="24" y="136" class="mono code">skills/easy-apply-tab-monitor/scripts</text>
+    </g>
+
+    <g transform="translate(70 590)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">7</text>
+      <text x="68" y="42" class="heading">Shell static analysis</text><text x="24" y="82" class="mono code">shellcheck scripts/verify.sh</text>
+      <text x="24" y="108" class="mono code">jobapply_agent/scripts/cron_wrapper.sh</text>
+      <text x="24" y="142" class="body">Fallback when unavailable: <tspan class="mono">bash -n</tspan></text>
+    </g>
+    <g transform="translate(570 590)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">8</text>
+      <text x="68" y="42" class="heading">Patch whitespace integrity</text><text x="24" y="82" class="mono code">git diff --check</text>
+      <text x="24" y="111" class="mono code">git diff --cached --check</text>
+      <text x="24" y="145" class="body">Unstaged and staged changes</text>
+    </g>
+    <g transform="translate(1070 590)">
+      <rect width="460" height="174" rx="18" fill="#0d1d30" stroke="#315174"/><circle cx="34" cy="34" r="18" fill="#5eead4"/><text x="34" y="40" text-anchor="middle" class="num">9</text>
+      <text x="68" y="42" class="heading">Candidate-data boundary</text><text x="24" y="82" class="mono code">git ls-files</text>
+      <text x="24" y="108" class="mono code">jobapply_agent/private/** • resumes/**</text>
+      <text x="24" y="134" class="mono code">codex-apply-*.*</text>
+      <text x="24" y="158" class="body">Fail if any matching path is tracked</text>
+    </g>
+  </g>
+
+  <rect x="70" y="800" width="1460" height="58" rx="14" fill="#2b2016" stroke="#f6bd60"/>
+  <text x="800" y="836" text-anchor="middle" class="sans footer">PASS requires all 9 stages; a subset never supports a completion claim.</text>
+</svg>

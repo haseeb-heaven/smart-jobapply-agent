@@ -62,15 +62,16 @@ signals, not safety or correctness scores.
 
 | Project | Primary surface | Application boundary | Tracking model | What is unique here by comparison |
 | --- | --- | --- | --- | --- |
-| **Smart JobApply Agent** | Bring your own agent, browser, and tools | The agent never fills or submits; the candidate applies manually | Candidate-selected 1–10 managed listing tabs (default 5), append-only history, and user-confirmed outcomes replenish open slots | A live browser queue makes candidate-selected listing tabs the work queue while deterministic eligibility and evidence ranking remain in the core package |
+| **Smart JobApply Agent** | Bring your own agent, browser, and tools | The agent never fills or submits; the candidate applies manually | Candidate-selected 1–10 managed listing tabs (default 5), append-only history, immediate refill of a missing/closed slot from admitted candidates, and user-confirmed outcomes | A live browser queue makes candidate-selected listing tabs the work queue while deterministic eligibility and evidence ranking remain in the core package |
 | [JobHuntBot](https://github.com/DanielPan12/JobHuntBot) | Any capable coding agent plus a local progress dashboard | Broader application workflow with a pause before final submission | Dashboard and local application lifecycle tracking | This project is narrower: no dashboard, no form workflow, and no agent-led application interaction |
 | [Job Apply Plugin](https://github.com/neonwatty/job-apply-plugin) | Claude Code/Codex plugin for supported job boards | Form-oriented assistance for LinkedIn, Greenhouse, Ashby, and Workday | Plugin answer memory and application-flow state | This project is board-agnostic at the core and limits browser authority to approved listing URLs only |
 | [CareerForge / AI Job Search](https://github.com/suraj-davariya/ai-job-search) | Claude Code search/apply commands, document generation, and a local dashboard | Prepares tailored application materials but does not submit | Local dashboard tracks applications and generated artifacts | This project optimizes a live candidate-sized decision queue rather than document generation or dashboard management |
 
 The differentiator is therefore the **Smart Job Queue**: an agent-managed,
 candidate-controlled set of 1–10 evidence-ranked managed listing tabs (default
-5) that is refilled only after the candidate explicitly confirms both an
-outcome and that the managed tab has been vacated.
+5) whose missing or closed slots are immediately refilled from distinct,
+already-admitted candidates; later candidate-confirmed outcomes are persisted
+separately in candidate memory.
 
 ### What is distinctive in this repo
 
@@ -135,18 +136,19 @@ verified profile + preferences + application history
           candidate applies, skips, or closes tabs
                         |
                         v
-       browser snapshot records missing tabs as awaiting_outcome
+        browser snapshot records missing/closed tabs as released
                         |
+                        v
+ daemon refills each released slot with a distinct already-admitted candidate
+                        |
+                        v
+   if none is admitted, daemon reports search_needed for separate intake work
+                        |
+                        v
  candidate explicitly confirms outcome and that managed tab is vacated
                         |
                         v
-        agent searches for search_needed replacements
-                        |
-                        v
-          deterministic queue selects the best unseen jobs
-                        |
-                        v
- browser adapter opens exact listing URLs; back to selected capacity
+ candidate-memory recorder persists only that later candidate-owned outcome
 ```
 
 That is the intended cadence in practice:
@@ -168,15 +170,18 @@ You apply to 2
       ↓
 Agent notices / you tell agent
       ↓
-Those 2 are logged only after the candidate confirms the outcome and vacancy
+Their missing or closed managed tabs release two queue slots immediately
       ↓
-Agent searches again
+Daemon opens two distinct, already-admitted candidates when available
       ↓
-Finds 2 best replacements
+If either slot has no admitted candidate, it reports `search_needed`
       ↓
-Opens them in your browser
+Agent separately searches, validates, suppresses, and admits replacements
       ↓
 Queue is back to the selected capacity
+      ↓
+You later confirm any submitted, rejected, or skipped outcome and vacancy;
+only then is it recorded in candidate memory
       ↓
 Repeat
 ```
@@ -188,13 +193,13 @@ list of exact listing URLs when the queue opens up.
 Use `jobapply_agent.smart_queue.SmartJobQueue` as the persistent queue authority.
 The host keeps its live queue database under the ignored
 `jobapply_agent/private/` directory; a live entry point must reject any other
-location. `record_visible_snapshot` observes only URLs. A missing tab enters
-`awaiting_outcome` and remains a reserved slot until the candidate explicitly
-confirms both `submitted`, `rejected`, or `skipped` and that its managed tab is
-vacated; it never records an application. An observed missing URL is not that
-vacancy confirmation. `plan_refill` returns data-only exact URLs and a
-`search_needed` count only for legitimate candidate-confirmed vacancies. The host LLM searches when needed, constructs
-only prevalidated deterministic `QueueCandidate` values, creates the live queue
+location. `record_visible_snapshot` observes only URLs. A missing/closed
+managed tab becomes `released` and frees its slot immediately; it never records
+an application. In the same reconciliation cycle, `plan_refill` may return a
+data-only exact URL only for a distinct, already-admitted candidate. If the
+admitted pool is short, it returns `search_needed`; the host LLM then separately
+searches, deterministically validates, and suppresses candidates before
+admission. The host creates the live queue
 with `discover.smart_queue_for_active_intake(intake_path, database_path)`, and
 then passes that integrity-bound queue to the skill-level
 `SmartQueueCoordinator(queue, browser)`. A non-default live capacity is rejected
@@ -209,19 +214,19 @@ the candidate's explicit dual confirmation records an outcome; an implementation
 must require that confirmation to state both the outcome and that the managed
 tab is vacated before calling its candidate-owned outcome-recording operation.
 
-The monitor never treats a physically missing tab as confirmation that the
-candidate vacated it: a manual application or continuation route can make the
-managed listing URL disappear while the candidate is still using that work.
-The agent never closes tabs. If the candidate lowers capacity below already
-managed tabs, the agent opens nothing and never closes, revokes, or reclassifies
-any tab; the queue returns to capacity only through candidate-controlled dual
-outcome-and-vacancy confirmations. This keeps the visible browser queue bounded
-without granting close or form authority.
+The monitor treats a physically missing managed tab as an immediate queue-slot
+release, never as an application outcome or candidate-memory event. It never
+reopens that missing listing; it may open only a distinct, already-admitted
+candidate to restore capacity. The agent never closes tabs. If the candidate
+lowers capacity below already managed tabs, the agent opens nothing and never
+closes, revokes, or reclassifies any tab. This keeps the visible browser queue
+bounded without granting close or form authority.
 
 In contrast to full-automation tools, this implementation is opinionated toward
 being an interview-ready co-pilot workflow: deterministic ranking, strict history
-dedupe, and browser-tab state only. There is no form navigation, no blind
-submission, and no replacement work until a slot is legitimately vacated.
+dedupe, and browser-tab state only. There is no form navigation or blind
+submission; released slots are refilled only from distinct, already-admitted
+candidates, and `search_needed` never authorizes an unvalidated replacement.
 
 ### Non-negotiable invariants
 
@@ -542,12 +547,26 @@ admission, the agent must call
 `CandidateMemory.filter_unsuppressed_candidates` with those prevalidated
 `QueueCandidate` values and admit only the returned values. The filter removes
 only exact canonical listing URLs already recorded in this candidate's durable
-memory; it does not rank jobs or turn missing evidence into verified fit.
+memory; it does not rank jobs or turn missing evidence into verified fit. Pass
+the authenticated queue explicitly as `queue=queue`. For the first non-empty
+valid batch, the filter binds an outcome-empty memory once to that queue's
+durable opaque `queue_id` and verifies every candidate's profile/policy revision
+pair against the queue's active pair before filtering. An empty batch returns
+empty without selecting a queue scope.
+
+That durable queue identity, rather than one profile revision, owns the memory
+scope. The queue may advance to later profile or matcher-policy revisions and
+the exact-URL suppression history remains effective for candidates matching the
+new active pair. Reusing the memory with a different queue fails closed without
+changing either queue or memory. A legacy memory that already has outcomes but
+has no durable queue scope also fails closed before migration mutates its
+schema, version history, or outcome rows; it requires an explicit migration
+decision rather than a guessed queue association.
 
 When the candidate explicitly says that one managed job was `submitted`,
 `skipped`, or `rejected` **and** that its managed tab is vacated, record the
-outcome before planning a replacement. Use the same ignored private queue and
-memory databases that back this candidate's queue:
+outcome in the same ignored private queue and memory databases that back this
+candidate's queue:
 
 ```sh
 python3 jobapply_agent/scripts/record_candidate_outcome.py \
@@ -559,22 +578,26 @@ python3 jobapply_agent/scripts/record_candidate_outcome.py \
 ```
 
 The command persists the exact canonical listing URL to candidate memory. A tab
-close or missing URL is not an outcome or a vacancy confirmation: the agent
-never infers either one, and it never fills, uploads, applies, or submits. Once
-the candidate's dual confirmation is recorded, the daemon can refill that
-vacancy using already verified, admitted candidates. If none remain, its
-`search_needed` status requires the agent to repeat the candidate-approved
-search, deterministic validation, and suppression check before admission.
+close or missing URL is not an outcome or a candidate-memory confirmation: the
+agent never infers either one, and it never fills, uploads, applies, or submits.
+The missing/closed tab nevertheless releases its queue slot immediately; the
+daemon refills it only with a distinct already verified, admitted candidate. If
+none remain, `search_needed` requires the agent to repeat the
+candidate-approved search, deterministic validation, and suppression check
+before admission. A later dual confirmation records the outcome independently
+of that refill.
 
 For persistent Smart Queue monitoring, start the dedicated live entry point;
 do not use the legacy watcher. The host starts it through the Node parent that
 owns the already-connected Codex Chrome binding, never by invoking Python
-directly:
+directly. Use the supervised helper, which retains one active host singleton
+until it finishes so repeated startup calls cannot create a duplicate daemon
+for the same runtime configuration:
 
 ```js
-import { startCodexSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetCodexSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
 
-const daemon = startCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -582,6 +605,17 @@ const daemon = startCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
   ],
 });
 ```
+
+The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
+test-only primitive; persistent agent operation must use the supervised helper
+above.
+
+The host reports `running`, `ready`, and `healthy` separately. `running` means
+the child and bridge are live; it is not a readiness claim. `ready` becomes true
+only after one complete, valid, redacted count-only status frame arrives on a
+still-live stdout status stream. `healthy` requires both `running` and `ready`.
+A partial or invalid status line, initialization failure, ended or errored status
+stream, terminal frame, or exited process cannot make the host ready or healthy.
 
 `smart_queue_daemon.py` builds the queue only from the active,
 integrity-checked candidate intake, uses a durable database under the ignored
@@ -605,18 +639,26 @@ session or window, close a tab, inspect page content, fill a form, upload, or
 submit. Its sole browser operations are listing current approved listing URLs
 and opening an exact, already-approved LinkedIn or Indeed listing URL.
 
-Each cycle records a URL-only snapshot through the coordinator. A missing
-managed tab becomes `awaiting_outcome`; the monitor does not infer an
-application, a vacancy, reopen that listing, or replace it. Before the monitor
-records `submitted`, `rejected`, or `skipped`, the candidate must explicitly
-confirm both that outcome and that the managed tab is vacated, then the agent
-runs `record_candidate_outcome.py` against the same private queue and memory
-databases with `--vacated`. A missing URL does not substitute for that
-confirmation, because a manual application or continuation route can hide the
-listing while the candidate still needs the slot. Only after that dual
-confirmation may the daemon request and open an approved replacement from
-already verified, unsuppressed queue candidates. It never fills, uploads,
-applies, or submits.
+Each cycle begins with a reliable URL-only snapshot through the coordinator. On
+that initial snapshot, any `waiting` reservation left by an interrupted prior
+cycle becomes `open` when visible. A stale `waiting` reservation that is absent
+becomes `open_failed`, releases its slot, and may be refilled only by a distinct
+already verified, admitted candidate. A missing previously `open` managed tab
+becomes `released` under the same no-inference rule. If no admitted replacement
+exists, the monitor reports `search_needed` for a separate candidate-approved
+search, deterministic validation, and suppression check.
+
+After open requests, the coordinator uses a follow-up snapshot to confirm which
+current-cycle reservations became visible. If that follow-up snapshot fails, it
+preserves every current-cycle `waiting` reservation; the next reliable initial
+snapshot resolves each one to visible `open` or missing `open_failed` before
+distinct admitted replacements refill released capacity. No missing URL or
+snapshot failure infers an application, outcome, vacancy confirmation, or
+candidate-memory entry. Before the monitor records `submitted`, `rejected`, or
+`skipped`, the candidate must explicitly confirm both that outcome and that the
+managed tab is vacated, then the agent runs `record_candidate_outcome.py`
+against the same private queue and memory databases with `--vacated`. It never
+fills, uploads, applies, or submits.
 
 The legacy watcher below preserves one fixed five-tab round by reopening the
 same URLs. It is separate legacy tooling, not a Smart Queue capacity authority;
@@ -649,6 +691,14 @@ and report schema in `AGENTS.md`. One agent cannot implement, approve, and
 verify the same change. Required identities include Investigator, Implementer,
 Unit-test Author, Critic/Bug Finder, Fixer, Reviewer, and Test Runner.
 
+`develop` is the integration/mainline branch; `main` is release-only. Major
+feature and bug work starts on `feature/<name>` and lands through a pull request
+into `develop`; only small, low-risk, tightly scoped fixes may go directly to
+`develop`. Keep commits small and focused. Every handoff and pull request must
+include proportionate unit, end-to-end/simulation, and manual-testing evidence,
+or state why a category is not applicable. Never claim coverage or validation
+that was not actually performed.
+
 ## VALIDATION GATE
 
 ![Validation gate](docs/assets/validation-gate.png)
@@ -662,7 +712,8 @@ The only authoritative local validation entry point is:
 README instructions, `AGENTS.md`, and CI MUST invoke that same script. Do not
 claim completion from a subset of its commands. A green gate proves only the
 covered behavior; the independent Reviewer still maps every acceptance
-criterion to diff and test evidence.
+criterion to diff and the recorded unit, end-to-end/simulation, and manual
+testing evidence.
 
 ## COMPLETION OUTPUT
 
