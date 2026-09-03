@@ -165,13 +165,14 @@ that the evidence does not establish.
 
 For persistent Smart Queue mode, agents MUST start and use
 `skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py` through
-`startOrGetCodexSmartQueueDaemonHost` with explicit active-intake,
+`startOrGetSmartQueueDaemonHost` with explicit active-intake,
 private-database, and exactly one `--bridge-stdio` in `daemonArgs`; agents MUST
 NOT launch the Python daemon directly. The supervised helper retains the active
 host singleton until it finishes, so repeated startup calls cannot create a
 duplicate daemon for the same runtime configuration. The unsupervised
-`startCodexSmartQueueDaemonHost` function is low-level/test-only and MUST NOT be
-used as the persistent agent startup path. The Node parent reads strict
+`startSmartQueueDaemonHost` function is low-level/test-only and MUST NOT be
+used as the persistent agent startup path. The Codex Chrome extension bridge is
+one tested reference integration for an already-connected session. The Node parent reads strict
 URL-bearing NDJSON requests
 from the daemon's stderr and writes one matching generic NDJSON response to
 stdin; stdout remains redacted count-only JSON status. Each request uses an

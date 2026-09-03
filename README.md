@@ -640,15 +640,15 @@ submit applications. The candidate owns every application action.
 
 For persistent Smart Queue monitoring, start the dedicated live entry point;
 do not use the legacy watcher. The host starts it through the Node parent that
-owns the already-connected Codex Chrome binding, never by invoking Python
+owns the already-connected browser binding, never by invoking Python
 directly. Use the supervised helper, which retains one active host singleton
 until it finishes so repeated startup calls cannot create a duplicate daemon
 for the same runtime configuration:
 
 ```js
-import { startOrGetCodexSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs";
 
-const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -657,9 +657,10 @@ const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, 
 });
 ```
 
-The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
+The unsupervised `startSmartQueueDaemonHost` function is a low-level,
 test-only primitive; persistent agent operation must use the supervised helper
-above.
+above. The Codex Chrome extension bridge is one tested reference integration
+for an already-connected session.
 
 The host reports `running`, `ready`, and `healthy` separately. `running` means
 the child and bridge are live; it is not a readiness claim. `ready` becomes true
@@ -671,7 +672,8 @@ stream, terminal frame, or exited process cannot make the host ready or healthy.
 `smart_queue_daemon.py` builds the queue only from the active,
 integrity-checked candidate intake, uses a durable database under the ignored
 private runtime directory, and attaches only through a Node-parented strict
-NDJSON stdio bridge to an already-connected Codex Chrome session. The daemon
+NDJSON stdio bridge to an already-connected browser session. The Codex Chrome
+extension bridge is one tested reference integration for such a session. The daemon
 writes bridge requests to stderr and reads one matching response from stdin;
 its stdout consists only of redacted count-only JSON status lines. The parent
 must reserve stderr for either `{"id":"opaque","operation":"list_tab_urls"}`

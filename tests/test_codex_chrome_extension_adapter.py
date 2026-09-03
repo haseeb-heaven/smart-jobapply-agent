@@ -103,7 +103,7 @@ def _assert_redacted(exception: BaseException, *private_values: str) -> None:
 def test_adapter_is_a_bounded_listing_protocol_for_live_smart_queue() -> None:
     adapter, _requests, _responses = _adapter({"id": "request-1", "ok": True, "urls": []})
 
-    assert adapter.smart_queue_adapter == "codex-chrome-extension-stdio"
+    assert adapter.smart_queue_adapter == "browser-bridge-stdio"
     assert isinstance(adapter, BrowserTabAdapter)
     for prohibited_name in ("click", "fill", "upload", "submit", "close_tab", "inspect_page"):
         assert not hasattr(adapter, prohibited_name)

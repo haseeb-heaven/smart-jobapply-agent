@@ -97,15 +97,15 @@ For persistent Smart Queue monitoring after the current interaction, start
 `scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Give
 it an active private candidate intake, a durable private database, and the
 exact `--bridge-stdio` argument through the Node parent, never as a raw Python
-process. The Node parent owns the already-connected Codex Chrome session. Use
+process. The Node parent owns the already-connected browser session. Use
 the supervised helper, which retains one active host singleton until it
 finishes so repeated startup calls cannot create a duplicate daemon for the
 same runtime configuration:
 
 ```js
-import { startOrGetCodexSmartQueueDaemonHost } from "./scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetSmartQueueDaemonHost } from "./scripts/smart_queue_daemon_host.mjs";
 
-const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -114,8 +114,10 @@ const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, 
 });
 ```
 
-The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
-test-only primitive and is not the persistent agent startup path.
+The unsupervised `startSmartQueueDaemonHost` function is a low-level,
+test-only primitive and is not the persistent agent startup path. The Codex
+Chrome extension bridge is one tested reference integration for an
+already-connected session.
 
 It receives strict URL-bearing NDJSON request frames from the daemon's stderr
 and writes one matching opaque-ID generic response frame to stdin. The daemon
@@ -134,9 +136,10 @@ watcher is fixed-round tooling and may reopen the same URL; it cannot maintain
 the persistent candidate-controlled Smart Queue.
 
 The persistent monitor is existing-session-only. It accepts only a
-listing-only Codex Chrome extension adapter for an already-connected browser session;
+listing-only browser-bridge adapter for an already-connected browser session;
 it never launches a browser, creates a session or window, closes a tab, or
-inspects page content. Its browser authority remains limited to listing current
+inspects page content. The Codex Chrome extension bridge is one tested
+reference integration for an already-connected session. Its browser authority remains limited to listing current
 tab URLs and opening an exact, already-approved LinkedIn or Indeed listing URL.
 It never applies, fills, uploads, or submits.
 

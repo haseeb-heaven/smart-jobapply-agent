@@ -15,6 +15,10 @@ import {
   startCodexSmartQueueDaemonHost,
   startOrGetCodexSmartQueueDaemonHost,
 } from "../skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
+import {
+  startSmartQueueDaemonHost,
+  startOrGetSmartQueueDaemonHost,
+} from "../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs";
 
 const LINKEDIN = "https://www.linkedin.com/jobs/view/123456";
 const INDEED = "https://in.indeed.com/viewjob?jk=abc_123";
@@ -1142,18 +1146,18 @@ test("authoritative startup docs require the singleton daemon host entry point",
     const source = await readFile(new URL(relativePath, import.meta.url), "utf8");
     assert.match(
       source,
-      /\bstartOrGetCodexSmartQueueDaemonHost\b/,
-      `${relativePath} must name startOrGetCodexSmartQueueDaemonHost`,
+      /\bstartOrGetSmartQueueDaemonHost\b/,
+      `${relativePath} must name startOrGetSmartQueueDaemonHost`,
     );
     assert.doesNotMatch(
       source,
-      /\bstartCodexSmartQueueDaemonHost\s*\(/,
-      `${relativePath} must not invoke startCodexSmartQueueDaemonHost`,
+      /\bstartSmartQueueDaemonHost\s*\(/,
+      `${relativePath} must not invoke startSmartQueueDaemonHost`,
     );
     assert.doesNotMatch(
       source,
-      /\bimport\s*\{[^}]*\bstartCodexSmartQueueDaemonHost\b[^}]*\}\s*from\b/s,
-      `${relativePath} must not import startCodexSmartQueueDaemonHost for operational use`,
+      /\bimport\s*\{[^}]*\bstartSmartQueueDaemonHost\b[^}]*\}\s*from\b/s,
+      `${relativePath} must not import startSmartQueueDaemonHost for operational use`,
     );
   }
 });
@@ -1165,7 +1169,7 @@ test("has no HTTP listener dependency", async () => {
 
 test("the direct bridge parent admits no admission payload, recommendation JSON, or browser authority", async () => {
   const parentSource = await readFile(
-    new URL("../skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs", import.meta.url),
+    new URL("../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs", import.meta.url),
     "utf8",
   );
   // The parent accepts daemon arguments only from the caller and enforces
@@ -1202,5 +1206,79 @@ test("agent handoff docs route search_needed through the private agent-only admi
     assert.match(source, /jobapply_agent\/private\/smart-queue\.sqlite3/, `${relativePath} must keep the queue database under jobapply_agent/private/`);
     assert.match(source, /jobapply_agent\/private\/candidate-memory\.sqlite3/, `${relativePath} must keep candidate memory under jobapply_agent/private/`);
     assert.match(source, /filter_unsuppressed_candidates/, `${relativePath} must document suppression before admission`);
+  }
+});
+
+test("an ambiguous dual-shape binding fails closed without exposing binding detail", () => {
+  const child = daemonChild();
+  const privateMarker = "dual-shape-private-marker";
+  const dual = {
+    listTabUrls: async () => [privateMarker],
+    openListing: async () => undefined,
+    user: { openTabs: async () => [{ url: privateMarker }] },
+    tabs: { new: async () => ({ goto: async () => undefined, markHandoff: async () => undefined }) },
+  };
+  assert.throws(
+    () => startSmartQueueDaemonHost(dual, { daemonArgs: ["--bridge-stdio"], spawn: () => child }),
+    (error) => {
+      assert.match(error.message, /ambiguous/);
+      assert.doesNotMatch(error.message, /dual-shape-private-marker/);
+      return true;
+    },
+  );
+  assert.deepEqual(child.killCalls, ["SIGTERM"]);
+});
+
+test("distinct bindingIds select distinct singleton slots; empty normalizes to absent", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const first = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" }));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" })), first);
+  const other = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b" }));
+  assert.notEqual(other, first);
+  const unnamed = startOrGetSmartQueueDaemonHost(binding, optionsFor({}));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "" })), unnamed);
+  assert.equal(spawnCalls, 3);
+
+  await first.stop();
+  await other.stop();
+  await unnamed.stop();
+});
+
+test("the generic wrapper fails closed on malformed listTabUrls without echo", async () => {
+  const cases = [
+    { listTabUrls: async () => ({ urls: [] }) },
+    { listTabUrls: async () => [LINKEDIN, 3] },
+  ];
+  for (const { listTabUrls } of cases) {
+    const child = daemonChild();
+    const generic = { listTabUrls, openListing: async () => undefined };
+    const host = startSmartQueueDaemonHost(generic, {
+      daemonArgs: ["--bridge-stdio"],
+      spawn: () => child,
+    });
+    const replies = [];
+    child.stdin.on("data", (chunk) => replies.push(chunk.toString("utf8")));
+    child.stderr.write(`${JSON.stringify({ id: "list", operation: "list_tab_urls" })}\n`);
+    await bounded(
+      (async () => {
+        while (replies.join("").trim() === "") await new Promise((resolve) => setImmediate(resolve));
+      })(),
+      "malformed generic reply",
+    );
+    const frames = replies.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.deepEqual(frames, [{ id: "list", ok: false, error: "request_failed" }]);
+    assert.doesNotMatch(replies.join(""), /https:|\[object/);
+    await host.stop();
   }
 });

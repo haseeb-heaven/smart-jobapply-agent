@@ -333,3 +333,68 @@ def test_factory_fails_closed_when_optional_chrome_adapter_cannot_be_loaded(
 def test_factory_rejects_a_command_for_chrome_compatibility_adapter():
     with pytest.raises(ValueError, match="does not accept"):
         create_adapter("chrome-applescript", command=("must-not-run",))
+
+
+def test_list_tabs_rejects_oversize_array_without_echoing_urls(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(_MODULE, "_MAX_TAB_URLS", 2)
+    payload = [LINKEDIN, INDEED, LINKEDIN]
+
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls()
+
+    rendered = str(raised.value)
+    for secret in payload:
+        assert secret not in rendered
+
+
+def test_list_tabs_rejects_overlong_entry_without_echoing(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(_MODULE, "_MAX_TAB_URL_LENGTH", 8)
+    overlong = "https://example.test/" + "x" * 64
+
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=json.dumps([overlong]), stderr="")
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls()
+
+    assert overlong not in str(raised.value)
+
+
+def test_list_tabs_rejects_empty_entry_without_echoing():
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=json.dumps([""]), stderr="")
+
+    with pytest.raises(BrowserAdapterError, match="invalid tab data"):
+        ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls()
+
+
+def test_list_tabs_skips_non_listing_urls_and_returns_only_canonical():
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([LINKEDIN, "https://example.com/"]),
+            stderr="",
+        )
+
+    assert ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls() == (LINKEDIN,)
+
+
+def test_list_tabs_empty_array_returns_empty_tuple():
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    assert ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls() == ()
+
+
+def test_list_tabs_all_non_listing_returns_empty_tuple():
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(["https://example.com/", "https://www.linkedin.com/login"]),
+            stderr="",
+        )
+
+    assert ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls() == ()
