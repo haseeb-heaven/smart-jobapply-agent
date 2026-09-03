@@ -78,6 +78,28 @@ class FailingLiveSnapshotAdapter(FakeListingAdapter):
         return ()
 
 
+class TimedOutPreflightAdapter(FakeListingAdapter):
+    """A terminal bridge deadline before any queue state may be created."""
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        self.list_calls += 1
+        raise _DAEMON_MODULE.BrowserAdapterError("private deadline diagnostic")
+
+
+class TimedOutLiveSnapshotAdapter(FakeListingAdapter):
+    """Preflight succeeds, but the next live bridge snapshot times out."""
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        self.list_calls += 1
+        if self.list_calls > 1:
+            raise _DAEMON_MODULE.BrowserAdapterError("private deadline diagnostic")
+        return ()
+
+    @property
+    def terminal(self) -> bool:
+        return self.list_calls > 1
+
+
 class FakeMonitor:
     """Host-owned monitor fake that does not call its coordinator or adapter."""
 
@@ -262,6 +284,36 @@ def test_daemon_reports_search_needed_when_a_released_vacancy_has_no_admitted_in
     assert adapter.open_calls == []
 
 
+def test_finite_run_stops_after_terminal_bridge_tick_and_releases_the_monitor_lease(tmp_path: Path) -> None:
+    database = _private_database(tmp_path)
+    timed_out_adapter = TimedOutLiveSnapshotAdapter()
+    daemon = SmartQueueDaemon.from_config(
+        _valid_config(tmp_path, database_path=str(database)),
+        adapter=timed_out_adapter,
+        queue_factory=lambda _intake, target_database: SmartJobQueue(target_database),
+    )
+
+    status = daemon.run(max_ticks=5)
+
+    assert asdict(status) == {
+        "ticks_completed": 1,
+        "requested_open_count": 0,
+        "opened_count": 0,
+        "open_failed_count": 0,
+        "search_needed": 0,
+        "degraded_tick_count": 1,
+    }
+    assert timed_out_adapter.list_calls == 2
+    # A second finite monitor can acquire the same queue lease after the
+    # terminal adapter tick has stopped and released the first monitor.
+    replacement = SmartQueueDaemon.from_config(
+        _valid_config(tmp_path, database_path=str(database)),
+        adapter=FakeListingAdapter(),
+        queue_factory=lambda _intake, target_database: SmartJobQueue(target_database),
+    )
+    assert replacement.run(max_ticks=1).ticks_completed == 1
+
+
 def test_config_parser_rejects_candidate_list_json_input_without_leaking_it() -> None:
     private_candidate_url = "https://www.indeed.com/viewjob?jk=private-candidate"
     candidate_list_json = json.dumps(
@@ -304,6 +356,29 @@ def test_bridge_preflight_fails_before_queue_factory_or_monitor_creation(tmp_pat
     assert monitor_factory_calls == []
 
 
+def test_bridge_deadline_during_preflight_prevents_queue_creation_or_mutation(tmp_path: Path) -> None:
+    adapter = TimedOutPreflightAdapter()
+    database = _private_database(tmp_path)
+    queue_factory_calls: list[tuple[Path, Path]] = []
+
+    def queue_factory(intake: Path, target_database: Path) -> object:
+        queue_factory_calls.append((intake, target_database))
+        raise AssertionError("a bridge deadline must stop before queue creation")
+
+    with pytest.raises(DaemonConfigurationError) as raised:
+        SmartQueueDaemon.from_config(
+            _valid_config(tmp_path, database_path=str(database)),
+            adapter=adapter,
+            queue_factory=queue_factory,
+        )
+
+    assert "private deadline diagnostic" not in str(raised.value)
+    assert adapter.list_calls == 1
+    assert adapter.open_calls == []
+    assert queue_factory_calls == []
+    assert not database.exists()
+
+
 def test_live_snapshot_failure_emits_degraded_bridge_tick_without_exiting(tmp_path: Path) -> None:
     adapter = FailingLiveSnapshotAdapter()
     cancellation = threading.Event()
@@ -333,6 +408,39 @@ def test_live_snapshot_failure_emits_degraded_bridge_tick_without_exiting(tmp_pa
     assert emitted[0].bridge_error is True
     assert emitted[0].candidate_provider_error is False
     assert "private live snapshot detail" not in repr(emitted[0])
+    assert adapter.list_calls == 2
+    assert adapter.open_calls == []
+
+
+def test_live_bridge_deadline_emits_only_count_level_degraded_status_and_finishes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = TimedOutLiveSnapshotAdapter()
+    cancellation = threading.Event()
+    emitted: list[object] = []
+
+    daemon = SmartQueueDaemon.from_config(
+        _valid_config(tmp_path),
+        adapter=adapter,
+        queue_factory=lambda _intake, database: SmartJobQueue(database),
+    )
+
+    daemon.run_forever(cancellation, emitted.append)
+    _DAEMON_MODULE._emit_status(emitted[0])
+
+    assert json.loads(capsys.readouterr().out) == {
+        "degraded_count": 1,
+        "open_failed_count": 0,
+        "opened_count": 0,
+        "requested_open_count": 0,
+        "search_needed": 0,
+    }
+    assert cancellation.is_set()
+    assert len(emitted) == 1
+    assert emitted[0].degraded is True
+    assert emitted[0].bridge_error is True
+    assert "private deadline diagnostic" not in repr(emitted[0])
     assert adapter.list_calls == 2
     assert adapter.open_calls == []
 

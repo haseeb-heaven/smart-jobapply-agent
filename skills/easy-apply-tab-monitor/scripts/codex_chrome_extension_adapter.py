@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
+import threading
 from typing import Final, Protocol
 
 try:
@@ -34,6 +36,7 @@ _ADAPTER_KIND: Final = "codex-chrome-extension-stdio"
 _MAX_RESPONSE_BYTES: Final = 1_048_576
 _MAX_TAB_URLS: Final = 512
 _MAX_TAB_URL_LENGTH: Final = 8_192
+_DEFAULT_RESPONSE_TIMEOUT_SECONDS: Final = 15.0
 
 
 class _RequestStream(Protocol):
@@ -62,6 +65,7 @@ class CodexChromeExtensionAdapter:
         *,
         response_stream: _ResponseStream | None = None,
         request_stream: _RequestStream | None = None,
+        response_timeout_seconds: float | None = None,
     ) -> None:
         self._response_stream = response_stream or sys.stdin
         self._request_stream = request_stream or sys.stderr
@@ -69,40 +73,92 @@ class CodexChromeExtensionAdapter:
             getattr(self._request_stream, "write", None)
         ) or not callable(getattr(self._request_stream, "flush", None)):
             raise TypeError("stdio bridge streams are invalid")
+        if response_timeout_seconds is None:
+            self._response_timeout_seconds = _DEFAULT_RESPONSE_TIMEOUT_SECONDS
+        elif (
+            isinstance(response_timeout_seconds, bool)
+            or not isinstance(response_timeout_seconds, (int, float))
+            or not math.isfinite(response_timeout_seconds)
+            or response_timeout_seconds <= 0
+        ):
+            raise ValueError("response timeout is invalid")
+        else:
+            self._response_timeout_seconds = float(response_timeout_seconds)
         self._next_request_id = 1
+        self._request_lock = threading.RLock()
+        self._terminal = False
+
+    @property
+    def terminal(self) -> bool:
+        """Whether a timed-out read makes this stdio stream unsafe to reuse."""
+
+        with self._request_lock:
+            return self._terminal
+
+    def _read_response(self) -> str:
+        """Read one frame with a portable deadline, without reusing timed-out stdio."""
+
+        completed = threading.Event()
+        result: dict[str, object] = {}
+
+        def read() -> None:
+            try:
+                result["response"] = self._response_stream.readline(_MAX_RESPONSE_BYTES + 1)
+            except Exception:
+                result["failed"] = True
+            finally:
+                completed.set()
+
+        try:
+            threading.Thread(target=read, daemon=True).start()
+        except Exception:
+            raise BrowserAdapterError("browser bridge is unavailable") from None
+        if not completed.wait(self._response_timeout_seconds):
+            # The reader may still consume a late frame. Do not issue or accept
+            # another request on a stream whose response boundary is now unknown.
+            self._terminal = True
+            raise BrowserAdapterError("browser bridge response timed out")
+        if result.get("failed") is True:
+            raise BrowserAdapterError("browser bridge is unavailable")
+        response = result.get("response")
+        if not isinstance(response, str):
+            raise BrowserAdapterError("browser bridge returned invalid data")
+        return response
 
     def _request(
         self, operation: str, *, url: str | None = None
     ) -> tuple[dict[str, object], str]:
-        request_id = f"request-{self._next_request_id}"
-        self._next_request_id += 1
-        request: dict[str, object] = {"id": request_id, "operation": operation}
-        if url is not None:
-            request["url"] = url
-        try:
-            self._request_stream.write(json.dumps(request, separators=(",", ":"), sort_keys=True) + "\n")
-            self._request_stream.flush()
-            response = self._response_stream.readline(_MAX_RESPONSE_BYTES + 1)
-        except Exception:
-            raise BrowserAdapterError("browser bridge is unavailable") from None
-        if (
-            not isinstance(response, str)
-            or not response.endswith("\n")
-            or response.endswith("\r\n")
-            or len(response.encode("utf-8")) > _MAX_RESPONSE_BYTES
-        ):
-            raise BrowserAdapterError("browser bridge returned invalid data")
-        try:
-            payload = json.loads(response[:-1])
-        except json.JSONDecodeError:
-            raise BrowserAdapterError("browser bridge returned invalid data") from None
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("ok"), bool)
-            or payload.get("id") != request_id
-        ):
-            raise BrowserAdapterError("browser bridge returned invalid data")
-        return payload, request_id
+        with self._request_lock:
+            if self._terminal:
+                raise BrowserAdapterError("browser bridge is unavailable")
+            request_id = f"request-{self._next_request_id}"
+            self._next_request_id += 1
+            request: dict[str, object] = {"id": request_id, "operation": operation}
+            if url is not None:
+                request["url"] = url
+            try:
+                self._request_stream.write(json.dumps(request, separators=(",", ":"), sort_keys=True) + "\n")
+                self._request_stream.flush()
+            except Exception:
+                raise BrowserAdapterError("browser bridge is unavailable") from None
+            response = self._read_response()
+            if (
+                not response.endswith("\n")
+                or response.endswith("\r\n")
+                or len(response.encode("utf-8")) > _MAX_RESPONSE_BYTES
+            ):
+                raise BrowserAdapterError("browser bridge returned invalid data")
+            try:
+                payload = json.loads(response[:-1])
+            except json.JSONDecodeError:
+                raise BrowserAdapterError("browser bridge returned invalid data") from None
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("ok"), bool)
+                or payload.get("id") != request_id
+            ):
+                raise BrowserAdapterError("browser bridge returned invalid data")
+            return payload, request_id
 
     def list_tab_urls(self) -> tuple[str, ...]:
         """Return canonical supported listing URLs from one bounded response."""

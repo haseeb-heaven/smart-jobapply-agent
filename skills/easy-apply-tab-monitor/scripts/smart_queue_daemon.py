@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import importlib.util
+import inspect
 import json
 import math
 from pathlib import Path
@@ -180,10 +181,11 @@ def _tick_count(tick: object, count_name: str, ids_name: str) -> int:
 class SmartQueueDaemon:
     """A durable monitor host with no recommendation or outcome interface."""
 
-    def __init__(self, monitor: object) -> None:
+    def __init__(self, monitor: object, *, adapter: ListingAdapter | None = None) -> None:
         if not callable(getattr(monitor, "run", None)):
             raise TypeError("monitor must provide run")
         self._monitor = monitor
+        self._adapter = adapter
 
     @classmethod
     def from_config(
@@ -219,13 +221,15 @@ class SmartQueueDaemon:
             raise
         except Exception:
             raise DaemonConfigurationError("daemon initialization failed") from None
-        return cls(monitor)
+        return cls(monitor, adapter=adapter)
 
     @staticmethod
     def _status(ticks: Sequence[object]) -> DaemonStatus:
         return DaemonStatus(
             ticks_completed=len(ticks),
-            requested_open_count=sum(_tick_count(tick, "requested_open_count", "requested_open_job_ids") for tick in ticks),
+            requested_open_count=sum(
+                _tick_count(tick, "requested_open_count", "requested_open_job_ids") for tick in ticks
+            ),
             opened_count=sum(_tick_count(tick, "opened_count", "opened_job_ids") for tick in ticks),
             open_failed_count=sum(_tick_count(tick, "open_failed_count", "open_failed_job_ids") for tick in ticks),
             search_needed=(int(getattr(ticks[-1], "search_needed", 0)) if ticks else 0),
@@ -235,7 +239,34 @@ class SmartQueueDaemon:
     def run(self, *, max_ticks: int) -> DaemonStatus:
         if isinstance(max_ticks, bool) or not isinstance(max_ticks, int) or max_ticks < 0:
             raise ValueError("max_ticks must be a non-negative integer")
-        ticks = self._monitor.run(max_ticks=max_ticks)
+        monitor_run = self._monitor.run
+        try:
+            parameters = inspect.signature(monitor_run).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        supports_result_sink = any(
+            parameter.name == "result_sink" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if supports_result_sink:
+            cancellation = threading.Event()
+
+            def stop_after_terminal_adapter(_status: object) -> None:
+                # A timed-out stdio read makes the response boundary unsafe.
+                # Stop a finite monitor at that completed degraded tick so the
+                # monitor releases its lease before the child exits.
+                if getattr(self._adapter, "terminal", False) is True:
+                    cancellation.set()
+
+            ticks = monitor_run(
+                cancellation,
+                max_ticks=max_ticks,
+                result_sink=stop_after_terminal_adapter,
+            )
+        else:
+            # Retain the original narrow test-double contract for monitors
+            # that only expose finite tuple runs.
+            ticks = monitor_run(max_ticks=max_ticks)
         if not isinstance(ticks, tuple):
             raise RuntimeError("monitor returned invalid status")
         return self._status(ticks)
@@ -243,7 +274,16 @@ class SmartQueueDaemon:
     def run_forever(self, cancellation: threading.Event, status_sink: Callable[[object], None]) -> None:
         if not isinstance(cancellation, threading.Event) or not callable(status_sink):
             raise TypeError("invalid daemon lifecycle arguments")
-        self._monitor.run(cancellation, max_ticks=None, result_sink=status_sink)
+
+        def emit_and_stop_after_terminal_adapter(status: object) -> None:
+            status_sink(status)
+            # A timed-out stdio read leaves a late response without a safe
+            # request boundary. The degraded tick above is the final count-only
+            # status; stopping here releases the monitor lease and ends the child.
+            if getattr(self._adapter, "terminal", False) is True:
+                cancellation.set()
+
+        self._monitor.run(cancellation, max_ticks=None, result_sink=emit_and_stop_after_terminal_adapter)
 
 
 def _emit_status(status: object) -> None:

@@ -263,12 +263,9 @@ export function startCodexSmartQueueDaemonHost(chromeBinding, options) {
   }
   const statusObserver = observeStatus(child.stdout);
   const exitObserver = observeExit(child);
-  const finished = exitObserver.finished.then(async (terminal) => {
-    await statusObserver.drain(terminal);
-    return terminal;
-  });
   let stopping;
   let bridgeTerminal = null;
+  let bridgeQuarantined = false;
   let bridgeEnded = false;
   let bridgeCloseTimer = null;
   let bridge;
@@ -278,6 +275,17 @@ export function startCodexSmartQueueDaemonHost(chromeBinding, options) {
     child.kill("SIGTERM");
     throw error;
   }
+  const finished = exitObserver.finished.then(async (terminal) => {
+    // Closing the logical bridge fences every browser operation that has not
+    // yet been dispatched. A dispatched mutation cannot be cancelled through
+    // the generic browser Promise API, so retain this host until it settles.
+    bridge.close();
+    bridgeQuarantined = bridge.mutationPending;
+    await statusObserver.drain(terminal);
+    await bridge.quiescent.catch(() => undefined);
+    bridgeQuarantined = false;
+    return terminal;
+  });
   // A bridge stream failure is terminal to this host but never publishes its
   // error object, which could contain private request data. A clean premature
   // bridge end is terminal too, but stderr EOF can arrive just before the
@@ -345,7 +353,8 @@ export function startCodexSmartQueueDaemonHost(chromeBinding, options) {
         ready,
         healthy: running && ready,
         exit: terminalExit,
-        terminal: bridgeTerminal ?? terminalExit,
+        quarantined: bridgeQuarantined,
+        terminal: bridgeQuarantined ? "quarantined" : (bridgeTerminal ?? terminalExit),
       });
     },
     get exit() { return exitObserver.exit(); },

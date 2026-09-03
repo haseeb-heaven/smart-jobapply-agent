@@ -2,10 +2,13 @@
 
 import assert from "node:assert/strict";
 import { spawn as spawnChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import { startCodexChromeExtensionHost } from "../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs";
 import {
@@ -20,7 +23,7 @@ function tab(url = "https://in.indeed.com/jobs?q=private") {
   return { url };
 }
 
-function chromeBinding({ tabs = [tab()], delay = null, openTabsError = null } = {}) {
+function chromeBinding({ tabs = [tab()], delay = null, newDelay = null, openTabsError = null } = {}) {
   const events = [];
   return {
     events,
@@ -36,6 +39,7 @@ function chromeBinding({ tabs = [tab()], delay = null, openTabsError = null } = 
       tabs: {
         async new() {
           events.push(["new"]);
+          if (newDelay !== null) await newDelay;
           return {
             async goto(url) { events.push(["goto", url]); },
             async markHandoff() { events.push(["markHandoff"]); },
@@ -169,6 +173,26 @@ test("request handling is serialized", async () => {
   assert.deepEqual(events, [["openTabs"], ["openTabs"], ["new"], ["goto", LINKEDIN], ["markHandoff"]]);
 });
 
+test("direct bridge close fences a read-only openTabs wait before any mutation", async () => {
+  let releaseOpenTabs;
+  const stalledOpenTabs = new Promise((resolve) => { releaseOpenTabs = resolve; });
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], delay: stalledOpenTabs });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+
+  input.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+
+  service.close();
+  await bounded(service.finished, "fenced direct bridge completion");
+  assert.equal(service.mutationPending, false);
+  releaseOpenTabs();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+});
+
 function daemonChild() {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
@@ -182,6 +206,7 @@ function daemonChild() {
     child.signalCode = signal;
     queueMicrotask(() => {
       child.stdout.end();
+      child.stderr.end();
       child.emit("close", null, signal);
     });
     return true;
@@ -247,6 +272,32 @@ function bounded(promise, label, timeoutMilliseconds = 2000) {
       timeout = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMilliseconds);
     }),
   ]).finally(() => clearTimeout(timeout));
+}
+
+function syntheticActiveIntake() {
+  const approvedFacts = { "targets.smart_queue_capacity": 5 };
+  const revisionInput = {
+    activated_by: "user",
+    approved_facts: approvedFacts,
+    contradictions: [],
+    documents: [],
+    pending_facts: [],
+    schema_version: 1,
+    state: "active",
+    unknown_fields: [],
+  };
+  return {
+    schema_version: 1,
+    documents: [],
+    approved_facts: approvedFacts,
+    unknown_fields: [],
+    contradictions: [],
+    pending_facts: [],
+    state: "active",
+    activated_by: "user",
+    confirmed_at: "2026-01-01T00:00:00+00:00",
+    revision_hash: createHash("sha256").update(JSON.stringify(revisionInput)).digest("hex"),
+  };
 }
 
 function realDaemonFixture(source) {
@@ -381,6 +432,73 @@ test("the real Node host preserves duplicate managed URLs through the Python coo
   assert.deepEqual(duplicateTabs.events, [["openTabs"]]);
 });
 
+test("the real Node parent runs one actual daemon tick through a strict private stdio bridge", { timeout: 10000 }, async () => {
+  const privateRoot = fileURLToPath(new URL("../jobapply_agent/private/", import.meta.url));
+  await mkdir(privateRoot, { recursive: true });
+  const runtime = await mkdtemp(join(privateRoot, "node-actual-daemon-"));
+  const intakePath = join(runtime, "synthetic-active-intake.json");
+  const databasePath = join(runtime, "synthetic-queue.sqlite3");
+  await writeFile(intakePath, JSON.stringify(syntheticActiveIntake()), "utf8");
+
+  const session = chromeBinding({ tabs: [tab(LINKEDIN)] });
+  const rawChildStdout = [];
+  const host = startCodexSmartQueueDaemonHost(session.binding, {
+    daemonArgs: [
+      "--candidate-intake", intakePath,
+      "--database", databasePath,
+      "--max-ticks", "1",
+      "--bridge-stdio",
+    ],
+    daemonPath: fileURLToPath(new URL("../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py", import.meta.url)),
+    pythonExecutable: "python",
+    spawn(executable, args, options) {
+      const child = spawnChildProcess(executable, args, options);
+      child.stdout.on("data", (chunk) => rawChildStdout.push(Buffer.from(chunk)));
+      return child;
+    },
+  });
+  const statuses = collectedLines(host.status);
+
+  try {
+    assert.deepEqual(await bounded(host.finished, "actual smart queue daemon exit", 5000), {
+      exitCode: 0,
+      signalCode: null,
+    });
+    await statuses.ended;
+    assert.deepEqual(statuses.parse(), [
+      {
+        ticks_completed: 1,
+        requested_open_count: 0,
+        opened_count: 0,
+        open_failed_count: 0,
+        search_needed: 5,
+        degraded_tick_count: 0,
+      },
+      { terminal: "exited" },
+    ]);
+    assert.deepEqual(session.events, [["openTabs"], ["openTabs"], ["openTabs"]]);
+    assert.equal(host.health.running, false);
+    assert.equal(host.health.ready, false);
+    assert.equal(host.health.healthy, false);
+    assert.doesNotMatch(JSON.stringify(statuses.parse()), /https:|synthetic-active-intake|sqlite|candidate/);
+    const rawFrames = Buffer.concat(rawChildStdout).toString("utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+    assert.ok(rawFrames.length > 0);
+    for (const frame of rawFrames) {
+      const keys = Object.keys(frame).sort();
+      const finiteKeys = ["degraded_tick_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed", "ticks_completed"];
+      const unboundedKeys = ["degraded_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed"];
+      assert.ok(
+        JSON.stringify(keys) === JSON.stringify(finiteKeys) || JSON.stringify(keys) === JSON.stringify(unboundedKeys),
+        "raw child stdout must use a count-only status schema",
+      );
+      for (const value of Object.values(frame)) assert.ok(Number.isSafeInteger(value) && value >= 0);
+    }
+    assert.doesNotMatch(Buffer.concat(rawChildStdout).toString("utf8"), /https:\/\//);
+  } finally {
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
+
 test("the daemon parent uses only piped stdio, drains stdout, and publishes bounded count-only status", async () => {
   const child = daemonChild();
   let spawned;
@@ -478,6 +596,7 @@ test("the daemon host exposes redacted terminal status for an early exit or spaw
   exited.exitCode = 2;
   exited.emit("exit", 2, null);
   exited.stdout.end();
+  exited.stderr.end();
   assert.deepEqual(await exitedHost.finished, { exitCode: 2, signalCode: null });
   await exitedStatuses.ended;
   assert.deepEqual(exitedStatuses.parse(), [{ terminal: "exited" }]);
@@ -492,6 +611,7 @@ test("the daemon host exposes redacted terminal status for an early exit or spaw
   const failedStatuses = collectedLines(failedHost.status);
   failed.emit("error", new Error("private launch failure"));
   failed.stdout.end();
+  failed.stderr.end();
   assert.deepEqual(await failedHost.finished, { exitCode: null, signalCode: null, terminalError: "spawn_error" });
   await failedStatuses.ended;
   assert.deepEqual(failedStatuses.parse(), [{ terminal: "spawn_error" }]);
@@ -650,12 +770,99 @@ test("startOrGet retains a terminating daemon until finished and then restarts",
   assert.equal(spawnCalls, 1);
 
   terminating.stdout.end();
+  terminating.stderr.end();
   assert.deepEqual(await initial.finished, { exitCode: 1, signalCode: null });
 
   const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
   assert.notEqual(replacement, initial);
   assert.equal(spawnCalls, 2);
   assert.equal(startOrGetCodexSmartQueueDaemonHost(binding, options), replacement);
+  assert.equal(spawnCalls, 2);
+  await replacement.stop();
+});
+
+test("child exit fences a stalled read-only openTabs request so a replacement starts safely", async () => {
+  const terminating = daemonChild();
+  const replacementChild = daemonChild();
+  const children = [terminating, replacementChild];
+  let releaseOpen;
+  const delayedOpen = new Promise((resolve) => { releaseOpen = resolve; });
+  let spawnCalls = 0;
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], delay: delayedOpen });
+  const options = {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/in-flight-bridge-daemon.py",
+    spawn() {
+      spawnCalls += 1;
+      return children.shift();
+    },
+  };
+
+  const initial = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  terminating.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+
+  terminating.exitCode = 0;
+  terminating.emit("exit", 0, null);
+  terminating.stdout.end();
+  terminating.stderr.end();
+  assert.deepEqual(await bounded(initial.finished, "fenced read-only host completion"), { exitCode: 0, signalCode: null });
+  assert.equal(initial.health.quarantined, false);
+  assert.deepEqual(events, [["openTabs"]]);
+
+  const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  assert.notEqual(replacement, initial);
+  assert.equal(spawnCalls, 2);
+  releaseOpen();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+  await replacement.stop();
+});
+
+test("child exit quarantines a dispatched mutation until it settles before replacement", async () => {
+  const terminating = daemonChild();
+  const replacementChild = daemonChild();
+  const children = [terminating, replacementChild];
+  let releaseNew;
+  const stalledNew = new Promise((resolve) => { releaseNew = resolve; });
+  let spawnCalls = 0;
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], newDelay: stalledNew });
+  const options = {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/quarantined-bridge-daemon.py",
+    spawn() {
+      spawnCalls += 1;
+      return children.shift();
+    },
+  };
+
+  const initial = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  terminating.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"], ["new"]]);
+
+  terminating.exitCode = 0;
+  terminating.emit("exit", 0, null);
+  terminating.stdout.end();
+  terminating.stderr.end();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(initial.health.running, false);
+  assert.equal(initial.health.healthy, false);
+  assert.equal(initial.health.quarantined, true);
+  assert.equal(initial.health.terminal, "quarantined");
+  assert.doesNotMatch(JSON.stringify(initial.health), /https:|open_listing|\"open\"/);
+  assert.equal(startOrGetCodexSmartQueueDaemonHost(binding, options), initial);
+  assert.equal(spawnCalls, 1);
+
+  releaseNew();
+  assert.deepEqual(await bounded(initial.finished, "quarantined mutation settlement"), { exitCode: 0, signalCode: null });
+  assert.deepEqual(events, [["openTabs"], ["new"]]);
+  assert.equal(initial.health.quarantined, false);
+  assert.notEqual(initial.health.terminal, "quarantined");
+
+  const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  assert.notEqual(replacement, initial);
   assert.equal(spawnCalls, 2);
   await replacement.stop();
 });
@@ -673,6 +880,7 @@ test("the daemon host rejects a partial final status frame after child exit", as
   child.emit("exit", 0, null);
   child.stdout.write(`${JSON.stringify({ ticks_completed: 2, opened_count: 1 })}\n`);
   child.stdout.end();
+  child.stderr.end();
 
   assert.deepEqual(await host.finished, { exitCode: 0, signalCode: null });
   await statuses.ended;

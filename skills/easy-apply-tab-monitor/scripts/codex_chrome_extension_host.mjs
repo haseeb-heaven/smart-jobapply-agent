@@ -218,14 +218,18 @@ async function listTabUrls(chrome) {
   return urls;
 }
 
-async function openListing(chrome, url) {
+async function openListing(chrome, url, fence) {
   // Existing-session check is intentionally before tabs.new().
   const tabs = await chrome.user.openTabs();
+  if (fence.closed()) return false;
   if (!Array.isArray(tabs) || tabs.length === 0) fail("existing session is required");
-  const tab = await chrome.tabs.new();
+  const tab = await fence.mutate(() => chrome.tabs.new());
+  if (tab === null || fence.closed()) return false;
   if (tab == null || typeof tab.goto !== "function" || typeof tab.markHandoff !== "function") fail("invalid handoff tab");
-  await tab.goto(url);
-  await tab.markHandoff();
+  await fence.mutate(() => tab.goto(url));
+  if (fence.closed()) return false;
+  await fence.mutate(() => tab.markHandoff());
+  return !fence.closed();
 }
 
 function failure(id = null) {
@@ -244,16 +248,20 @@ async function writeJson(output, payload) {
   });
 }
 
-async function handle(chrome, line) {
+async function handle(chrome, line, fence) {
   const requestId = requestIdFromLine(line);
   try {
     const request = parseRequest(line);
-    if (request.operation === "list_tab_urls") return { id: request.id, ok: true, urls: await listTabUrls(chrome) };
-    await openListing(chrome, request.url);
-    return { id: request.id, ok: true };
+    if (fence.closed()) return null;
+    if (request.operation === "list_tab_urls") {
+      const urls = await listTabUrls(chrome);
+      return fence.closed() ? null : { id: request.id, ok: true, urls };
+    }
+    const opened = await openListing(chrome, request.url, fence);
+    return opened ? { id: request.id, ok: true } : null;
   } catch {
     // Never reflect URLs, browser state, or binding exceptions.
-    return failure(requestId);
+    return fence.closed() ? null : failure(requestId);
   }
 }
 
@@ -267,7 +275,40 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
   const chrome = requireChromeBinding(chromeBinding);
   const { input, output } = requireStreams(options);
   let closed = false;
-  const finished = (async () => {
+  let pendingMutations = 0;
+  let finishedResolved = false;
+  let quiescentResolved = false;
+  let resolveFinished;
+  let rejectFinished;
+  let resolveQuiescent;
+  const finished = new Promise((resolve, reject) => {
+    resolveFinished = resolve;
+    rejectFinished = reject;
+  });
+  const quiescent = new Promise((resolve) => { resolveQuiescent = resolve; });
+  const settle = () => {
+    if (!closed || pendingMutations !== 0 || quiescentResolved) return;
+    quiescentResolved = true;
+    resolveQuiescent();
+    if (!finishedResolved) {
+      finishedResolved = true;
+      resolveFinished();
+    }
+  };
+  const fence = Object.freeze({
+    closed: () => closed,
+    async mutate(operation) {
+      if (closed) return null;
+      pendingMutations += 1;
+      try {
+        return await operation();
+      } finally {
+        pendingMutations -= 1;
+        settle();
+      }
+    },
+  });
+  void (async () => {
     let parts = [];
     let length = 0;
     let oversized = false;
@@ -288,7 +329,8 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
           } else {
             parts.push(final);
             length += final.length;
-            await writeJson(output, await handle(chrome, Buffer.concat(parts, length)));
+            const response = await handle(chrome, Buffer.concat(parts, length), fence);
+            if (response !== null && !closed) await writeJson(output, response);
           }
         } else {
           oversizedId.push(bytes.subarray(start, index));
@@ -315,12 +357,26 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
       }
     }
     if (!closed && (length > 0 || oversized)) await writeJson(output, failure(oversized ? oversizedId.value : null));
-  })();
+    if (!closed && !finishedResolved) {
+      finishedResolved = true;
+      resolveFinished();
+    }
+  })().catch(() => {
+    // Stream failures are observed by the daemon host; no untrusted error is exposed here.
+    if (closed) settle();
+    else if (!finishedResolved) {
+      finishedResolved = true;
+      rejectFinished(new Error("bridge failed"));
+    }
+  });
   return Object.freeze({
     finished,
+    quiescent,
+    get mutationPending() { return pendingMutations !== 0; },
     close() {
       closed = true;
       if (typeof input.destroy === "function") input.destroy();
+      settle();
     },
   });
 }
