@@ -12,12 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 from typing import Iterable
+import uuid
 
 from .smart_queue import QueueCandidate, QueueEvent, QueuePolicyError, QueueStorageError, SmartJobQueue
 from .sources import canonical_listing_url
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
 
 
@@ -107,13 +108,16 @@ class CandidateMemory:
     def _initialize(self) -> None:
         connection = self._connect(self.database_path)
         try:
-            connection.executescript(
+            connection.execute("BEGIN IMMEDIATE")
+            self._preflight_unscoped_legacy_outcomes(connection)
+            statements = (
                 """
                 CREATE TABLE IF NOT EXISTS candidate_memory_schema_versions (
                     version INTEGER PRIMARY KEY CHECK(version > 0),
                     applied_at TEXT NOT NULL
-                );
-
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS candidate_memory_outcomes (
                     queue_id TEXT NOT NULL CHECK(length(queue_id) = 32),
                     event_id INTEGER NOT NULL CHECK(event_id > 0),
@@ -124,37 +128,63 @@ class CandidateMemory:
                     vacated INTEGER NOT NULL CHECK(vacated = 1),
                     recorded_at TEXT NOT NULL,
                     PRIMARY KEY (queue_id, event_id)
-                );
-
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS candidate_memory_queue_scope (
+                    scope_id INTEGER PRIMARY KEY CHECK(scope_id = 1),
+                    queue_id TEXT NOT NULL CHECK(length(queue_id) = 32)
+                )
+                """,
+                """
                 CREATE INDEX IF NOT EXISTS idx_candidate_memory_outcomes_source_url
-                    ON candidate_memory_outcomes(source_url);
-
+                    ON candidate_memory_outcomes(source_url)
+                """,
+                """
                 CREATE TRIGGER IF NOT EXISTS candidate_memory_schema_versions_no_update
                 BEFORE UPDATE ON candidate_memory_schema_versions
                 BEGIN
                     SELECT RAISE(ABORT, 'candidate memory schema history is append-only');
-                END;
-
+                END
+                """,
+                """
                 CREATE TRIGGER IF NOT EXISTS candidate_memory_schema_versions_no_delete
                 BEFORE DELETE ON candidate_memory_schema_versions
                 BEGIN
                     SELECT RAISE(ABORT, 'candidate memory schema history is append-only');
-                END;
-
+                END
+                """,
+                """
                 CREATE TRIGGER IF NOT EXISTS candidate_memory_outcomes_no_update
                 BEFORE UPDATE ON candidate_memory_outcomes
                 BEGIN
                     SELECT RAISE(ABORT, 'candidate memory outcomes are append-only');
-                END;
-
+                END
+                """,
+                """
                 CREATE TRIGGER IF NOT EXISTS candidate_memory_outcomes_no_delete
                 BEFORE DELETE ON candidate_memory_outcomes
                 BEGIN
                     SELECT RAISE(ABORT, 'candidate memory outcomes are append-only');
-                END;
+                END
+                """,
                 """
+                CREATE TRIGGER IF NOT EXISTS candidate_memory_queue_scope_no_update
+                BEFORE UPDATE ON candidate_memory_queue_scope
+                BEGIN
+                    SELECT RAISE(ABORT, 'candidate memory queue scope is immutable');
+                END
+                """,
+                """
+                CREATE TRIGGER IF NOT EXISTS candidate_memory_queue_scope_no_delete
+                BEFORE DELETE ON candidate_memory_queue_scope
+                BEGIN
+                    SELECT RAISE(ABORT, 'candidate memory queue scope is immutable');
+                END
+                """,
             )
-            connection.execute("BEGIN IMMEDIATE")
+            for statement in statements:
+                connection.execute(statement)
             versions = [
                 int(row["version"])
                 for row in connection.execute(
@@ -175,12 +205,98 @@ class CandidateMemory:
         finally:
             connection.close()
 
+    @classmethod
+    def _preflight_unscoped_legacy_outcomes(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Reject populated legacy memory before migration mutates its schema."""
+
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "candidate_memory_outcomes" not in tables:
+            return
+        if connection.execute(
+            "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+        ).fetchone() is None:
+            return
+        if "candidate_memory_queue_scope" not in tables:
+            raise CandidateMemoryStorageError("candidate memory queue scope is unavailable")
+        scope_rows = connection.execute(
+            "SELECT scope_id, queue_id FROM candidate_memory_queue_scope"
+        ).fetchall()
+        if len(scope_rows) != 1 or scope_rows[0]["scope_id"] != 1:
+            raise CandidateMemoryStorageError("candidate memory queue scope is invalid")
+        scope_queue_id = cls._require_queue_id(scope_rows[0]["queue_id"])
+        outcome_queue_rows = connection.execute(
+            "SELECT DISTINCT queue_id FROM candidate_memory_outcomes LIMIT 2"
+        ).fetchall()
+        if len(outcome_queue_rows) != 1:
+            raise CandidateMemoryStorageError("candidate memory outcome queue scope is invalid")
+        outcome_queue_id = cls._require_queue_id(outcome_queue_rows[0]["queue_id"])
+        if outcome_queue_id != scope_queue_id:
+            raise CandidateMemoryStorageError("candidate memory outcome queue scope is invalid")
+
     @staticmethod
     def _require_user_vacated(*, actor: str, vacated: bool) -> None:
-        if actor != "user":
+        if type(actor) is not str or actor != "user":
             raise CandidateMemoryPolicyError("candidate-memory writes require the exact user actor")
         if type(vacated) is not bool or vacated is not True:
             raise CandidateMemoryPolicyError("candidate-memory writes require explicit vacated=True")
+
+    @staticmethod
+    def _require_queue_id(value: object) -> str:
+        if type(value) is not str:
+            raise CandidateMemoryStorageError("candidate memory queue scope is invalid")
+        try:
+            normalized = uuid.UUID(value).hex
+        except (AttributeError, ValueError):
+            raise CandidateMemoryStorageError("candidate memory queue scope is invalid") from None
+        if value != normalized:
+            raise CandidateMemoryStorageError("candidate memory queue scope is invalid")
+        return normalized
+
+    @classmethod
+    def _bind_or_validate_queue_scope(
+        cls,
+        connection: sqlite3.Connection,
+        queue_id: str,
+    ) -> None:
+        """Bind an empty memory once, or require its immutable queue scope."""
+
+        queue_id = cls._require_queue_id(queue_id)
+        row = connection.execute(
+            "SELECT queue_id FROM candidate_memory_queue_scope WHERE scope_id = 1"
+        ).fetchone()
+        if row is None:
+            legacy_outcome = connection.execute(
+                "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+            ).fetchone()
+            if legacy_outcome is not None:
+                raise CandidateMemoryStorageError(
+                    "candidate memory queue scope is unavailable"
+                )
+            connection.execute(
+                """
+                INSERT INTO candidate_memory_queue_scope (scope_id, queue_id)
+                VALUES (1, ?)
+                """,
+                (queue_id,),
+            )
+            return
+
+        try:
+            stored_queue_id = cls._require_queue_id(row["queue_id"])
+        except CandidateMemoryStorageError:
+            raise
+        if stored_queue_id != queue_id:
+            raise CandidateMemoryPolicyError(
+                "candidate memory queue scope does not match the authenticated queue"
+            )
 
     @staticmethod
     def _authenticated_queue_outcome(
@@ -217,85 +333,17 @@ class CandidateMemory:
         actor: str,
         vacated: bool,
     ) -> CandidateMemoryOutcome:
-        """Record one authentic user outcome once and return its reconciliation.
+        """Reject the legacy non-atomic replay path without writing memory.
 
-        Replaying the exact source event is a no-op.  A conflicting reuse of a
-        queue event identity fails closed rather than overwriting audit data.
+        The queue event has already committed before this method can observe
+        it. Persisting matching suppression data here would therefore use two
+        commit boundaries. Call :meth:`finalize_queue_outcome` instead.
         """
 
-        self._require_user_vacated(actor=actor, vacated=vacated)
-        queue_event, source_url = self._authenticated_queue_outcome(
-            queue=queue,
-            event=event,
-            actor=actor,
+        del queue, event, actor, vacated
+        raise CandidateMemoryPolicyError(
+            "candidate-memory outcomes must be finalized atomically with the SmartJobQueue"
         )
-        connection = self._connect(self.database_path)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                """
-                SELECT job_id, source_url, outcome, actor, vacated, recorded_at
-                FROM candidate_memory_outcomes
-                WHERE queue_id = ? AND event_id = ?
-                """,
-                (queue_event.queue_id, queue_event.event_id),
-            ).fetchone()
-            if existing is not None:
-                expected = (queue_event.job_id, source_url, queue_event.name, actor, 1)
-                actual = (
-                    str(existing["job_id"]),
-                    str(existing["source_url"]),
-                    str(existing["outcome"]),
-                    str(existing["actor"]),
-                    int(existing["vacated"]),
-                )
-                if actual != expected:
-                    raise CandidateMemoryStorageError("candidate memory event identity conflicts with stored facts")
-                connection.commit()
-                return CandidateMemoryOutcome(
-                    queue_id=queue_event.queue_id,
-                    event_id=queue_event.event_id,
-                    source_url=source_url,
-                    outcome=queue_event.name,
-                    recorded_at=str(existing["recorded_at"]),
-                    inserted=False,
-                )
-
-            recorded_at = _utc_now()
-            connection.execute(
-                """
-                INSERT INTO candidate_memory_outcomes (
-                    queue_id, event_id, job_id, source_url, outcome, actor, vacated, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    queue_event.queue_id,
-                    queue_event.event_id,
-                    queue_event.job_id,
-                    source_url,
-                    queue_event.name,
-                    actor,
-                    1,
-                    recorded_at,
-                ),
-            )
-            connection.commit()
-            return CandidateMemoryOutcome(
-                queue_id=queue_event.queue_id,
-                event_id=queue_event.event_id,
-                source_url=source_url,
-                outcome=queue_event.name,
-                recorded_at=recorded_at,
-                inserted=True,
-            )
-        except CandidateMemoryStorageError:
-            connection.rollback()
-            raise
-        except sqlite3.Error:
-            connection.rollback()
-            raise CandidateMemoryStorageError("candidate memory storage operation failed") from None
-        finally:
-            connection.close()
 
     def finalize_queue_outcome(
         self,
@@ -321,6 +369,7 @@ class CandidateMemory:
                 job_id,
                 outcome,
                 actor=actor,
+                vacated=vacated,
                 memory_database=self.database_path,
             )
         except QueueStorageError:
@@ -355,6 +404,8 @@ class CandidateMemory:
     def filter_unsuppressed_candidates(
         self,
         candidates: Iterable[QueueCandidate],
+        *,
+        queue: SmartJobQueue,
     ) -> tuple[QueueCandidate, ...]:
         """Keep prevalidated candidates whose exact listing identity is unseen.
 
@@ -363,6 +414,13 @@ class CandidateMemory:
         present in the candidate's durable suppression memory.
         """
 
+        if not isinstance(queue, SmartJobQueue):
+            raise CandidateMemoryPolicyError("an authenticated SmartJobQueue is required")
+        try:
+            authenticated_queue_id, active_revisions = queue._candidate_memory_scope()
+            queue_id = self._require_queue_id(authenticated_queue_id)
+        except (QueuePolicyError, QueueStorageError):
+            raise CandidateMemoryPolicyError("an authenticated SmartJobQueue is required") from None
         if isinstance(candidates, (str, bytes)):
             raise CandidateMemoryPolicyError("candidates must be QueueCandidate values")
         try:
@@ -373,9 +431,20 @@ class CandidateMemory:
             raise CandidateMemoryPolicyError("candidates must contain only QueueCandidate values")
         if not values:
             return ()
+        if active_revisions == (None, None):
+            raise CandidateMemoryPolicyError("authenticated queue revisions are unavailable")
+        if any(
+            (candidate.profile_revision, candidate.matcher_policy_revision) != active_revisions
+            for candidate in values
+        ):
+            raise CandidateMemoryPolicyError(
+                "candidate batch revisions do not match the authenticated queue"
+            )
         connection = self._connect(self.database_path)
         try:
-            return tuple(
+            connection.execute("BEGIN IMMEDIATE")
+            self._bind_or_validate_queue_scope(connection, queue_id)
+            unsuppressed = tuple(
                 candidate
                 for candidate in values
                 if connection.execute(
@@ -384,7 +453,13 @@ class CandidateMemory:
                 ).fetchone()
                 is None
             )
+            connection.commit()
+            return unsuppressed
+        except (CandidateMemoryPolicyError, CandidateMemoryStorageError):
+            connection.rollback()
+            raise
         except sqlite3.Error:
+            connection.rollback()
             raise CandidateMemoryStorageError("candidate memory storage operation failed") from None
         finally:
             connection.close()

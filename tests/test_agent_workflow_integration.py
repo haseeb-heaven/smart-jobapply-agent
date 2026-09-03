@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.listing_extraction import (
     listing_from_validated_extraction,
@@ -184,9 +185,24 @@ def test_verified_profile_drives_five_job_queue_refill_and_user_owned_lifecycle(
     submitted_job_id = initial.job_ids[0]
     remaining_visible_urls = initial.urls_to_open[1:]
     queue.record_visible_snapshot(remaining_visible_urls, actor="agent")
-    assert queue.get(submitted_job_id).state == "awaiting_outcome"
+    assert queue.get(submitted_job_id).state == "released"
 
-    queue.confirm_outcome(submitted_job_id, "submitted", actor="user")
+    refill = queue.plan_refill(open_urls=remaining_visible_urls)
+    assert refill.job_ids == (recommendations[5].job_id,)
+    assert refill.urls_to_open == (recommendations[5].source_url,)
+    assert refill.search_needed == 0
+
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    queue.confirm_outcome(
+        submitted_job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
     assert queue.get(submitted_job_id).state == "submitted"
     assert queue.confirmed_submitted_count() == 1
 
@@ -197,10 +213,6 @@ def test_verified_profile_drives_five_job_queue_refill_and_user_owned_lifecycle(
     assert tracker.get_job(submitted_job_id).state == "interview"
     assert tracker.unique_manual_submitted_count() == 1
 
-    refill = queue.plan_refill(open_urls=remaining_visible_urls)
-    assert refill.job_ids == (recommendations[5].job_id,)
-    assert refill.urls_to_open == (recommendations[5].source_url,)
-    assert refill.search_needed == 0
     queue.record_visible_snapshot([*remaining_visible_urls, *refill.urls_to_open], actor="agent")
     assert sum(queue.get(candidate.job_id).state == "open" for candidate in recommendations) == 5
 
@@ -246,10 +258,7 @@ def test_verified_profile_drives_candidate_selected_three_job_queue_refill(tmp_p
 
     assert initial.job_ids == tuple(candidate.job_id for candidate in recommendations[:3])
     assert len(initial.urls_to_open) == 3
-    assert queue.get(manually_closed).state == "awaiting_outcome"
-    assert queue.plan_refill(open_urls=remaining).urls_to_open == ()
-
-    queue.confirm_outcome(manually_closed, "skipped", actor="user")
+    assert queue.get(manually_closed).state == "released"
     replacement = queue.plan_refill(open_urls=remaining)
 
     assert replacement.job_ids == (recommendations[3].job_id,)

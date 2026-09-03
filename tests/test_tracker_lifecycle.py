@@ -5,12 +5,13 @@ import sqlite3
 
 import pytest
 
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.tracker_lifecycle import (
     InvalidLifecycleTransition,
     LifecycleTracker,
     RoundLimitExceeded,
 )
-from jobapply_agent.smart_queue import QueueCandidate, SmartJobQueue
+from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
 
 
 def _advance_to_opened(tracker: LifecycleTracker, job_id: str) -> None:
@@ -32,6 +33,20 @@ def _advance_to_state_before(tracker: LifecycleTracker, job_id: str, target: str
         tracker.transition(job_id, "submitted", actor="user")
     if target == "offer":
         tracker.transition(job_id, "interview", actor="user")
+
+
+def _finalize_queue_outcome(queue: SmartJobQueue, job_id: str, outcome: str) -> None:
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    queue.confirm_outcome(
+        job_id,
+        outcome,
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
 
 
 def _confirmed_queue_outcome(
@@ -58,7 +73,7 @@ def _confirmed_queue_outcome(
     )
     planned = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
-    queue.confirm_outcome(job_id, outcome, actor="user")
+    _finalize_queue_outcome(queue, job_id, outcome)
     return queue, queue.confirmed_outcome_events()[0].event_id
 
 
@@ -324,7 +339,9 @@ def test_queue_outcome_reconciliation_is_transactional_idempotent_and_user_owned
         )
 
 
-def test_queue_outcome_reconciliation_namespaces_colliding_event_ids(tmp_path: Path):
+def test_lifecycle_reconciliation_rejects_cross_queue_memory_with_colliding_event_ids(
+    tmp_path: Path,
+) -> None:
     tracker = LifecycleTracker(tmp_path / "lifecycle.sqlite3")
     source_url_a = "https://www.linkedin.com/jobs/view/job-queue-a"
     source_url_b = "https://www.linkedin.com/jobs/view/job-queue-b"
@@ -334,17 +351,32 @@ def test_queue_outcome_reconciliation_namespaces_colliding_event_ids(tmp_path: P
         source_url=source_url_a,
         outcome="submitted",
     )
-    queue_b, queue_event_id_b = _confirmed_queue_outcome(
-        tmp_path,
-        job_id="job-queue-b",
-        source_url=source_url_b,
-        outcome="submitted",
+    memory = CandidateMemory(
+        tmp_path / "candidate-memory.sqlite3",
+        private_root=tmp_path,
     )
+    queue_b = SmartJobQueue(tmp_path / "job-queue-b-queue.sqlite3")
+    queue_b.add_recommendations(
+        [
+            QueueCandidate(
+                job_id="job-queue-b",
+                source_url=source_url_b,
+                fit_score=99,
+                eligible=True,
+                decision="recommended",
+                evidence=("synthetic verified professional evidence",),
+                profile_revision="lifecycle-profile-v1",
+                matcher_policy_revision="lifecycle-policy-v1",
+            )
+        ]
+    )
+    planned = queue_b.plan_refill(open_urls=[])
+    queue_b.record_visible_snapshot(planned.urls_to_open, actor="agent")
 
-    assert queue_event_id_a == queue_event_id_b
     assert queue_a.queue_id != queue_b.queue_id
     assert queue_a.confirmed_outcome_events()[0].queue_id == queue_a.queue_id
-    assert queue_b.confirmed_outcome_events()[0].queue_id == queue_b.queue_id
+    assert memory.is_suppressed(source_url_a) is True
+    assert queue_b.history_for("job-queue-b")[-1].event_id + 1 == queue_event_id_a
 
     job_a = tracker.reconcile_queue_outcome(
         queue=queue_a,
@@ -354,22 +386,28 @@ def test_queue_outcome_reconciliation_namespaces_colliding_event_ids(tmp_path: P
         outcome="submitted",
         actor="user",
     )
-    job_b = tracker.reconcile_queue_outcome(
-        queue=queue_b,
-        queue_event_id=queue_event_id_b,
-        job_id="job-queue-b",
-        source_url=source_url_b,
-        outcome="submitted",
-        actor="user",
-    )
+    queue_b_history_before = queue_b.history_for("job-queue-b")
 
-    assert job_a.state == job_b.state == "submitted"
-    assert tracker.unique_manual_submitted_count() == 2
-    assert [
-        event.payload
-        for event in tracker.events_for("job-queue-b")
-        if event.category == "queue_outcome"
-    ] == [{"queue_event_id": queue_event_id_b, "queue_id": queue_b.queue_id}]
+    with pytest.raises(QueuePolicyError, match="queue scope") as raised:
+        queue_b.confirm_outcome(
+            "job-queue-b",
+            "submitted",
+            actor="user",
+            vacated=True,
+            candidate_memory=memory,
+        )
+
+    error_text = str(raised.value)
+    assert job_a.state == "submitted"
+    assert tracker.unique_manual_submitted_count() == 1
+    assert queue_b.get("job-queue-b").state == "open"
+    assert queue_b.confirmed_outcome_events() == ()
+    assert queue_b.history_for("job-queue-b") == queue_b_history_before
+    assert memory.is_suppressed(source_url_a) is True
+    assert memory.is_suppressed(source_url_b) is False
+    assert str(memory.database_path) not in error_text
+    assert queue_a.queue_id not in error_text
+    assert queue_b.queue_id not in error_text
 
 
 def test_queue_and_reconciliation_identities_survive_restart(tmp_path: Path):
@@ -392,7 +430,7 @@ def test_queue_and_reconciliation_identities_survive_restart(tmp_path: Path):
     queue_id = queue.queue_id
     planned = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
-    queue.confirm_outcome("job-durable", "skipped", actor="user")
+    _finalize_queue_outcome(queue, "job-durable", "skipped")
 
     reloaded = SmartJobQueue(queue_database)
 
@@ -564,7 +602,7 @@ def test_confirmed_queue_submission_replays_into_lifecycle_after_crash_without_d
     queue.add_recommendations([candidate])
     planned = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(planned.urls_to_open, actor="agent")
-    queue.confirm_outcome(candidate.job_id, "submitted", actor="user")
+    _finalize_queue_outcome(queue, candidate.job_id, "submitted")
 
     # Simulate a restart after the queue commit but before lifecycle received it.
     replayed_queue = SmartJobQueue(tmp_path / "queue.sqlite3")

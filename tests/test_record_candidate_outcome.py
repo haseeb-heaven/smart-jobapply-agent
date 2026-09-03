@@ -60,6 +60,14 @@ def _seed_open_queue_job(database_path: Path) -> QueueCandidate:
     return candidate
 
 
+def _seed_released_queue_job(database_path: Path) -> QueueCandidate:
+    candidate = _seed_open_queue_job(database_path)
+    queue = SmartJobQueue(database_path)
+    queue.record_visible_snapshot((), actor="synthetic-browser-bridge")
+    assert queue.get(candidate.job_id).state == "released"
+    return candidate
+
+
 def _arguments(queue_path: Path, memory_path: Path, *extra: str, outcome: str = "submitted") -> list[str]:
     return [
         "--queue-db",
@@ -135,6 +143,27 @@ def test_cli_records_only_allowed_candidate_confirmed_outcomes_with_redacted_std
     assert retry_exit_code == 0
     assert json.loads(retry_stdout) == {"status": "ok", "reconciled": 0}
     assert len(SmartJobQueue(queue_path).confirmed_outcome_events()) == 1
+    assert CandidateMemory(memory_path).is_suppressed(_URL) is True
+
+
+def test_cli_records_a_delayed_user_outcome_for_a_released_job_through_candidate_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queue_path, memory_path = _private_paths(tmp_path)
+    _seed_released_queue_job(queue_path)
+    cli = _load_cli_module()
+
+    def forbidden_browser_flow(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("outcome CLI must not perform browser queue work")
+
+    monkeypatch.setattr(SmartJobQueue, "record_visible_snapshot", forbidden_browser_flow)
+    monkeypatch.setattr(SmartJobQueue, "plan_refill", forbidden_browser_flow)
+
+    exit_code = _run_cli(monkeypatch, cli, _arguments(queue_path, memory_path, "--vacated"))
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "ok", "reconciled": 1}
+    assert SmartJobQueue(queue_path).get("cli-queue-job").state == "submitted"
     assert CandidateMemory(memory_path).is_suppressed(_URL) is True
 
 
@@ -231,3 +260,41 @@ def test_cli_blocks_wal_candidate_memory_without_mutating_queue_or_memory(
     assert _URL not in (captured.out + captured.err)
     assert SmartJobQueue(queue_path).get("cli-queue-job").state == "open"
     assert CandidateMemory(memory_path).is_suppressed(_URL) is False
+
+
+def test_cli_rejects_cross_candidate_queue_and_memory_pairing_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queue_path, memory_path = _private_paths(tmp_path)
+    queue_candidate = _seed_open_queue_job(queue_path)
+    other_profile_candidate = QueueCandidate(
+        job_id="other-profile-job",
+        source_url="https://www.indeed.com/viewjob?jk=other-profile-synthetic",
+        fit_score=95,
+        eligible=True,
+        decision="recommended",
+        evidence=("synthetic candidate-approved evidence",),
+        profile_revision="record-outcome-other-profile-v1",
+        matcher_policy_revision=_POLICY_REVISION,
+    )
+    other_profile_memory = CandidateMemory(memory_path)
+    other_queue = SmartJobQueue(memory_path.with_name("other-smart-queue.sqlite3"))
+    other_queue.add_recommendations([other_profile_candidate])
+    assert other_profile_memory.filter_unsuppressed_candidates(
+        [other_profile_candidate], queue=other_queue
+    ) == (
+        other_profile_candidate,
+    )
+    cli = _load_cli_module()
+
+    exit_code = _run_cli(monkeypatch, cli, _arguments(queue_path, memory_path, "--vacated"))
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert json.loads(captured.out) == {"status": "blocked", "reconciled": 0}
+    assert _URL not in (captured.out + captured.err)
+    assert "https://" not in (captured.out + captured.err)
+    assert SmartJobQueue(queue_path).get(queue_candidate.job_id).state == "open"
+    assert SmartJobQueue(queue_path).confirmed_outcome_events() == ()
+    assert other_profile_memory.is_suppressed(queue_candidate.source_url) is False
+    assert other_profile_memory.is_suppressed(other_profile_candidate.source_url) is False

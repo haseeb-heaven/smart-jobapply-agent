@@ -24,7 +24,7 @@ QueueState = Literal[
     "waiting",
     "open",
     "open_failed",
-    "awaiting_outcome",
+    "released",
     "submitted",
     "rejected",
     "skipped",
@@ -48,8 +48,8 @@ _CAPACITY_PROVENANCE_VALUES = frozenset(
 _INTAKE_REVISION_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _DECISIONS = frozenset({"recommended", "review", "reject"})
 _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
-# A missing tab still reserves its physical slot until the user confirms an outcome.
-_ACTIVE_STATES = frozenset({"waiting", "open", "awaiting_outcome"})
+# A missing tab is released without inferring an application outcome.
+_ACTIVE_STATES = frozenset({"waiting", "open"})
 _MAX_IDENTIFIER_LENGTH = 256
 _MAX_OPAQUE_JOB_ID_LENGTH = 128
 _MAX_URL_LENGTH = 4096
@@ -182,6 +182,17 @@ def _require_opaque_job_id(value: object) -> str:
 
 def _require_actor(value: object) -> str:
     return _require_identifier(value, "actor")
+
+
+def _require_user_vacated_outcome_actor(value: object, vacated: object) -> str:
+    """Require the candidate's exact dual outcome-and-vacancy attestation."""
+
+    actor = _require_actor(value)
+    if type(value) is not str or value != "user":
+        raise QueuePolicyError("an application outcome must be confirmed by the exact user actor")
+    if type(vacated) is not bool or vacated is not True:
+        raise QueuePolicyError("an application outcome requires explicit vacated=True confirmation")
+    return actor
 
 
 def _require_revision(value: object, label: str) -> str:
@@ -381,6 +392,38 @@ class SmartJobQueue:
         connection = self._connect()
         try:
             return self._read_active_revisions(connection)
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    def _candidate_memory_scope(
+        self,
+    ) -> tuple[str, tuple[str | None, str | None]]:
+        """Read the authenticated queue identity and active revisions together."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT queue_id, active_profile_revision, active_matcher_policy_revision
+                FROM smart_queue_metadata WHERE metadata_id = 1
+                """
+            ).fetchone()
+            if row is None:
+                raise QueueStorageError("smart queue identity is unavailable")
+            queue_id = self._require_stored_queue_id(row["queue_id"])
+            if queue_id != self.queue_id:
+                raise QueueStorageError("smart queue identity is inconsistent")
+            try:
+                revisions = _require_revision_pair(
+                    row["active_profile_revision"],
+                    row["active_matcher_policy_revision"],
+                    allow_unversioned=True,
+                )
+            except QueuePolicyError:
+                raise QueueStorageError("smart queue active revisions are invalid") from None
+            return queue_id, revisions
         except sqlite3.Error:
             raise QueueStorageError("smart queue storage operation failed") from None
         finally:
@@ -918,7 +961,7 @@ class SmartJobQueue:
             return str(row["outcome"])  # type: ignore[return-value]
         latest = str(row["latest_event"])
         if latest == "missing":
-            return "awaiting_outcome"
+            return "released"
         return latest  # type: ignore[return-value]
 
     @staticmethod
@@ -1157,21 +1200,78 @@ class SmartJobQueue:
             search_needed=max(0, vacancies - len(selected)),
         )
 
-    def record_visible_snapshot(self, visible_urls: Iterable[str], *, actor: str) -> None:
+    def refill_search_needed(self, *, open_urls: Iterable[str]) -> int:
+        """Return the current refill shortage without reserving candidates."""
+
+        visible_urls = self._normalize_snapshot(open_urls)
+        connection = self._connect()
+        try:
+            rows = self._rows(connection)
+            active_revisions = self._read_active_revisions(connection)
+            target_size = self._read_target_size(connection)
+            known_visible = self._known_visible_urls(rows, visible_urls)
+            occupied_urls = set(known_visible)
+            occupied_urls.update(
+                str(row["source_url"])
+                for row in rows
+                if self._state(row) in _ACTIVE_STATES
+            )
+            vacancies = max(0, target_size - len(occupied_urls))
+            available = sum(
+                1
+                for row in rows
+                if bool(row["eligible"])
+                and row["decision"] == "recommended"
+                and self._state(row) == "recommended"
+                and row["source_url"] not in visible_urls
+                and self._matches_active_revision(row, active_revisions)
+            )
+            return max(0, vacancies - available)
+        except (QueuePolicyError, QueueStorageError):
+            raise
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    def record_visible_snapshot(
+        self,
+        visible_urls: Iterable[str],
+        *,
+        actor: str,
+        recover_stale_waiting: bool = False,
+    ) -> tuple[str, ...]:
+        """Atomically reconcile one URL-only browser snapshot.
+
+        A reliable initial cycle snapshot may opt into recovering reservations
+        left ``waiting`` by an interrupted prior cycle. Visible reservations
+        become open; absent stale reservations become open failures and release
+        their slots. Follow-up snapshots must keep the default so reservations
+        created during the current cycle survive an unavailable observation.
+        """
+
         actor = _require_actor(actor)
+        if type(recover_stale_waiting) is not bool:
+            raise QueuePolicyError("recover_stale_waiting must be a boolean")
         normalized_visible = self._normalize_snapshot(visible_urls)
         connection = self._transaction()
         try:
             rows = self._rows(connection)
             self._known_visible_urls(rows, normalized_visible)
+            recovered_open_failed_job_ids: list[str] = []
             for row in rows:
                 state = self._state(row)
                 is_visible = str(row["source_url"]) in normalized_visible
                 if state == "waiting" and is_visible:
                     self._append_event(connection, str(row["job_id"]), "open", actor)
+                elif state == "waiting" and recover_stale_waiting:
+                    job_id = str(row["job_id"])
+                    self._append_event(connection, job_id, "open_failed", actor)
+                    recovered_open_failed_job_ids.append(job_id)
                 elif row["latest_visibility"] == "open" and not is_visible:
                     self._append_event(connection, str(row["job_id"]), "missing", actor)
             connection.commit()
+            return tuple(recovered_open_failed_job_ids)
         except QueuePolicyError:
             connection.rollback()
             raise
@@ -1222,47 +1322,36 @@ class SmartJobQueue:
         finally:
             self._close(connection)
 
-    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueJob:
-        job_id = _require_opaque_job_id(job_id)
-        raw_actor = actor
-        actor = _require_actor(actor)
-        if raw_actor != "user":
-            raise QueuePolicyError("an application outcome must be confirmed by the exact user actor")
-        if not isinstance(outcome, str) or outcome not in _OUTCOMES:
-            raise QueuePolicyError("outcome must be submitted, rejected, or skipped")
+    def confirm_outcome(
+        self,
+        job_id: str,
+        outcome: str,
+        *,
+        actor: str,
+        vacated: bool,
+        candidate_memory: object,
+    ) -> QueueJob:
+        """Finalize an outcome through the atomic candidate-memory boundary.
 
-        connection = self._transaction()
-        try:
-            row = next((item for item in self._rows(connection) if item["job_id"] == job_id), None)
-            if row is None:
-                raise KeyError("unknown job id")
-            if self._state(row) not in {"open", "awaiting_outcome"}:
-                raise QueuePolicyError(
-                    "an application outcome may be confirmed only for an open or awaiting_outcome listing"
-                )
-            self._append_event(connection, job_id, outcome, actor)
-            connection.commit()
-            result = self._job_from_row(row)
-            result = QueueJob(
-                job_id=result.job_id,
-                source_url=result.source_url,
-                fit_score=result.fit_score,
-                eligible=result.eligible,
-                decision=result.decision,
-                evidence=result.evidence,
-                state=outcome,  # type: ignore[arg-type]
-                profile_revision=result.profile_revision,
-                matcher_policy_revision=result.matcher_policy_revision,
-            )
-        except (QueuePolicyError, KeyError):
-            connection.rollback()
-            raise
-        except sqlite3.Error:
-            connection.rollback()
-            raise QueueStorageError("smart queue storage operation failed") from None
-        finally:
-            self._close(connection)
-        return result
+        A queue outcome is durable suppression state.  The public queue API
+        therefore delegates to :class:`CandidateMemory`, whose attached
+        SQLite transaction commits the queue event and suppression row together.
+        """
+
+        # Import only when this optional public convenience API is invoked:
+        # CandidateMemory imports SmartJobQueue at module load time.
+        from .candidate_memory import CandidateMemory
+
+        if not isinstance(candidate_memory, CandidateMemory):
+            raise QueuePolicyError("candidate_memory must be a CandidateMemory finalization authority")
+        candidate_memory.finalize_queue_outcome(
+            queue=self,
+            job_id=job_id,
+            outcome=outcome,
+            actor=actor,
+            vacated=vacated,
+        )
+        return self.get(job_id)
 
     def _confirm_outcome_with_candidate_memory(
         self,
@@ -1270,6 +1359,7 @@ class SmartJobQueue:
         outcome: str,
         *,
         actor: str,
+        vacated: bool,
         memory_database: Path,
     ) -> tuple[QueueEvent, str, str, bool]:
         """Atomically record one user outcome and its private suppression row.
@@ -1284,10 +1374,7 @@ class SmartJobQueue:
         """
 
         job_id = _require_opaque_job_id(job_id)
-        raw_actor = actor
-        actor = _require_actor(actor)
-        if raw_actor != "user":
-            raise QueuePolicyError("an application outcome must be confirmed by the exact user actor")
+        actor = _require_user_vacated_outcome_actor(actor, vacated)
         if not isinstance(outcome, str) or outcome not in _OUTCOMES:
             raise QueuePolicyError("outcome must be submitted, rejected, or skipped")
 
@@ -1307,12 +1394,69 @@ class SmartJobQueue:
             ):
                 raise QueueStorageError("atomic candidate outcome storage is unavailable")
             connection.execute("BEGIN IMMEDIATE")
+            queue_metadata = connection.execute(
+                """
+                SELECT queue_id, active_profile_revision, active_matcher_policy_revision
+                FROM smart_queue_metadata WHERE metadata_id = 1
+                """
+            ).fetchone()
+            if queue_metadata is None:
+                raise QueueStorageError("smart queue identity is unavailable")
+            transaction_queue_id = self._require_stored_queue_id(queue_metadata["queue_id"])
+            if transaction_queue_id != self.queue_id:
+                raise QueueStorageError("smart queue identity changed during outcome finalization")
+            try:
+                _require_revision_pair(
+                    queue_metadata["active_profile_revision"],
+                    queue_metadata["active_matcher_policy_revision"],
+                    allow_unversioned=False,
+                )
+            except QueuePolicyError:
+                raise QueuePolicyError(
+                    "active queue revisions are required for candidate memory"
+                ) from None
+            memory_scope = connection.execute(
+                """
+                SELECT queue_id
+                FROM candidate_memory.candidate_memory_queue_scope
+                WHERE scope_id = 1
+                """
+            ).fetchone()
+            if memory_scope is None:
+                legacy_memory = connection.execute(
+                    "SELECT 1 FROM candidate_memory.candidate_memory_outcomes LIMIT 1"
+                ).fetchone()
+                if legacy_memory is not None:
+                    raise QueueStorageError(
+                        "candidate memory queue scope is unavailable"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO candidate_memory.candidate_memory_queue_scope (
+                        scope_id, queue_id
+                    ) VALUES (1, ?)
+                    """,
+                    (transaction_queue_id,),
+                )
+            else:
+                try:
+                    stored_memory_queue_id = self._require_stored_queue_id(
+                        memory_scope["queue_id"]
+                    )
+                except QueueStorageError:
+                    raise QueueStorageError(
+                        "candidate memory queue scope is invalid"
+                    ) from None
+                if stored_memory_queue_id != transaction_queue_id:
+                    raise QueuePolicyError(
+                        "candidate memory queue scope does not match the authenticated queue"
+                    )
             row = next((item for item in self._rows(connection) if item["job_id"] == job_id), None)
             if row is None:
                 raise KeyError("unknown job id")
 
             state = self._state(row)
-            if state in {"open", "awaiting_outcome"}:
+            if state in {"open", "released"}:
                 event_id = self._append_event(connection, job_id, outcome, actor)
                 occurred_at = str(
                     connection.execute(
@@ -1336,7 +1480,7 @@ class SmartJobQueue:
                 occurred_at = str(existing_event["occurred_at"])
             else:
                 raise QueuePolicyError(
-                    "an application outcome may be confirmed only for an open or awaiting_outcome listing"
+                    "an application outcome may be confirmed only for an open or released listing"
                 )
 
             source_url = str(row["source_url"])
