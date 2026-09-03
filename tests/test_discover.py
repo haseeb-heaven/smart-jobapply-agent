@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).parents[1]
 DISCOVER_SCRIPT = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
@@ -1933,3 +1935,11 @@ def test_active_intake_queue_factory_requires_integrity_checked_candidate_capaci
     with pytest.raises(ValueError, match="revision|integrity|active"):
         discover.smart_queue_for_active_intake(tampered_path, tmp_path / "tampered.sqlite3")
     assert not (tmp_path / "tampered.sqlite3").exists()
+
+
+def test_discover_help_documents_current_recommendation_queue_default(capsys):
+    discover = load_discover_module()
+    with pytest.raises(SystemExit) as exc:
+        discover.main(["--help"])
+    assert exc.value.code == 0
+    assert "output/Current_Profile_Recommended_Queue.csv" in capsys.readouterr().out

@@ -25,8 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "output" / "Job_Application_Tracker.xlsx",
-        help="Output .csv path. The historical .xlsx default reports a clear tooling blocker.",
+        default=PROJECT_ROOT / "output" / "Job_Application_Tracker.csv",
+        help=(
+            "Output CSV tracker file (default: %(default)s). Explicit .xlsx paths stay blocked "
+            "until the approved workbook dependency is available."
+        ),
     )
     return parser.parse_args()
 

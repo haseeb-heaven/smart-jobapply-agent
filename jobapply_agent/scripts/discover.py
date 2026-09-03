@@ -1466,7 +1466,10 @@ def main(
         type=Path,
         nargs="?",
         const=PROJECT_ROOT / "output" / "Current_Profile_Recommended_Queue.csv",
-        help="Write a read-only CSV queue for the current profile revision; defaults to the local output directory.",
+        help=(
+            "Write a read-only CSV queue for the current profile revision; defaults to "
+            "output/Current_Profile_Recommended_Queue.csv."
+        ),
     )
     arguments = parser.parse_args(argv)
     try:

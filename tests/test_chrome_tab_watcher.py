@@ -479,3 +479,106 @@ def test_script_entrypoint_exits_cleanly_for_help(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(SystemExit) as exit_status:
         runpy.run_path(str(_SCRIPT_PATH), run_name="__main__")
     assert exit_status.value.code == 0
+
+
+class _FlakyListChrome(FakeChrome):
+    """Fails the first failing_cycles list_tab_urls calls, then succeeds."""
+
+    def __init__(self, failing_cycles: int):
+        super().__init__(())
+        self._failing_cycles = failing_cycles
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        if self._failing_cycles > 0:
+            self._failing_cycles -= 1
+            raise ChromeAutomationError("Chrome tab automation is unavailable")
+        return self.urls
+
+
+_STATUS_COUNTS_ZERO = {
+    "failed": 0,
+    "missing_before_reopen": 1,
+    "observed_open_tabs": 0,
+    "reopened": 1,
+}
+
+
+def _failure_lines(emitted: list[str]) -> list[str]:
+    return [line for line in emitted if json.loads(line).get("ok") is False]
+
+
+def test_run_watch_recovers_after_transient_failure_and_redacts_the_error_line():
+    emitted: list[str] = []
+    run_watch(
+        _FlakyListChrome(failing_cycles=1),
+        (JobTarget(LINKEDIN),),
+        interval_seconds=1,
+        max_cycles=2,
+        sleep=lambda _seconds: None,
+        emit=emitted.append,
+    )
+    assert len(emitted) == 2
+    assert json.loads(emitted[0]) == {"ok": False, "error": "ChromeAutomationError"}
+    assert json.loads(emitted[1]) == _STATUS_COUNTS_ZERO
+    failures = _failure_lines(emitted)
+    assert len(failures) == 1
+    assert LINKEDIN not in failures[0]
+    assert LINKEDIN not in json.dumps(json.loads(failures[0]))
+
+
+def test_run_watch_reraises_after_three_consecutive_failures():
+    emitted: list[str] = []
+    with pytest.raises(ChromeAutomationError):
+        run_watch(
+            _FlakyListChrome(failing_cycles=3),
+            (JobTarget(LINKEDIN),),
+            interval_seconds=1,
+            max_cycles=3,
+            sleep=lambda _seconds: None,
+            emit=emitted.append,
+        )
+    assert len(emitted) == 3
+    assert all(
+        json.loads(line) == {"ok": False, "error": "ChromeAutomationError"} for line in emitted
+    )
+
+
+def test_run_watch_unlimited_mode_reraises_after_three_consecutive_failures():
+    emitted: list[str] = []
+    with pytest.raises(ChromeAutomationError):
+        run_watch(
+            _FlakyListChrome(failing_cycles=3),
+            (JobTarget(LINKEDIN),),
+            interval_seconds=1,
+            max_cycles=None,
+            sleep=lambda _seconds: None,
+            emit=emitted.append,
+        )
+    assert len(emitted) == 3
+
+
+def test_run_watch_resets_failure_counter_after_a_successful_cycle():
+    emitted: list[str] = []
+    run_watch(
+        _FlakyListChrome(failing_cycles=2),
+        (JobTarget(LINKEDIN),),
+        interval_seconds=1,
+        max_cycles=3,
+        sleep=lambda _seconds: None,
+        emit=emitted.append,
+    )
+    assert [json.loads(line).get("ok") is False for line in emitted] == [True, True, False]
+    assert json.loads(emitted[-1]) == _STATUS_COUNTS_ZERO
+    assert all(LINKEDIN not in line for line in _failure_lines(emitted))
+
+
+def test_main_watch_returns_error_after_three_consecutive_failed_cycles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    manifest = _manifest(tmp_path / "valid.json", [{"url": LINKEDIN}])
+    monkeypatch.setattr(_MODULE, "ChromeAppleScript", lambda: _FlakyListChrome(failing_cycles=3))
+    assert main(["--manifest", str(manifest), "--watch", "--max-cycles", "3"]) == 2
+    assert json.loads(capsys.readouterr().err) == {
+        "ok": False,
+        "error": "ChromeAutomationError",
+    }
