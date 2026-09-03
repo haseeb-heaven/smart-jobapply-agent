@@ -242,6 +242,14 @@ def _validate_listing_url(url: str, platform: str) -> None:
     canonical_listing_url(url, platform)
 
 
+def _build_search_profile(entry: Mapping[str, str]) -> SearchProfile:
+    """Construct one validated profile, fail-closed when keywords are absent."""
+
+    if "keywords" not in entry:
+        raise ValueError("Search profiles must declare keywords")
+    return SearchProfile(**entry)
+
+
 def load_search_profiles(path: str | Path | None = None) -> tuple[SearchProfile, ...]:
     """Load this project's small, reviewable YAML profile shape without PyYAML."""
 
@@ -256,7 +264,7 @@ def load_search_profiles(path: str | Path | None = None) -> tuple[SearchProfile,
             continue
         if line.startswith("- "):
             if current:
-                profiles.append(SearchProfile(**current))
+                profiles.append(_build_search_profile(current))
             current = {}
             line = line[2:].strip()
         if current is not None and ":" in line:
@@ -265,5 +273,5 @@ def load_search_profiles(path: str | Path | None = None) -> tuple[SearchProfile,
             if key.strip() in {"platform", "keywords", "location"}:
                 current[key.strip()] = value
     if current:
-        profiles.append(SearchProfile(**current))
+        profiles.append(_build_search_profile(current))
     return tuple(profiles)

@@ -164,6 +164,9 @@ def load_scoring_rules(path: str | None = None) -> dict[str, Any]:
             section = rules.setdefault(active_section, {})
             if isinstance(section, dict):
                 section[key.strip()] = _parse_scalar(value)
+    for section in ("weights", "thresholds"):
+        if not isinstance(rules[section], Mapping):
+            raise ValueError(f"scoring rule section {section!r} must be a mapping")
     return rules
 
 

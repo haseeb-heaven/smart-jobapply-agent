@@ -28,6 +28,18 @@ def _normalized_strings(value: Any) -> tuple[str, ...]:
     )
 
 
+DEFAULT_EXCLUDED_TITLE_TERMS: tuple[str, ...] = (
+    "senior",
+    "staff",
+    "principal",
+    "lead",
+    "architect",
+    "manager",
+    "head",
+    "director",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class JobRequirement:
     """One validated listing requirement consumed by deterministic policy.
@@ -60,16 +72,7 @@ class CandidateProfile:
     learning_or_exposure_skills: tuple[str, ...] = ()
     years_experience: int | None = None
     role_targets: tuple[str, ...] = ()
-    excluded_title_terms: tuple[str, ...] = (
-        "senior",
-        "staff",
-        "principal",
-        "lead",
-        "architect",
-        "manager",
-        "head",
-        "director",
-    )
+    excluded_title_terms: tuple[str, ...] = DEFAULT_EXCLUDED_TITLE_TERMS
     mandatory_excluded_requirements: tuple[str, ...] = ()
     location_preferences: tuple[str, ...] = ()
     work_mode_preferences: tuple[str, ...] = ()
@@ -186,8 +189,11 @@ class CandidateProfile:
                 experience.get("years_experience", experience.get("total_years")),
             ),
             role_targets=_as_strings(data.get("role_targets", roles.get("include", positioning.get("focus", ())))),
-            excluded_title_terms=_as_strings(data.get("exclude_title_terms", roles.get("exclude_title_terms", ())))
-            or cls.excluded_title_terms,
+            excluded_title_terms=_as_strings(
+                data.get("exclude_title_terms", roles.get("exclude_title_terms"))
+                if "exclude_title_terms" in data or "exclude_title_terms" in roles
+                else DEFAULT_EXCLUDED_TITLE_TERMS
+            ),
             mandatory_excluded_requirements=_as_strings(
                 data.get("mandatory_excluded_requirements", hard_exclusions.get("mandatory_requirements", ()))
             ),

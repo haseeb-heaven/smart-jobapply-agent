@@ -581,3 +581,315 @@ def test_confirmed_queue_submission_replays_into_lifecycle_after_crash_without_d
     assert replayed_queue.confirmed_submitted_count() == 1
     assert replayed_tracker.unique_manual_submitted_count() == 1
     assert replayed_tracker.get_job(candidate.job_id).state == "submitted"
+
+
+def test_queue_identity_mismatch_fails_closed_without_lifecycle_change(tmp_path: Path):
+    source_url_a = "https://www.linkedin.com/jobs/view/job-queue-a"
+    source_url_b = "https://www.linkedin.com/jobs/view/job-queue-b"
+    queue_a, queue_event_id_a = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-queue-a",
+        source_url=source_url_a,
+        outcome="submitted",
+    )
+    queue_b, queue_event_id_b = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-queue-b",
+        source_url=source_url_b,
+        outcome="submitted",
+    )
+    assert queue_event_id_a == queue_event_id_b
+    assert queue_a.queue_id != queue_b.queue_id
+
+    tracker = LifecycleTracker(tmp_path / "lifecycle.sqlite3")
+    with pytest.raises(InvalidLifecycleTransition, match="authenticated"):
+        tracker.reconcile_queue_outcome(
+            queue=queue_a,
+            queue_event_id=queue_event_id_a,
+            job_id="job-queue-b",
+            source_url=source_url_b,
+            outcome="submitted",
+            actor="user",
+        )
+    with pytest.raises(InvalidLifecycleTransition, match="authenticated"):
+        tracker.reconcile_queue_outcome(
+            queue=queue_b,
+            queue_event_id=queue_event_id_b,
+            job_id="job-queue-a",
+            source_url=source_url_a,
+            outcome="submitted",
+            actor="user",
+        )
+
+    assert tracker.unique_manual_submitted_count() == 0
+    with pytest.raises(KeyError):
+        tracker.get_job("job-queue-b")
+    with sqlite3.connect(tmp_path / "lifecycle.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lifecycle_queue_reconciliations").fetchone()[0] == 0
+
+    job_a = tracker.reconcile_queue_outcome(
+        queue=queue_a,
+        queue_event_id=queue_event_id_a,
+        job_id="job-queue-a",
+        source_url=source_url_a,
+        outcome="submitted",
+        actor="user",
+    )
+    assert job_a.state == "submitted"
+    assert tracker.unique_manual_submitted_count() == 1
+
+
+def test_job_identity_mismatch_fails_closed_without_lifecycle_change(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "two-job-queue.sqlite3")
+    queue.add_recommendations(
+        [
+            QueueCandidate(
+                job_id=f"job-{number}",
+                source_url=f"https://www.linkedin.com/jobs/view/job-{number}",
+                fit_score=100 - number,
+                eligible=True,
+                decision="recommended",
+                evidence=("synthetic verified professional evidence",),
+                profile_revision="lifecycle-profile-v1",
+                matcher_policy_revision="lifecycle-policy-v1",
+            )
+            for number in range(1, 3)
+        ]
+    )
+    queue.plan_refill(open_urls=[])
+    queue.confirm_outcome("job-1", "submitted", actor="user")
+    queue.confirm_outcome("job-2", "submitted", actor="user")
+    job_1_event, job_2_event = queue.confirmed_outcome_events()
+    assert job_1_event.event_id != job_2_event.event_id
+
+    tracker = LifecycleTracker(tmp_path / "lifecycle.sqlite3")
+    with pytest.raises(InvalidLifecycleTransition, match="facts do not match"):
+        tracker.reconcile_queue_outcome(
+            queue=queue,
+            queue_event_id=job_1_event.event_id,
+            job_id="job-2",
+            source_url="https://www.linkedin.com/jobs/view/job-2",
+            outcome="submitted",
+            actor="user",
+        )
+
+    assert tracker.unique_manual_submitted_count() == 0
+    with pytest.raises(KeyError):
+        tracker.get_job("job-1")
+    with pytest.raises(KeyError):
+        tracker.get_job("job-2")
+    with sqlite3.connect(tmp_path / "lifecycle.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lifecycle_queue_reconciliations").fetchone()[0] == 0
+
+
+def test_submitted_reconciliation_fails_closed_on_canonical_url_mismatch(tmp_path: Path):
+    tracker = LifecycleTracker(tmp_path / "lifecycle.sqlite3")
+    source_url = "https://www.linkedin.com/jobs/view/job-url"
+    queue, queue_event_id = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-url",
+        source_url=source_url,
+        outcome="submitted",
+    )
+
+    with pytest.raises(InvalidLifecycleTransition, match="facts do not match"):
+        tracker.reconcile_queue_outcome(
+            queue=queue,
+            queue_event_id=queue_event_id,
+            job_id="job-url",
+            source_url="https://www.linkedin.com/jobs/view/job-other",
+            outcome="submitted",
+            actor="user",
+        )
+
+    assert tracker.unique_manual_submitted_count() == 0
+    with pytest.raises(KeyError):
+        tracker.get_job("job-url")
+
+    replayed = tracker.reconcile_queue_outcome(
+        queue=queue,
+        queue_event_id=queue_event_id,
+        job_id="job-url",
+        source_url=source_url,
+        outcome="submitted",
+        actor="user",
+    )
+    assert replayed.state == "submitted"
+    assert tracker.unique_manual_submitted_count() == 1
+
+
+def test_submitted_reconciliation_rejects_a_non_submitted_queue_event(tmp_path: Path):
+    tracker = LifecycleTracker(tmp_path / "lifecycle.sqlite3")
+    source_url = "https://www.indeed.com/viewjob?jk=job-reject"
+    queue, queue_event_id = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-reject",
+        source_url=source_url,
+        outcome="rejected",
+    )
+
+    with pytest.raises(InvalidLifecycleTransition, match="facts do not match"):
+        tracker.reconcile_queue_outcome(
+            queue=queue,
+            queue_event_id=queue_event_id,
+            job_id="job-reject",
+            source_url=source_url,
+            outcome="submitted",
+            actor="user",
+        )
+
+    assert tracker.unique_manual_submitted_count() == 0
+    with pytest.raises(KeyError):
+        tracker.get_job("job-reject")
+
+
+@pytest.mark.parametrize("before_state", ["opened", "submitted", "interview"])
+def test_rejected_reconciliation_only_changes_lifecycle_from_submitted_or_interview(
+    tmp_path: Path, before_state: str
+):
+    tracker = LifecycleTracker(tmp_path / f"lifecycle-{before_state}.sqlite3")
+    if before_state == "opened":
+        _advance_to_opened(tracker, "job-rejected")
+    elif before_state == "submitted":
+        _advance_to_submitted(tracker, "job-rejected")
+    else:
+        _advance_to_submitted(tracker, "job-rejected")
+        tracker.transition("job-rejected", "interview", actor="user")
+
+    source_url = "https://www.linkedin.com/jobs/view/job-rejected"
+    queue, queue_event_id = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-rejected",
+        source_url=source_url,
+        outcome="rejected",
+    )
+    job = tracker.reconcile_queue_outcome(
+        queue=queue,
+        queue_event_id=queue_event_id,
+        job_id="job-rejected",
+        source_url=source_url,
+        outcome="rejected",
+        actor="user",
+    )
+
+    lifecycle_events = [
+        event.name for event in tracker.events_for("job-rejected") if event.category == "lifecycle"
+    ]
+    if before_state in {"submitted", "interview"}:
+        assert job.state == "rejected"
+        assert lifecycle_events[-1] == "rejected"
+    else:
+        assert job.state == before_state
+        assert "rejected" not in lifecycle_events
+    assert tracker.unique_manual_submitted_count() == (1 if before_state != "opened" else 0)
+
+
+def test_legacy_unscoped_reconciliation_fails_closed_before_reauthentication(tmp_path: Path):
+    database = tmp_path / "legacy-lifecycle.sqlite3"
+    source_url = "https://www.linkedin.com/jobs/view/job-legacy"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            f"""
+            CREATE TABLE lifecycle_jobs (
+                job_id TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL UNIQUE,
+                shortlisted_at TEXT NOT NULL
+            );
+            CREATE TABLE lifecycle_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL REFERENCES lifecycle_jobs(job_id),
+                category TEXT NOT NULL,
+                name TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            );
+            CREATE TABLE lifecycle_rounds (
+                round_id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE lifecycle_round_jobs (
+                round_id TEXT NOT NULL REFERENCES lifecycle_rounds(round_id),
+                job_id TEXT NOT NULL REFERENCES lifecycle_jobs(job_id),
+                position INTEGER NOT NULL,
+                PRIMARY KEY (round_id, job_id),
+                UNIQUE (round_id, position)
+            );
+            CREATE TABLE lifecycle_queue_reconciliations (
+                queue_event_id INTEGER PRIMARY KEY CHECK(queue_event_id > 0),
+                job_id TEXT NOT NULL REFERENCES lifecycle_jobs(job_id),
+                source_url TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('submitted', 'rejected', 'skipped')),
+                actor TEXT NOT NULL CHECK(actor = 'user'),
+                reconciled_at TEXT NOT NULL
+            );
+            INSERT INTO lifecycle_jobs VALUES ('job-legacy', '{source_url}', '2026-09-01T00:00:00+00:00');
+            INSERT INTO lifecycle_events (
+                job_id, category, name, actor, payload_json, occurred_at
+            ) VALUES (
+                'job-legacy', 'lifecycle', 'shortlisted', 'agent', '{{}}', '2026-09-01T00:00:00+00:00'
+            );
+            INSERT INTO lifecycle_queue_reconciliations VALUES (
+                3, 'job-legacy', '{source_url}', 'skipped', 'user', '2026-09-01T00:00:01+00:00'
+            );
+            """
+        )
+
+    tracker = LifecycleTracker(database)
+    queue, queue_event_id = _confirmed_queue_outcome(
+        tmp_path,
+        job_id="job-legacy",
+        source_url=source_url,
+        outcome="skipped",
+    )
+    assert queue_event_id == 3
+
+    with pytest.raises(InvalidLifecycleTransition, match="unscoped legacy"):
+        tracker.reconcile_queue_outcome(
+            queue=queue,
+            queue_event_id=queue_event_id,
+            job_id="job-legacy",
+            source_url=source_url,
+            outcome="skipped",
+            actor="user",
+        )
+
+    with sqlite3.connect(database) as connection:
+        reconciliation_rows = connection.execute(
+            "SELECT queue_id, queue_event_id FROM lifecycle_queue_reconciliations"
+        ).fetchall()
+        queue_outcome_events = connection.execute(
+            "SELECT COUNT(*) FROM lifecycle_events WHERE category = 'queue_outcome'"
+        ).fetchone()[0]
+    assert reconciliation_rows == [("legacy-unscoped", 3)]
+    assert queue_outcome_events == 0
+    assert tracker.get_job("job-legacy").state == "shortlisted"
+
+
+@pytest.mark.parametrize("actor", ["agent", "host", "browser-bridge", "USER"])
+def test_reconciliation_requires_the_exact_user_actor_before_any_lifecycle_change(
+    tmp_path: Path, actor: str
+):
+    tracker = LifecycleTracker(tmp_path / f"lifecycle-{actor}.sqlite3")
+    source_url = f"https://www.linkedin.com/jobs/view/job-auth-{actor.lower()}"
+    queue, queue_event_id = _confirmed_queue_outcome(
+        tmp_path,
+        job_id=f"job-auth-{actor.lower()}",
+        source_url=source_url,
+        outcome="submitted",
+    )
+
+    with pytest.raises(InvalidLifecycleTransition, match="user"):
+        tracker.reconcile_queue_outcome(
+            queue=queue,
+            queue_event_id=queue_event_id,
+            job_id=f"job-auth-{actor.lower()}",
+            source_url=source_url,
+            outcome="submitted",
+            actor=actor,
+        )
+
+    assert tracker.unique_manual_submitted_count() == 0
+    with pytest.raises(KeyError):
+        tracker.get_job(f"job-auth-{actor.lower()}")
