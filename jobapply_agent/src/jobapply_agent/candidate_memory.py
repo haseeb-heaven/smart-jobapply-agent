@@ -463,3 +463,53 @@ class CandidateMemory:
             raise CandidateMemoryStorageError("candidate memory storage operation failed") from None
         finally:
             connection.close()
+
+    def discard_outcome_empty_queue_scope(self) -> None:
+        """Roll back a newly bound queue scope while outcomes stay empty.
+
+        This is the rollback half of scope binding during admission.  It is a
+        no-op when no scope row exists and fails closed without mutating
+        anything once any outcome has been recorded.
+        """
+
+        connection = self._connect(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            scope_row = connection.execute(
+                "SELECT queue_id FROM candidate_memory_queue_scope WHERE scope_id = 1"
+            ).fetchone()
+            if scope_row is None:
+                connection.commit()
+                return
+            has_outcome = connection.execute(
+                "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+            ).fetchone()
+            if has_outcome is not None:
+                raise CandidateMemoryPolicyError(
+                    "candidate memory queue scope is discarded only while outcomes are empty"
+                )
+            # The no-delete trigger keeps the scope immutable for normal
+            # traffic, so this rollback path drops and recreates it inside
+            # the same transaction as the single scope-row deletion.
+            connection.execute(
+                "DROP TRIGGER IF EXISTS candidate_memory_queue_scope_no_delete"
+            )
+            connection.execute("DELETE FROM candidate_memory_queue_scope WHERE scope_id = 1")
+            connection.execute(
+                """
+                CREATE TRIGGER candidate_memory_queue_scope_no_delete
+                BEFORE DELETE ON candidate_memory_queue_scope
+                BEGIN
+                    SELECT RAISE(ABORT, 'candidate memory queue scope is immutable');
+                END
+                """
+            )
+            connection.commit()
+        except CandidateMemoryPolicyError:
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise CandidateMemoryStorageError("candidate memory storage operation failed") from None
+        finally:
+            connection.close()

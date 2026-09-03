@@ -43,6 +43,76 @@ def _candidate(
         profile_revision=profile_revision,
         matcher_policy_revision=matcher_policy_revision,
     )
+def _scope_queue_ids(memory: CandidateMemory) -> list[str]:
+    with sqlite3.connect(memory.database_path) as connection:
+        return [
+            row[0]
+            for row in connection.execute(
+                "SELECT queue_id FROM candidate_memory_queue_scope ORDER BY scope_id"
+            ).fetchall()
+        ]
+
+
+def _bind_empty_memory_scope(
+    tmp_path: Path,
+) -> tuple[SmartJobQueue, QueueCandidate, CandidateMemory]:
+    queue = SmartJobQueue(tmp_path / "smart-queue.sqlite3", target_size=1)
+    candidate = _candidate("scope-job", _LINKEDIN_URL)
+    queue.add_recommendations([candidate])
+    memory = CandidateMemory(
+        tmp_path / "private" / "candidate-memory.sqlite3",
+        private_root=tmp_path / "private",
+    )
+    assert memory.filter_unsuppressed_candidates([candidate], queue=queue) == (candidate,)
+    assert _scope_queue_ids(memory) == [queue.queue_id]
+    return queue, candidate, memory
+
+
+def test_discard_outcome_empty_queue_scope_discards_newly_bound_scope_once(tmp_path: Path) -> None:
+    queue, candidate, memory = _bind_empty_memory_scope(tmp_path)
+
+    memory.discard_outcome_empty_queue_scope()
+
+    assert _scope_queue_ids(memory) == []
+
+    memory.discard_outcome_empty_queue_scope()
+
+    assert _scope_queue_ids(memory) == []
+    assert memory.is_suppressed(candidate.source_url) is False
+
+    assert memory.filter_unsuppressed_candidates([candidate], queue=queue) == (candidate,)
+    assert _scope_queue_ids(memory) == [queue.queue_id]
+
+
+def test_discard_outcome_empty_queue_scope_fails_closed_with_recorded_outcomes(
+    tmp_path: Path,
+) -> None:
+    queue, candidate, memory = _bind_empty_memory_scope(tmp_path)
+    with sqlite3.connect(memory.database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO candidate_memory_outcomes
+                (queue_id, event_id, job_id, source_url, outcome, actor, vacated, recorded_at)
+            VALUES (?, 1, ?, ?, 'submitted', 'user', 1, '2026-09-03T00:00:00+00:00')
+            """,
+            (queue.queue_id, candidate.job_id, candidate.source_url),
+        )
+
+    with pytest.raises(CandidateMemoryPolicyError, match="outcomes are empty"):
+        memory.discard_outcome_empty_queue_scope()
+
+    assert _scope_queue_ids(memory) == [queue.queue_id]
+
+
+def test_discard_outcome_empty_queue_scope_is_a_noop_without_a_scope_row(tmp_path: Path) -> None:
+    memory = CandidateMemory(
+        tmp_path / "private" / "candidate-memory.sqlite3",
+        private_root=tmp_path / "private",
+    )
+
+    memory.discard_outcome_empty_queue_scope()
+
+    assert _scope_queue_ids(memory) == []
 
 
 def _queue_with_open_job(tmp_path: Path, *, job_id: str = "queue-job", url: str = _LINKEDIN_URL) -> tuple[SmartJobQueue, QueueCandidate]:
@@ -111,6 +181,37 @@ def test_memory_keeps_canonical_linkedin_and_indeed_listing_identities_independe
     assert memory.is_suppressed(_LINKEDIN_URL) is True
     assert memory.is_suppressed(_INDEED_URL) is True
     assert memory.filter_unsuppressed_candidates([linkedin, indeed], queue=queue) == ()
+
+
+def test_memory_filters_suppressed_candidates_before_queue_admission_without_mutating_the_queue(
+    tmp_path: Path,
+) -> None:
+    """Suppression returns only candidates safe for a later admission step."""
+
+    queue, suppressed = _queue_with_open_job(tmp_path)
+    private_root = tmp_path / "private"
+    memory = CandidateMemory(private_root / "candidate-memory.sqlite3", private_root=private_root)
+    memory.finalize_queue_outcome(
+        queue=queue,
+        job_id=suppressed.job_id,
+        outcome="skipped",
+        actor="user",
+        vacated=True,
+    )
+    unsuppressed = _candidate(
+        "not-yet-admitted-job",
+        "https://www.linkedin.com/jobs/view/910002?utm_source=synthetic",
+    )
+
+    admitted = memory.filter_unsuppressed_candidates((suppressed, unsuppressed), queue=queue)
+
+    assert admitted == (unsuppressed,)
+    with pytest.raises(KeyError):
+        queue.get(unsuppressed.job_id)
+    with sqlite3.connect(memory.database_path) as connection:
+        assert connection.execute(
+            "SELECT queue_id FROM candidate_memory_queue_scope WHERE scope_id = 1"
+        ).fetchone() == (queue.queue_id,)
 
 
 def test_finalization_atomically_records_a_released_outcome_and_its_suppression_row(tmp_path: Path) -> None:
