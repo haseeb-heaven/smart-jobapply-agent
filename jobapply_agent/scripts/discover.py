@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 from tempfile import NamedTemporaryFile
 from typing import Any, Mapping, Sequence
@@ -43,6 +44,8 @@ from jobapply_agent.sources import MappingVisiblePageAdapter, load_search_profil
 DEFAULT_CANDIDATE_PROFILE_PATH = PROJECT_ROOT / "private" / "candidate_profile.yaml"
 DEFAULT_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private" / "candidate_intake.json"
 REDACTED_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private.example" / "candidate_intake.json"
+_INTERACTIVE_PRIVATE_ROOT = PROJECT_ROOT / "private"
+_INTERACTIVE_PATH_ERROR = "Interactive onboarding intake path is not permitted."
 INTERACTIVE_CONFIRMATION_TOKEN = "yes"
 _UNSET_QUEUE_CAPACITY = object()
 _JSON_STRING_LIST_FIELDS = frozenset(
@@ -656,6 +659,100 @@ def _read_candidate_intake(path: Path) -> Mapping[str, Any]:
     return payload
 
 
+class _InteractivePathPolicyError(ValueError):
+    """Reject an interactive intake location without disclosing that location."""
+
+
+def _raise_interactive_path_error() -> None:
+    raise _InteractivePathPolicyError(_INTERACTIVE_PATH_ERROR)
+
+
+def _is_link_like(path: Path, status: os.stat_result) -> bool:
+    """Recognize links, Windows junctions, and other reparse-point indirection."""
+
+    if stat.S_ISLNK(status.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(getattr(status, "st_file_attributes", 0) & reparse_flag)
+
+
+def _validated_interactive_intake_path(
+    intake_path: Path,
+    *,
+    _private_root: Path | None = None,
+) -> Path:
+    """Return a canonical regular-file target confined to the interactive root.
+
+    ``_private_root`` is an internal dependency-injection seam for isolated unit
+    tests. Production CLI callers cannot set it through arguments or the
+    environment.
+    """
+
+    try:
+        if not isinstance(intake_path, Path) or not str(intake_path).strip():
+            _raise_interactive_path_error()
+        if ".." in intake_path.parts:
+            _raise_interactive_path_error()
+
+        root_value = _INTERACTIVE_PRIVATE_ROOT if _private_root is None else _private_root
+        if not isinstance(root_value, Path) or not str(root_value).strip():
+            _raise_interactive_path_error()
+
+        root = Path(os.path.abspath(root_value))
+        candidate = Path(os.path.abspath(intake_path))
+        if candidate == root or not candidate.is_relative_to(root):
+            _raise_interactive_path_error()
+
+        root_status = os.lstat(root)
+        if _is_link_like(root, root_status) or not stat.S_ISDIR(root_status.st_mode):
+            _raise_interactive_path_error()
+        canonical_root = root.resolve(strict=True)
+        canonical_candidate = candidate.resolve(strict=False)
+        if canonical_candidate == canonical_root or not canonical_candidate.is_relative_to(
+            canonical_root
+        ):
+            _raise_interactive_path_error()
+
+        relative_candidate = candidate.relative_to(root)
+        current = canonical_root
+        for index, component in enumerate(relative_candidate.parts):
+            current /= component
+            try:
+                current_status = os.lstat(current)
+            except FileNotFoundError:
+                continue
+            if _is_link_like(current, current_status):
+                _raise_interactive_path_error()
+            is_target = index == len(relative_candidate.parts) - 1
+            if is_target:
+                if not stat.S_ISREG(current_status.st_mode):
+                    _raise_interactive_path_error()
+            elif not stat.S_ISDIR(current_status.st_mode):
+                _raise_interactive_path_error()
+        return canonical_candidate
+    except _InteractivePathPolicyError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _InteractivePathPolicyError(_INTERACTIVE_PATH_ERROR) from None
+
+
+def _read_interactive_candidate_intake(
+    intake_path: Path,
+    *,
+    _private_root: Path | None = None,
+) -> Mapping[str, Any]:
+    """Validate immediately before reading an interactive intake."""
+
+    validated_path = _validated_interactive_intake_path(
+        intake_path,
+        _private_root=_private_root,
+    )
+    return _read_candidate_intake(validated_path)
+
+
 def _question_draft_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     """Select draft fields without exposing the source payload."""
 
@@ -1001,12 +1098,20 @@ def _intake_question_bundle(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _interactive_onboarding_draft(intake_path: Path) -> dict[str, Any]:
+def _interactive_onboarding_draft(
+    intake_path: Path,
+    *,
+    _private_root: Path | None = None,
+) -> dict[str, Any]:
     """Load the explicit target or the redacted starter without creating either."""
 
+    validated_path = _validated_interactive_intake_path(
+        intake_path,
+        _private_root=_private_root,
+    )
     payload = (
-        _read_candidate_intake(intake_path)
-        if intake_path.exists()
+        _read_interactive_candidate_intake(validated_path, _private_root=_private_root)
+        if validated_path.exists()
         else _read_candidate_intake(REDACTED_CANDIDATE_INTAKE_PATH)
     )
     return validate_candidate_intake(_question_draft_payload(payload))
@@ -1090,24 +1195,57 @@ def _record_interactive_answer(draft: dict[str, Any], *, group: str, field: str,
         draft["pending_facts"] = [item for item in draft["pending_facts"] if item["field"] != field]
 
 
-def _persist_active_candidate_intake(intake_path: Path, active_intake: Mapping[str, Any]) -> None:
-    """Atomically replace only the explicitly supplied local intake path."""
+def _persist_active_candidate_intake(
+    intake_path: Path,
+    active_intake: Mapping[str, Any],
+    *,
+    _private_root: Path | None = None,
+) -> None:
+    """Atomically replace an interactive intake confined to its private root."""
 
-    intake_path.parent.mkdir(parents=True, exist_ok=True)
+    validated_path = _validated_interactive_intake_path(
+        intake_path,
+        _private_root=_private_root,
+    )
+    validated_path.parent.mkdir(parents=True, exist_ok=True)
+    validated_path = _validated_interactive_intake_path(
+        validated_path,
+        _private_root=_private_root,
+    )
     temporary_path: Path | None = None
     try:
-        with NamedTemporaryFile("w", encoding="utf-8", dir=intake_path.parent, delete=False) as stream:
+        validated_path = _validated_interactive_intake_path(
+            validated_path,
+            _private_root=_private_root,
+        )
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=validated_path.parent,
+            delete=False,
+        ) as stream:
             temporary_path = Path(stream.name)
             json.dump(active_intake, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        temporary_path.replace(intake_path)
+        validated_path = _validated_interactive_intake_path(
+            validated_path,
+            _private_root=_private_root,
+        )
+        temporary_path.replace(validated_path)
         temporary_path = None
-        _sync_parent_directory(intake_path.parent)
+        validated_path = _validated_interactive_intake_path(
+            validated_path,
+            _private_root=_private_root,
+        )
+        _sync_parent_directory(validated_path.parent)
     except BaseException:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
 
 
@@ -1144,11 +1282,22 @@ def _interactive_confirmation_prompt(
     )
 
 
-def _run_interactive_onboarding(intake_path: Path) -> int:
+def _run_interactive_onboarding(
+    intake_path: Path,
+    *,
+    _private_root: Path | None = None,
+) -> int:
     """Collect explicit candidate answers and activate only after final confirmation."""
 
-    if intake_path.exists():
-        existing_intake = _read_candidate_intake(intake_path)
+    validated_path = _validated_interactive_intake_path(
+        intake_path,
+        _private_root=_private_root,
+    )
+    if validated_path.exists():
+        existing_intake = _read_interactive_candidate_intake(
+            validated_path,
+            _private_root=_private_root,
+        )
         if existing_intake.get("state") == "active":
             try:
                 validate_active_candidate_profile(existing_intake)
@@ -1158,7 +1307,10 @@ def _run_interactive_onboarding(intake_path: Path) -> int:
             print("Candidate intake is already active; interactive onboarding made no changes.")
             return 0
 
-    draft = _interactive_onboarding_draft(intake_path)
+    draft = _interactive_onboarding_draft(
+        validated_path,
+        _private_root=_private_root,
+    )
     collected_safe_fields: list[str] = []
     unresolved_safe_fields: list[str] = []
     candidate_confirmed_fields: set[str] = set()
@@ -1207,7 +1359,11 @@ def _run_interactive_onboarding(intake_path: Path) -> int:
 
     active_intake = activate_candidate_profile(draft, actor="user")
     try:
-        _persist_active_candidate_intake(intake_path, active_intake)
+        _persist_active_candidate_intake(
+            validated_path,
+            active_intake,
+            _private_root=_private_root,
+        )
     except KeyboardInterrupt:
         print("Interactive onboarding was interrupted while saving; inspect the intake before retrying.", file=sys.stderr)
         return 2
@@ -1264,7 +1420,11 @@ def export_current_profile_recommendation_queue(
     return len(rows)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    _private_root: Path | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description="Export only 85+ profile-fit jobs from injected visible-page JSON.")
     parser.add_argument("--visible-payloads", type=Path, help="Offline JSON mapping of visible search URLs to listing payloads.")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data", help="Local directory for state, exports, and run logs.")
@@ -1272,7 +1432,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--candidate-intake",
         type=Path,
-        help="Required active, user-confirmed candidate intake revision.",
+        help=(
+            "Required candidate intake revision. Interactive onboarding may write only to a "
+            "validated regular-file target beneath this script's private directory."
+        ),
     )
     parser.add_argument(
         "--show-intake-questions",
@@ -1282,7 +1445,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--interactive-onboarding",
         action="store_true",
-        help="Collect explicit candidate answers locally and activate only after exact lowercase 'yes' confirmation.",
+        help=(
+            "Collect explicit candidate answers locally, writing only beneath this script's "
+            "private directory after exact lowercase 'yes' confirmation."
+        ),
     )
     parser.add_argument(
         "--onboarding-format",
@@ -1309,7 +1475,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.interactive_onboarding and arguments.show_intake_questions:
             raise ValueError("interactive onboarding and question-display modes cannot be combined")
         if arguments.interactive_onboarding:
-            return _run_interactive_onboarding(arguments.candidate_intake)
+            return _run_interactive_onboarding(
+                arguments.candidate_intake,
+                _private_root=_private_root,
+            )
         if arguments.show_intake_questions:
             raw_candidate_intake = (
                 _read_candidate_intake(arguments.candidate_intake)

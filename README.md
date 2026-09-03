@@ -406,6 +406,24 @@ python jobapply_agent/scripts/discover.py \
   --interactive-onboarding
 ```
 
+Interactive onboarding is the CLI's only onboarding mode that writes candidate
+data. Its `--candidate-intake` target must resolve beneath the script-local
+`jobapply_agent/private/` directory. The command rejects paths that escape that
+directory, including arbitrary absolute locations, traversal and sibling-prefix
+paths, links or junctions, directories, and other non-regular existing targets.
+This private-root boundary is fixed for CLI use; there is no command-line or
+environment override. The read-only `--show-intake-questions` mode and all
+noninteractive discovery and export paths retain their existing caller-supplied
+path flexibility.
+
+Path validation is repeated around interactive reads, directory creation, and
+atomic replacement to reduce namespace-change and time-of-check/time-of-use
+(TOCTOU) exposure. It does not eliminate races caused by another process running
+as the same user. The private directory must therefore remain single-user with
+mode `0700` (or equivalent owner-only access on platforms without POSIX modes),
+and no untrusted same-user process should be allowed to mutate that namespace
+during onboarding.
+
 Interactive onboarding starts from the repository's redacted draft shape when
 the target does not exist. It stores only explicit candidate-approved facts and
 never parses resumes, invents defaults, performs lookups, or activates an

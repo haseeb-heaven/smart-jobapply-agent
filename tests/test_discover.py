@@ -1,19 +1,47 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import csv
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+from types import SimpleNamespace
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 DISCOVER_SCRIPT = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
+PRIVATE_RUNTIME_ROOT = PROJECT_ROOT / "jobapply_agent" / "private"
+
+
+@pytest.fixture
+def private_test_dir() -> Iterator[Path]:
+    PRIVATE_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    test_directory = Path(
+        tempfile.mkdtemp(prefix="discover-sonar-path-", dir=PRIVATE_RUNTIME_ROOT)
+    )
+    try:
+        yield test_directory
+    finally:
+        shutil.rmtree(test_directory, ignore_errors=True)
+
+
+@pytest.fixture
+def private_sibling_test_dir() -> Iterator[Path]:
+    test_directory = Path(
+        tempfile.mkdtemp(prefix="private-sonar-path-", dir=PRIVATE_RUNTIME_ROOT.parent)
+    )
+    try:
+        yield test_directory
+    finally:
+        shutil.rmtree(test_directory, ignore_errors=True)
 
 
 def load_discover_module():
@@ -185,8 +213,300 @@ def run_discover_cli(intake_path: Path, *arguments: str, stdin: str = "") -> sub
     )
 
 
-def test_interactive_onboarding_cli_activates_after_all_answers_and_confirmation(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def assert_interactive_path_rejected_before_prompt(
+    completed: subprocess.CompletedProcess[str], *sensitive_paths: Path
+) -> None:
+    rendered = completed.stdout + completed.stderr
+    assert completed.returncode == 2
+    assert completed.stderr.strip()
+    assert "Candidate-approved answer" not in rendered
+    assert "Privacy-safe structured candidate review" not in rendered
+    assert "confirm activation" not in rendered
+    for path in sensitive_paths:
+        assert str(path) not in rendered
+        assert path.parent.name not in rendered
+
+
+def test_is_link_like_rejects_callable_junction(monkeypatch: pytest.MonkeyPatch):
+    discover = load_discover_module()
+    monkeypatch.setattr(Path, "is_junction", lambda _path: True, raising=False)
+    regular_file_status = SimpleNamespace(st_mode=stat.S_IFREG)
+
+    assert discover._is_link_like(Path("candidate_intake.json"), regular_file_status)
+
+
+def test_is_link_like_rejects_windows_reparse_point(monkeypatch: pytest.MonkeyPatch):
+    discover = load_discover_module()
+    reparse_flag = 0x0400
+    monkeypatch.setattr(Path, "is_junction", lambda _path: False, raising=False)
+    monkeypatch.setattr(
+        discover.stat,
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        reparse_flag,
+        raising=False,
+    )
+    reparse_status = SimpleNamespace(
+        st_mode=stat.S_IFREG,
+        st_file_attributes=reparse_flag,
+    )
+
+    assert discover._is_link_like(Path("candidate_intake.json"), reparse_status)
+
+
+def test_interactive_onboarding_uses_injected_private_root_for_direct_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    discover = load_discover_module()
+    trusted_root = tmp_path / "trusted-private"
+    intake_path = trusted_root / "candidate_intake.json"
+    write_onboarding_draft(intake_path, ["candidate_profile"])
+    answers = iter(("Backend profile", "yes"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    exit_code = discover.main(
+        ["--candidate-intake", str(intake_path), "--interactive-onboarding"],
+        _private_root=trusted_root,
+    )
+
+    assert exit_code == 0, capsys.readouterr().err
+    persisted = json.loads(intake_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "active"
+    assert persisted["activated_by"] == "user"
+    assert persisted["approved_facts"]["candidate_profile"] == "Backend profile"
+    assert [path for path in tmp_path.rglob("*") if path.is_file()] == [intake_path]
+
+
+def test_interactive_onboarding_rejects_target_outside_injected_private_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    discover = load_discover_module()
+    trusted_root = tmp_path / "trusted-private"
+    trusted_root.mkdir()
+    outside_path = tmp_path / "outside" / "candidate_intake.json"
+    original = write_onboarding_draft(outside_path, ["candidate_profile"])
+
+    def fail_if_prompted(_prompt: str) -> str:
+        pytest.fail("path validation must reject before interactive prompting")
+
+    monkeypatch.setattr("builtins.input", fail_if_prompted)
+
+    exit_code = discover.main(
+        ["--candidate-intake", str(outside_path), "--interactive-onboarding"],
+        _private_root=trusted_root,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert outside_path.read_bytes() == original
+    assert not any(trusted_root.iterdir())
+    assert str(outside_path) not in captured.out + captured.err
+
+
+def test_interactive_onboarding_rejects_symlink_injected_private_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    discover = load_discover_module()
+    real_root = tmp_path / "real-private"
+    real_root.mkdir()
+    linked_root = tmp_path / "trusted-private"
+    try:
+        linked_root.symlink_to(real_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    intake_path = linked_root / "candidate_intake.json"
+
+    def fail_if_prompted(_prompt: str) -> str:
+        pytest.fail("trusted-root validation must reject before interactive prompting")
+
+    monkeypatch.setattr("builtins.input", fail_if_prompted)
+
+    exit_code = discover.main(
+        ["--candidate-intake", str(intake_path), "--interactive-onboarding"],
+        _private_root=linked_root,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert linked_root.is_symlink()
+    assert not any(real_root.iterdir())
+    assert str(intake_path) not in captured.out + captured.err
+
+
+def test_interactive_onboarding_rejects_non_regular_target_under_injected_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    discover = load_discover_module()
+    trusted_root = tmp_path / "trusted-private"
+    intake_path = trusted_root / "candidate_intake.json"
+    intake_path.mkdir(parents=True)
+
+    def fail_if_prompted(_prompt: str) -> str:
+        pytest.fail("target validation must reject before interactive prompting")
+
+    monkeypatch.setattr("builtins.input", fail_if_prompted)
+
+    exit_code = discover.main(
+        ["--candidate-intake", str(intake_path), "--interactive-onboarding"],
+        _private_root=trusted_root,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert intake_path.is_dir()
+    assert not any(intake_path.iterdir())
+    assert str(intake_path) not in captured.out + captured.err
+
+
+def test_injected_private_root_does_not_restrict_read_only_intake_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    discover = load_discover_module()
+    trusted_root = tmp_path / "trusted-private"
+    trusted_root.mkdir()
+    outside_path = tmp_path / "outside" / "candidate_intake.json"
+    original = write_onboarding_draft(outside_path, ["candidate_profile"])
+
+    exit_code = discover.main(
+        [
+            "--candidate-intake",
+            str(outside_path),
+            "--show-intake-questions",
+            "--onboarding-format",
+            "json",
+        ],
+        _private_root=trusted_root,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["question_count"] == 1
+    assert outside_path.read_bytes() == original
+    assert not any(trusted_root.iterdir())
+
+
+def test_interactive_onboarding_cli_rejects_absolute_outside_path_before_prompt_or_mutation(
+    tmp_path: Path,
+):
+    intake_path = tmp_path / "absolute-outside" / "candidate_intake.json"
+    original = write_onboarding_draft(intake_path, ["candidate_profile"])
+    original_entries = sorted(path.name for path in intake_path.parent.iterdir())
+
+    completed = run_discover_cli(
+        intake_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nyes\n",
+    )
+
+    assert_interactive_path_rejected_before_prompt(completed, intake_path)
+    assert intake_path.read_bytes() == original
+    assert sorted(path.name for path in intake_path.parent.iterdir()) == original_entries
+
+
+@pytest.mark.parametrize("path_style", ("sibling-prefix", "traversal"))
+def test_interactive_onboarding_cli_rejects_private_root_lexical_escapes(
+    private_test_dir: Path,
+    private_sibling_test_dir: Path,
+    path_style: str,
+):
+    escaped_intake = private_sibling_test_dir / "candidate_intake.json"
+    original = write_onboarding_draft(escaped_intake, ["candidate_profile"])
+    supplied_path = escaped_intake
+    if path_style == "traversal":
+        supplied_path = (
+            private_test_dir
+            / ".."
+            / ".."
+            / private_sibling_test_dir.name
+            / escaped_intake.name
+        )
+
+    completed = run_discover_cli(
+        supplied_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nyes\n",
+    )
+
+    assert_interactive_path_rejected_before_prompt(
+        completed, supplied_path, escaped_intake
+    )
+    assert escaped_intake.read_bytes() == original
+    assert [path for path in private_test_dir.iterdir()] == []
+    assert [path.name for path in private_sibling_test_dir.iterdir()] == [
+        escaped_intake.name
+    ]
+
+
+def test_interactive_onboarding_cli_rejects_symlink_directory_escape_without_touching_target(
+    private_test_dir: Path,
+    tmp_path: Path,
+):
+    external_intake = tmp_path / "external-directory" / "candidate_intake.json"
+    original = write_onboarding_draft(external_intake, ["candidate_profile"])
+    linked_directory = private_test_dir / "linked-directory"
+    try:
+        linked_directory.symlink_to(external_intake.parent, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    supplied_path = linked_directory / external_intake.name
+    completed = run_discover_cli(
+        supplied_path,
+        "--interactive-onboarding",
+        stdin="Backend profile\nyes\n",
+    )
+
+    assert_interactive_path_rejected_before_prompt(
+        completed, supplied_path, external_intake
+    )
+    assert linked_directory.is_symlink()
+    assert external_intake.read_bytes() == original
+    assert [path.name for path in external_intake.parent.iterdir()] == [
+        external_intake.name
+    ]
+
+
+def test_interactive_onboarding_cli_rejects_symlink_file_escape_without_touching_target(
+    private_test_dir: Path,
+    tmp_path: Path,
+):
+    external_intake = tmp_path / "external-file" / "candidate_intake.json"
+    original = write_onboarding_draft(external_intake, ["candidate_profile"])
+    linked_intake = private_test_dir / "candidate_intake.json"
+    try:
+        linked_intake.symlink_to(external_intake)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    completed = run_discover_cli(
+        linked_intake,
+        "--interactive-onboarding",
+        stdin="Backend profile\nyes\n",
+    )
+
+    assert_interactive_path_rejected_before_prompt(
+        completed, linked_intake, external_intake
+    )
+    assert linked_intake.is_symlink()
+    assert external_intake.read_bytes() == original
+    assert [path.name for path in external_intake.parent.iterdir()] == [
+        external_intake.name
+    ]
+
+
+def test_interactive_onboarding_cli_activates_after_all_answers_and_confirmation(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     write_onboarding_draft(intake_path, ["candidate_profile", "education"])
 
     completed = run_discover_cli(
@@ -204,11 +524,13 @@ def test_interactive_onboarding_cli_activates_after_all_answers_and_confirmation
     assert persisted["unknown_fields"] == []
     assert persisted["approved_facts"]["candidate_profile"] == "Backend profile"
     assert persisted["approved_facts"]["education"] == "Example University"
-    assert len([path for path in tmp_path.rglob("*") if path.is_file()]) == 1
+    assert len([path for path in private_test_dir.rglob("*") if path.is_file()]) == 1
 
 
-def test_interactive_onboarding_cli_keeps_blank_answer_unresolved_and_does_not_persist(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_onboarding_cli_keeps_blank_answer_unresolved_and_does_not_persist(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     original = write_onboarding_draft(intake_path, ["candidate_profile"])
 
     completed = run_discover_cli(intake_path, "--interactive-onboarding", stdin="\n")
@@ -221,9 +543,9 @@ def test_interactive_onboarding_cli_keeps_blank_answer_unresolved_and_does_not_p
 
 @pytest.mark.parametrize("terminal_answer", ("unknown", "uncertain", "ambiguous"))
 def test_interactive_onboarding_terminal_uncertainty_stays_unresolved_and_unpersisted(
-    tmp_path: Path, terminal_answer: str
+    private_test_dir: Path, terminal_answer: str
 ):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path = private_test_dir / "candidate_intake.json"
     original = write_onboarding_draft(intake_path, ["candidate_profile"])
 
     completed = run_discover_cli(
@@ -240,8 +562,10 @@ def test_interactive_onboarding_terminal_uncertainty_stays_unresolved_and_unpers
     assert "candidate_profile" not in persisted["approved_facts"]
 
 
-def test_interactive_onboarding_cli_declined_confirmation_does_not_overwrite_draft(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_onboarding_cli_declined_confirmation_does_not_overwrite_draft(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     original = write_onboarding_draft(intake_path, ["candidate_profile"])
 
     completed = run_discover_cli(
@@ -280,9 +604,10 @@ def test_public_question_modes_remain_backward_compatible_and_privacy_safe(tmp_p
     assert intake_path.read_bytes() == original
 
 
-def test_interactive_onboarding_cli_absent_target_uses_redacted_starter(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
-    intake_path.parent.mkdir(parents=True)
+def test_interactive_onboarding_cli_absent_target_uses_redacted_starter(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     starter_path = PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json"
     starter = json.loads(starter_path.read_text(encoding="utf-8"))
     unresolved_count = len(starter["unknown_fields"]) + len(starter["pending_facts"])
@@ -299,12 +624,13 @@ def test_interactive_onboarding_cli_absent_target_uses_redacted_starter(tmp_path
     assert "resume-primary" not in completed.stdout
     assert "Interactive onboarding ended before confirmation" in completed.stderr
     assert not intake_path.exists()
-    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert not [path for path in private_test_dir.rglob("*") if path.is_file()]
 
 
-def test_interactive_onboarding_cli_activates_absent_redacted_starter_with_skill_arrays(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
-    intake_path.parent.mkdir()
+def test_interactive_onboarding_cli_activates_absent_redacted_starter_with_skill_arrays(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     starter = json.loads(
         (PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json").read_text(
             encoding="utf-8"
@@ -363,9 +689,10 @@ def test_missing_intake_question_mode_returns_safe_redacted_question_bundle(tmp_
     assert not intake_path.exists()
 
 
-def test_interactive_onboarding_invalid_json_skill_answer_fails_without_writing(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
-    intake_path.parent.mkdir()
+def test_interactive_onboarding_invalid_json_skill_answer_fails_without_writing(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     starter = json.loads(
         (PROJECT_ROOT / "jobapply_agent" / "private.example" / "candidate_intake.json").read_text(
             encoding="utf-8"
@@ -399,8 +726,10 @@ def test_noninteractive_missing_intake_still_fails_without_creating_a_target(tmp
     assert not intake_path.exists()
 
 
-def test_interactive_onboarding_cli_leaves_existing_active_intake_unchanged(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_onboarding_cli_leaves_existing_active_intake_unchanged(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     write_active_candidate_intake(intake_path)
     original = intake_path.read_bytes()
 
@@ -409,15 +738,17 @@ def test_interactive_onboarding_cli_leaves_existing_active_intake_unchanged(tmp_
     assert completed.returncode == 0, completed.stderr
     assert "already active" in completed.stdout
     assert intake_path.read_bytes() == original
-    assert len([path for path in tmp_path.rglob("*") if path.is_file()]) == 1
+    assert len([path for path in private_test_dir.rglob("*") if path.is_file()]) == 1
 
 
 @pytest.mark.parametrize("raised_exception", [KeyboardInterrupt, OSError])
 def test_active_intake_persistence_cleans_temp_files_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised_exception: type[BaseException]
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raised_exception: type[BaseException],
 ):
     discover = load_discover_module()
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path = private_test_dir / "candidate_intake.json"
     original = write_onboarding_draft(intake_path, [])
 
     def fail_during_flush(_file_descriptor: int) -> None:
@@ -432,8 +763,10 @@ def test_active_intake_persistence_cleans_temp_files_on_failure(
     assert [path for path in intake_path.parent.iterdir() if path != intake_path] == []
 
 
-def test_interactive_onboarding_cli_fails_closed_for_invalid_active_target(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_onboarding_cli_fails_closed_for_invalid_active_target(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     write_active_candidate_intake(intake_path)
     invalid_active = json.loads(intake_path.read_text(encoding="utf-8"))
     invalid_active["revision_hash"] = "0" * 64
@@ -448,8 +781,10 @@ def test_interactive_onboarding_cli_fails_closed_for_invalid_active_target(tmp_p
     assert intake_path.read_bytes() == original
 
 
-def test_interactive_confirmation_summarizes_safe_fields_with_review_values(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_confirmation_summarizes_safe_fields_with_review_values(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     write_onboarding_draft(intake_path, ["candidate_profile", "education"])
 
     completed = run_discover_cli(
@@ -473,8 +808,10 @@ def test_interactive_confirmation_summarizes_safe_fields_with_review_values(tmp_
     assert "Example University" in completed.stdout
 
 
-def test_interactive_onboarding_cli_accepts_whitespace_around_literal_yes(tmp_path: Path):
-    intake_path = tmp_path / "private" / "candidate_intake.json"
+def test_interactive_onboarding_cli_accepts_whitespace_around_literal_yes(
+    private_test_dir: Path,
+):
+    intake_path = private_test_dir / "candidate_intake.json"
     write_onboarding_draft(intake_path, ["candidate_profile"])
 
     completed = run_discover_cli(
