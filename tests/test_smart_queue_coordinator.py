@@ -8,6 +8,7 @@ browser-session authority.  All values below are synthetic listing URLs.
 from __future__ import annotations
 
 from dataclasses import asdict, fields
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -150,6 +151,7 @@ def _load_discover_module():
     spec = importlib.util.spec_from_file_location("discover_for_live_queue_provenance", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -185,6 +187,118 @@ def _assert_redacted_public_cycle(result: object, *, search_needed: int) -> None
     assert not any(isinstance(getattr(result, field.name), QueueAction) for field in fields(result))
     assert "https://" not in repr(payload)
     assert "http://" not in repr(payload)
+
+
+def _active_admission_intake(runtime_directory: Path) -> Path:
+    """Write an active synthetic intake in the admission service's private root."""
+
+    professional = ["Python", "FastAPI", "REST APIs", "PostgreSQL", "unit testing"]
+    payload = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {
+            "experience": {"total_years": 3},
+            "roles": {
+                "include": ["Python Backend Developer"],
+                "exclude_title_terms": ["senior"],
+            },
+            "skills": {
+                "professional": professional,
+                "personal_open_source": ["OpenAI"],
+                "learning_or_exposure": ["Docker"],
+                "evidence_by_skill": {skill: "professional" for skill in professional},
+            },
+        },
+        "unknown_fields": [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+    runtime_directory.mkdir(parents=True, exist_ok=True)
+    intake_path = runtime_directory / "candidate-intake.json"
+    intake_path.write_text(
+        json.dumps(activate_candidate_profile(validate_candidate_intake(payload), actor="user")),
+        encoding="utf-8",
+    )
+    return intake_path
+
+
+def _admission_row(discover: object, *, number: int, profile_revision: str, policy_revision: str) -> dict[str, object]:
+    """Return one strict, synthetic current-revision discovery export row."""
+
+    return {
+        "schema_version": 2,
+        "record_type": "recommended_job_for_human_review",
+        "discovery_mode": "export_only",
+        "application_actions": 0,
+        "fingerprint": hashlib.sha256(f"synthetic-admission-{number}".encode()).hexdigest(),
+        "profile_revision": profile_revision,
+        "matcher_policy_revision": policy_revision,
+        "run_id": "synthetic-admission-run",
+        "discovered_at": "2026-09-03T00:00:00+00:00",
+        "search_url": "https://www.linkedin.com/jobs/search/?keywords=python",
+        "platform": "linkedin",
+        "title": "Python Backend Developer",
+        "company": "Synthetic Queue Systems",
+        "url": f"https://www.linkedin.com/jobs/view/{990000 + number}",
+        "location": "",
+        "work_mode": "",
+        "posted_at": None,
+        "score": 95,
+        "decision": "recommended",
+        "minimum_profile_fit_score": discover.MINIMUM_RECOMMENDED_SCORE,
+        "threshold_met": True,
+        "reasons": ["synthetic eligible evidence"],
+        "gaps": [],
+        "evidence_explanations": ["synthetic candidate-approved evidence"],
+        "score_explanation": "synthetic deterministic score explanation",
+        "human_action_required": "candidate reviews the listing manually",
+    }
+
+
+def test_five_admitted_current_rows_refill_five_url_only_slots(tmp_path: Path) -> None:
+    """Admission is the only source of the five canonical URL-only opens."""
+
+    discover = _load_discover_module()
+    runtime_directory = _private_runtime_database(tmp_path, "admission-refill").parent
+    intake_path = _active_admission_intake(runtime_directory)
+    profile = discover.active_candidate_profile(intake_path)
+    profile_revision = discover.candidate_profile_revision(profile)
+    policy_revision = discover.matcher_policy_revision()
+    rows = [
+        _admission_row(
+            discover,
+            number=number,
+            profile_revision=profile_revision,
+            policy_revision=policy_revision,
+        )
+        for number in range(1, 6)
+    ]
+    export_path = runtime_directory / "discovery.jsonl"
+    export_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    queue_path = runtime_directory / "smart-queue.sqlite3"
+    memory_path = runtime_directory / "candidate-memory.sqlite3"
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path,
+        export_path,
+        queue_path,
+        memory_path,
+    )
+    browser = SnapshotBrowser()
+    queue = discover.smart_queue_for_active_intake(intake_path, queue_path)
+    coordinator = SmartQueueCoordinator(queue, browser)
+    result = coordinator.cycle()
+
+    expected_urls = [row["url"] for row in rows]
+    assert status.validated_count == 5
+    assert status.suppressed_count == 0
+    assert status.admitted_count == 5
+    assert len(result.opened_job_ids) == 5
+    assert browser.opened_urls == expected_urls
+    assert len(browser.visible_urls) == 5
 
 
 def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recommendations(tmp_path: Path):
