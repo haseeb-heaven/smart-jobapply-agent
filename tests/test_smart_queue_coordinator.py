@@ -15,6 +15,7 @@ import sys
 
 import pytest
 
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueuePolicyError, SmartJobQueue
 
@@ -135,6 +136,13 @@ def _private_runtime_database(tmp_path: Path, name: str) -> Path:
     )
 
 
+def _candidate_memory(queue: SmartJobQueue) -> CandidateMemory:
+    return CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+
+
 def _load_discover_module():
     """Load the public active-intake queue factory without using a CLI host."""
 
@@ -212,7 +220,7 @@ def test_cycle_opens_exactly_the_candidate_selected_number_of_listing_tabs(
     assert {queue.get(candidate.job_id).state for candidate in expected} == {"open"}
 
 
-def test_manual_close_then_candidate_outcomes_reopens_exactly_the_number_of_replacements_needed(
+def test_manual_close_immediately_refills_from_distinct_pre_admitted_recommendations(
     tmp_path: Path,
 ):
     browser = SnapshotBrowser()
@@ -224,23 +232,26 @@ def test_manual_close_then_candidate_outcomes_reopens_exactly_the_number_of_repl
     for candidate in manually_closed:
         browser.visible_urls.remove(candidate.source_url)
     browser.opened_urls.clear()
-    pending = coordinator.cycle(())
-
-    assert pending.opened_job_ids == ()
-    assert browser.opened_urls == []
-    assert {queue.get(candidate.job_id).state for candidate in manually_closed} == {"awaiting_outcome"}
-
-    for candidate in manually_closed:
-        coordinator.confirm_outcome(candidate.job_id, "submitted", actor="user")
     refilled = coordinator.cycle(())
 
     expected_replacements = candidates[3:5]
     assert refilled.opened_job_ids == tuple(candidate.job_id for candidate in expected_replacements)
     assert browser.opened_urls == [candidate.source_url for candidate in expected_replacements]
+    assert {queue.get(candidate.job_id).state for candidate in manually_closed} == {"released"}
+    assert len(browser.visible_urls) == 3
+
+    for candidate in manually_closed:
+        coordinator.confirm_outcome(
+            candidate.job_id, "submitted", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+        )
+    repeated = coordinator.cycle(())
+
+    assert repeated.opened_job_ids == ()
+    assert browser.opened_urls == [candidate.source_url for candidate in expected_replacements]
     assert len(browser.visible_urls) == 3
 
 
-def test_missing_tab_reserves_slot_as_awaiting_outcome_and_is_not_reopened(tmp_path: Path):
+def test_missing_tab_releases_slot_and_never_reopens_the_original_listing(tmp_path: Path):
     browser = SnapshotBrowser()
     queue, coordinator = _coordinator(tmp_path, browser)
     candidates = [_candidate(number) for number in range(1, 7)]
@@ -249,30 +260,42 @@ def test_missing_tab_reserves_slot_as_awaiting_outcome_and_is_not_reopened(tmp_p
     browser.visible_urls.remove(missing.source_url)
     browser.opened_urls.clear()
 
-    coordinator.cycle(())
+    refilled = coordinator.cycle(())
 
-    assert queue.get(missing.job_id).state == "awaiting_outcome"
-    assert browser.opened_urls == []
-    assert queue.plan_refill(open_urls=browser.visible_urls).urls_to_open == ()
-
-    coordinator.confirm_outcome(missing.job_id, "skipped", actor="user")
-    coordinator.cycle(())
-
+    assert queue.get(missing.job_id).state == "released"
+    assert refilled.opened_job_ids == (candidates[5].job_id,)
     assert browser.opened_urls == [candidates[5].source_url]
+    assert missing.source_url not in browser.opened_urls
 
 
-def test_cycle_uses_follow_up_snapshot_to_record_open_failures_without_waiting_reservations(tmp_path: Path):
+def test_cycle_reports_no_post_attempt_shortage_when_a_failed_open_has_an_admitted_reserve(tmp_path: Path):
     candidates = [_candidate(number) for number in range(1, 7)]
     browser = SnapshotBrowser(failing_urls={candidates[0].source_url})
     queue, coordinator = _coordinator(tmp_path, browser)
 
-    coordinator.cycle(candidates)
+    result = coordinator.cycle(candidates)
 
     assert browser.list_calls >= 2
     assert browser.opened_urls == [candidate.source_url for candidate in candidates[:5]]
     assert queue.get(candidates[0].job_id).state == "open_failed"
     assert [queue.get(candidate.job_id).state for candidate in candidates[1:5]] == ["open"] * 4
+    assert queue.get(candidates[5].job_id).state == "recommended"
     assert not any(queue.get(candidate.job_id).state == "waiting" for candidate in candidates)
+    _assert_redacted_public_cycle(result, search_needed=0)
+
+
+def test_cycle_reports_new_post_attempt_shortage_when_a_failed_open_has_no_admitted_reserve(tmp_path: Path):
+    candidates = [_candidate(number) for number in range(1, 6)]
+    browser = SnapshotBrowser(failing_urls={candidates[0].source_url})
+    queue, coordinator = _coordinator(tmp_path, browser)
+
+    result = coordinator.cycle(candidates)
+
+    assert browser.opened_urls == [candidate.source_url for candidate in candidates]
+    assert queue.get(candidates[0].job_id).state == "open_failed"
+    assert [queue.get(candidate.job_id).state for candidate in candidates[1:]] == ["open"] * 4
+    assert not any(queue.get(candidate.job_id).state == "waiting" for candidate in candidates)
+    _assert_redacted_public_cycle(result, search_needed=1)
 
 
 def test_open_then_raise_is_reconciled_as_open_when_follow_up_snapshot_contains_the_url(tmp_path: Path):
@@ -309,6 +332,69 @@ def test_unavailable_follow_up_snapshot_preserves_waiting_reservation_until_a_la
     assert [event.name for event in queue.history_for(candidate.job_id)] == ["recommended", "waiting", "open"]
 
 
+def test_restart_releases_stale_waiting_reservations_and_refills_only_with_distinct_admitted_jobs(
+    tmp_path: Path,
+) -> None:
+    browser = SnapshotBrowser()
+    queue, _coordinator_before_process_death = _coordinator(tmp_path, browser)
+    candidates = [_candidate(number) for number in range(1, 9)]
+    queue.add_recommendations(candidates)
+    reserved = queue.plan_refill(open_urls=())
+    assert reserved.job_ids == tuple(candidate.job_id for candidate in candidates[:5])
+
+    visible_before_process_death = candidates[:2]
+    stale_reservations = candidates[2:5]
+    admitted_reserves = candidates[5:8]
+    browser.visible_urls[:] = [candidate.source_url for candidate in visible_before_process_death]
+
+    restarted_queue = SmartJobQueue(queue.database_path)
+    restarted_coordinator = SmartQueueCoordinator(restarted_queue, browser)
+    resumed = restarted_coordinator.cycle(())
+
+    assert resumed.requested_open_job_ids == tuple(candidate.job_id for candidate in admitted_reserves)
+    assert resumed.opened_job_ids == tuple(candidate.job_id for candidate in admitted_reserves)
+    assert browser.opened_urls == [candidate.source_url for candidate in admitted_reserves]
+    assert not set(browser.opened_urls) & {candidate.source_url for candidate in candidates[:5]}
+    assert {restarted_queue.get(candidate.job_id).state for candidate in stale_reservations} == {"open_failed"}
+    assert {restarted_queue.get(candidate.job_id).state for candidate in admitted_reserves} == {"open"}
+    assert all(
+        [event.name for event in restarted_queue.history_for(candidate.job_id)]
+        == ["recommended", "waiting", "open_failed"]
+        for candidate in stale_reservations
+    )
+    assert restarted_queue.confirmed_outcome_events() == ()
+    _assert_redacted_public_cycle(resumed, search_needed=0)
+
+
+def test_failed_follow_up_snapshot_defers_waiting_reconciliation_until_next_reliable_initial_snapshot(
+    tmp_path: Path,
+) -> None:
+    browser = FollowUpUnavailableBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    candidates = [_candidate(number) for number in range(1, 9)]
+
+    with pytest.raises(QueueCoordinatorError, match="snapshot"):
+        coordinator.cycle(candidates)
+
+    assert {queue.get(candidate.job_id).state for candidate in candidates[:5]} == {"waiting"}
+    still_visible = candidates[:2]
+    no_longer_visible = candidates[2:5]
+    admitted_reserves = candidates[5:8]
+    browser.visible_urls[:] = [candidate.source_url for candidate in still_visible]
+    browser.opened_urls.clear()
+
+    resumed = coordinator.cycle(())
+
+    assert {queue.get(candidate.job_id).state for candidate in still_visible} == {"open"}
+    assert {queue.get(candidate.job_id).state for candidate in no_longer_visible} == {"open_failed"}
+    assert resumed.requested_open_job_ids == tuple(candidate.job_id for candidate in admitted_reserves)
+    assert resumed.opened_job_ids == tuple(candidate.job_id for candidate in admitted_reserves)
+    assert browser.opened_urls == [candidate.source_url for candidate in admitted_reserves]
+    assert not set(browser.opened_urls) & {candidate.source_url for candidate in candidates[:5]}
+    assert queue.confirmed_outcome_events() == ()
+    _assert_redacted_public_cycle(resumed, search_needed=0)
+
+
 def test_failed_initial_open_never_records_an_outcome_and_next_cycle_uses_a_different_candidate(tmp_path: Path):
     candidates = [_candidate(number) for number in range(1, 7)]
     failed_candidate = candidates[0]
@@ -340,7 +426,9 @@ def test_confirmed_visible_tab_waits_for_later_url_only_snapshot_before_replacem
     coordinator.cycle(candidates)
     confirmed = candidates[0]
 
-    coordinator.confirm_outcome(confirmed.job_id, "submitted", actor="user")
+    coordinator.confirm_outcome(
+        confirmed.job_id, "submitted", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+    )
     browser.opened_urls.clear()
     coordinator.cycle(())
 
@@ -360,7 +448,9 @@ def test_restart_preserves_history_and_opens_one_replacement_for_four_visible_ta
     candidates = [_candidate(number) for number in range(1, 7)]
     coordinator.cycle(candidates)
     confirmed = candidates[0]
-    coordinator.confirm_outcome(confirmed.job_id, "submitted", actor="user")
+    coordinator.confirm_outcome(
+        confirmed.job_id, "submitted", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+    )
     browser.visible_urls.remove(confirmed.source_url)
     browser.opened_urls.clear()
 
@@ -529,7 +619,9 @@ def test_insufficient_pool_returns_only_counts_then_exact_caller_recommendations
         browser.visible_urls.remove(candidate.source_url)
     coordinator.cycle(())
     for candidate in initial[3:]:
-        coordinator.confirm_outcome(candidate.job_id, "skipped", actor="user")
+        coordinator.confirm_outcome(
+            candidate.job_id, "skipped", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+        )
 
     browser.opened_urls.clear()
     insufficient = coordinator.cycle(())
@@ -576,14 +668,16 @@ def test_direct_outcomes_reject_non_visible_or_non_open_queue_states(tmp_path: P
     if state == "open_failed":
         queue.record_open_failure(candidate.job_id, actor="synthetic-bridge")
 
-    with pytest.raises(QueuePolicyError, match="open|awaiting"):
-        coordinator.confirm_outcome(candidate.job_id, "skipped", actor="user")
+    with pytest.raises(QueuePolicyError, match="open|released"):
+        coordinator.confirm_outcome(
+            candidate.job_id, "skipped", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+        )
 
     assert queue.get(candidate.job_id).state == state
 
 
-@pytest.mark.parametrize("state", ("open", "awaiting_outcome"))
-def test_direct_outcomes_accept_currently_open_or_awaiting_outcome_jobs(tmp_path: Path, state: str):
+@pytest.mark.parametrize("state", ("open", "released"))
+def test_direct_outcomes_accept_currently_open_or_released_jobs(tmp_path: Path, state: str):
     candidate = _candidate(1)
     browser = SnapshotBrowser()
     queue, coordinator = _coordinator(tmp_path, browser)
@@ -591,11 +685,13 @@ def test_direct_outcomes_accept_currently_open_or_awaiting_outcome_jobs(tmp_path
     action = queue.plan_refill(open_urls=[])
     browser.visible_urls[:] = list(action.urls_to_open)
     queue.record_visible_snapshot(browser.visible_urls, actor="synthetic-bridge")
-    if state == "awaiting_outcome":
+    if state == "released":
         browser.visible_urls.clear()
         queue.record_visible_snapshot(browser.visible_urls, actor="synthetic-bridge")
 
-    result = coordinator.confirm_outcome(candidate.job_id, "skipped", actor="user")
+    result = coordinator.confirm_outcome(
+        candidate.job_id, "skipped", actor="user", vacated=True, candidate_memory=_candidate_memory(queue)
+    )
 
     assert result.state == "skipped"
     assert queue.get(candidate.job_id).state == "skipped"

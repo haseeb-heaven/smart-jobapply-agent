@@ -11,8 +11,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
 import threading
+
+import pytest
 
 from jobapply_agent.smart_queue import QueueCandidate
 
@@ -25,6 +28,8 @@ _MONITOR_MODULE = importlib.util.module_from_spec(_MONITOR_SPEC)
 sys.modules[_MONITOR_SPEC.name] = _MONITOR_MODULE
 _MONITOR_SPEC.loader.exec_module(_MONITOR_MODULE)
 PersistentSmartQueueMonitor = _MONITOR_MODULE.PersistentSmartQueueMonitor
+DatabaseLease = _MONITOR_MODULE.DatabaseLease
+MonitorLeaseError = _MONITOR_MODULE.MonitorLeaseError
 QueueCoordinatorError = _MONITOR_MODULE.QueueCoordinatorError
 MonitorTick = _MONITOR_MODULE.MonitorTick
 
@@ -89,15 +94,15 @@ class FakeSmartQueueCoordinator:
     """Small coordinator double that preserves the queue lifecycle boundary.
 
     It models only the behavior that the monitor must preserve: missing tabs
-    reserve their slots, user outcomes release those slots after the tab is
-    gone, and an open failure is not a successful open.
+    release their slots without inferring outcomes, pre-admitted candidates
+    refill those slots, and an open failure is not a successful open.
     """
 
     def __init__(self, browser: FakeListingAdapter, *, target_size: int = 5) -> None:
         self.browser = browser
         self.target_size = target_size
         self.calls: list[tuple[QueueCandidate, ...]] = []
-        self.outcome_calls: list[tuple[str, str, str]] = []
+        self.outcome_calls: list[tuple[str, str, str, bool]] = []
         self.fail_cycles = 0
         self.failed_cycle_attempts: set[int] = set()
         self.cycle_attempts = 0
@@ -120,9 +125,9 @@ class FakeSmartQueueCoordinator:
         visible = set(self.browser.list_tab_urls())
         for job_id, candidate in self._candidates.items():
             if self._states[job_id] == "open" and candidate.source_url not in visible:
-                self._states[job_id] = "awaiting_outcome"
+                self._states[job_id] = "released"
 
-        occupied_states = {"open", "awaiting_outcome"}
+        occupied_states = {"open"}
         vacancies = self.target_size - sum(state in occupied_states for state in self._states.values())
         requested = tuple(
             candidate
@@ -149,12 +154,14 @@ class FakeSmartQueueCoordinator:
             search_needed=max(0, vacancies - len(requested)),
         )
 
-    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> None:
-        if actor != "user":
+    def confirm_outcome(
+        self, job_id: str, outcome: str, *, actor: str, vacated: bool, candidate_memory: object
+    ) -> None:
+        if actor != "user" or vacated is not True:
             raise PermissionError("only the candidate may confirm an outcome")
         if outcome not in {"submitted", "rejected", "skipped"}:
             raise ValueError("unsupported synthetic outcome")
-        self.outcome_calls.append((job_id, outcome, actor))
+        self.outcome_calls.append((job_id, outcome, actor, vacated))
         self._states[job_id] = outcome
 
 
@@ -204,7 +211,11 @@ class BlockingFakeSmartQueueCoordinator:
         self._enter("cycle", block=True)
         return FakeCycle((), (), ())
 
-    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> None:
+    def confirm_outcome(
+        self, job_id: str, outcome: str, *, actor: str, vacated: bool, candidate_memory: object
+    ) -> None:
+        if actor != "user" or vacated is not True:
+            raise PermissionError("only the candidate may confirm an outcome")
         self._enter("confirm_outcome")
 
 
@@ -256,9 +267,10 @@ def test_initial_tick_opens_the_candidate_selected_capacity_once() -> None:
     assert coordinator.calls == [candidates]
 
 
-def test_two_closed_tabs_without_outcomes_open_no_replacements() -> None:
+def test_released_tabs_refill_from_pre_admitted_candidates_without_calling_the_provider() -> None:
     browser = FakeListingAdapter()
-    coordinator, monitor = _monitor(browser)
+    provider = FakeCandidateProvider(AssertionError("provider must not be called while admitted inventory remains"))
+    coordinator, monitor = _monitor(browser, candidate_provider=provider)
     candidates = tuple(_candidate(number) for number in range(1, 8))
     monitor.tick(candidates)
     for candidate in candidates[:2]:
@@ -269,32 +281,39 @@ def test_two_closed_tabs_without_outcomes_open_no_replacements() -> None:
     repeated = monitor.tick()
 
     assert result is not None
-    assert result.opened_job_ids == ()
-    assert result.requested_open_job_ids == ()
+    assert result.opened_job_ids == tuple(candidate.job_id for candidate in candidates[5:])
+    assert result.requested_open_job_ids == tuple(candidate.job_id for candidate in candidates[5:])
     assert repeated is not None
     assert repeated.opened_job_ids == ()
     assert repeated.requested_open_job_ids == ()
-    assert browser.opened_urls == []
+    assert browser.opened_urls == [candidate.source_url for candidate in candidates[5:]]
+    assert provider.calls == []
     assert coordinator.calls == [candidates, (), ()]
 
 
-def test_explicit_user_outcomes_refill_exactly_two_vacated_slots() -> None:
+def test_delayed_user_outcomes_after_released_refill_do_not_open_duplicate_tabs() -> None:
     browser = FakeListingAdapter()
     _coordinator, monitor = _monitor(browser)
     candidates = tuple(_candidate(number) for number in range(1, 8))
     monitor.tick(candidates)
     for candidate in candidates[:2]:
         browser.visible_urls.remove(candidate.source_url)
-    monitor.tick()
+    released_refill = monitor.tick()
     browser.opened_urls.clear()
 
-    monitor.confirm_outcome(candidates[0].job_id, "submitted", actor="user", vacated=True)
-    monitor.confirm_outcome(candidates[1].job_id, "skipped", actor="user", vacated=True)
+    monitor.confirm_outcome(
+        candidates[0].job_id, "submitted", actor="user", vacated=True, candidate_memory=object()
+    )
+    monitor.confirm_outcome(
+        candidates[1].job_id, "skipped", actor="user", vacated=True, candidate_memory=object()
+    )
     result = monitor.tick()
 
     assert result is not None
-    assert result.opened_job_ids == (candidates[5].job_id, candidates[6].job_id)
-    assert browser.opened_urls == [candidates[5].source_url, candidates[6].source_url]
+    assert released_refill is not None
+    assert released_refill.opened_job_ids == (candidates[5].job_id, candidates[6].job_id)
+    assert result.opened_job_ids == ()
+    assert browser.opened_urls == []
 
 
 def test_repeated_ticks_do_not_duplicate_existing_listing_opens() -> None:
@@ -469,7 +488,9 @@ def test_tick_and_candidate_outcome_confirmation_cannot_overlap() -> None:
     def confirm_outcome() -> None:
         second_operation_attempted.set()
         try:
-            monitor.confirm_outcome("opaque-job-id", "submitted", actor="user", vacated=True)
+            monitor.confirm_outcome(
+                "opaque-job-id", "submitted", actor="user", vacated=True, candidate_memory=object()
+            )
         except BaseException as error:  # pragma: no cover - surfaced by the assertion below.
             errors.append(error)
 
@@ -510,6 +531,7 @@ def test_transformed_indeed_continuation_with_nonvacating_user_outcome_opens_no_
             "submitted",
             actor="user",
             vacated=False,
+            candidate_memory=object(),
         )
     except PermissionError:
         outcome = None
@@ -551,6 +573,92 @@ def test_lease_contention_fails_closed_without_a_coordinator_cycle_or_open() -> 
     assert lease.release_calls == 0
     assert coordinator.calls == []
     assert browser.opened_urls == []
+
+
+def test_database_lease_rejects_symlink_without_modifying_its_external_target(
+    tmp_path: Path,
+) -> None:
+    runtime_directory = tmp_path / "private-runtime"
+    runtime_directory.mkdir()
+    database_path = runtime_directory / "smart-queue.sqlite3"
+    external_target = tmp_path / "external-target"
+    external_target.write_bytes(b"")
+    lease = DatabaseLease(database_path)
+    try:
+        lease.path.symlink_to(external_target)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(MonitorLeaseError):
+        lease.acquire()
+
+    assert lease.held is False
+    assert lease.path.is_symlink()
+    assert external_target.read_bytes() == b""
+
+
+def test_database_lease_rejects_a_live_owner_then_recovers_after_hard_process_death(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "smart-queue.sqlite3"
+    holder_script = """
+import importlib.util
+from pathlib import Path
+import sys
+import threading
+
+module_path = Path(sys.argv[1])
+sys.path.insert(0, sys.argv[3])
+spec = importlib.util.spec_from_file_location("lease_holder_monitor", module_path)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+lease = module.DatabaseLease(Path(sys.argv[2]))
+lease.acquire()
+print("lease-acquired", flush=True)
+threading.Event().wait()
+"""
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            holder_script,
+            str(_MONITOR_PATH),
+            str(database_path),
+            str(Path(__file__).parents[1] / "jobapply_agent" / "src"),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "lease-acquired"
+        with pytest.raises(MonitorLeaseError, match="already owns"):
+            DatabaseLease(database_path).acquire()
+
+        holder.kill()
+        assert holder.wait(timeout=5) != 0
+
+        browser = FakeListingAdapter()
+        coordinator = FakeSmartQueueCoordinator(browser, target_size=1)
+        monitor = PersistentSmartQueueMonitor(
+            coordinator,
+            lease=DatabaseLease(database_path),
+        )
+        candidate = _candidate(1)
+
+        result = monitor.tick((candidate,))
+
+        assert result is not None
+        assert result.opened_job_ids == (candidate.job_id,)
+        assert coordinator.calls == [(candidate,)]
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
 
 
 def test_bridge_open_failure_never_claims_or_creates_an_open_listing() -> None:

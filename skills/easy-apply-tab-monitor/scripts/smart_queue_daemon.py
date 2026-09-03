@@ -46,11 +46,12 @@ def _load_sibling_module(filename: str) -> object:
 
 _adapter_module = _load_sibling_module("codex_chrome_extension_adapter.py")
 _monitor_module = _load_sibling_module("persistent_smart_queue_monitor.py")
-_coordinator_module = _load_sibling_module("smart_queue_coordinator.py")
 BrowserAdapterError = _adapter_module.BrowserAdapterError
 CodexChromeExtensionAdapter = _adapter_module.CodexChromeExtensionAdapter
 PersistentSmartQueueMonitor = _monitor_module.PersistentSmartQueueMonitor
-SmartQueueCoordinator = _coordinator_module.SmartQueueCoordinator
+# Construct the exact coordinator class whose exception identity the monitor
+# catches, including when this daemon is imported directly from its file path.
+SmartQueueCoordinator = _monitor_module.SmartQueueCoordinator
 DEFAULT_INTERVAL_SECONDS = _monitor_module.DEFAULT_INTERVAL_SECONDS
 DEFAULT_MAX_BACKOFF_SECONDS = _monitor_module.DEFAULT_MAX_BACKOFF_SECONDS
 
@@ -315,7 +316,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         )
     except (DaemonConfigurationError, BrowserAdapterError, OSError, RuntimeError, TypeError, ValueError):
-        _emit_status(DaemonStatus(0, 0, 0, 0, 0, 0))
         return 2
     if arguments.max_ticks is not None:
         _emit_status(daemon.run(max_ticks=arguments.max_ticks))

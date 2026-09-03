@@ -12,15 +12,35 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import importlib.util
-import inspect
 import math
 import os
 from pathlib import Path
+import stat
 import sys
 import threading
 import time
 from typing import Callable, Iterable, Iterator, Protocol, runtime_checkable
-import uuid
+
+if os.name == "nt":  # pragma: win32 cover
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class _WindowsFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+else:  # pragma: posix cover
+    import fcntl
 
 from jobapply_agent.smart_queue import QueueCandidate
 
@@ -134,11 +154,13 @@ class MonitorTick:
 
 
 class DatabaseLease:
-    """Fail-closed, process-safe exclusive lease for one queue database.
+    """Fail-closed, crash-recoverable exclusive lease for one queue database.
 
-    The lock is a sibling file in the queue's private runtime directory.  It is
-    intentionally never stolen: an orphaned lock requires an explicit local
-    operator decision instead of risking two monitors acting on one queue.
+    The lock is held by the open descriptor for a sibling file in the queue's
+    private runtime directory.  The operating system releases descriptor locks
+    when a process exits, including hard termination.  The file itself remains
+    as a stable rendezvous point and is never deleted or replaced while another
+    process may still have it open.
     """
 
     def __init__(self, database_path: Path | str) -> None:
@@ -147,8 +169,6 @@ class DatabaseLease:
             raise MonitorLeaseError("persistent monitoring requires a durable queue database")
         self._path = path.with_name(f"{path.name}.persistent-smart-queue-monitor.lock")
         self._descriptor: int | None = None
-        self._identity: tuple[int, int] | None = None
-        self._token: str | None = None
 
     @property
     def path(self) -> Path:
@@ -161,56 +181,176 @@ class DatabaseLease:
         return self._descriptor is not None
 
     def acquire(self) -> None:
-        """Acquire the lease or fail without replacing a pre-existing lock."""
+        """Acquire the descriptor lease without waiting or stealing a live lock."""
 
         if self.held:
             return
+        parent_descriptor: int | None = None
         try:
-            descriptor = os.open(
-                self._path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        except FileExistsError:
-            raise MonitorLeaseError("another persistent monitor already owns this queue database") from None
+            if os.name == "nt":  # pragma: win32 cover
+                descriptor = self._open_windows_lock_file()
+            else:  # pragma: posix cover
+                descriptor, parent_descriptor = self._open_posix_lock_file()
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
                 raise MonitorLeaseError("persistent monitor lease is unavailable") from None
             raise MonitorLeaseError("persistent monitor lease could not be acquired") from None
 
-        token = uuid.uuid4().hex
         try:
-            os.write(descriptor, f"pid={os.getpid()} token={token}\n".encode("ascii"))
-            identity = os.fstat(descriptor)
-        except OSError:
+            descriptor_info = self._validate_descriptor(descriptor)
+            if parent_descriptor is not None:
+                self._validate_posix_path_binding(descriptor, parent_descriptor)
+            if os.name == "nt" and descriptor_info.st_size == 0:  # pragma: win32 cover
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            self._lock_descriptor(descriptor)
+            descriptor_info = self._validate_descriptor(descriptor)
+            if parent_descriptor is not None:
+                self._validate_posix_path_binding(descriptor, parent_descriptor)
+            if descriptor_info.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+        except BlockingIOError:
             os.close(descriptor)
-            try:
-                self._path.unlink()
-            except OSError:
-                pass
+            raise MonitorLeaseError("another persistent monitor already owns this queue database") from None
+        except OSError as error:
+            os.close(descriptor)
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise MonitorLeaseError(
+                    "another persistent monitor already owns this queue database"
+                ) from None
             raise MonitorLeaseError("persistent monitor lease could not be initialized") from None
+        finally:
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
 
         self._descriptor = descriptor
-        self._identity = (identity.st_dev, identity.st_ino)
-        self._token = token
+
+    def _open_posix_lock_file(self) -> tuple[int, int]:
+        """Open the final path component atomically without following links."""
+
+        required_flags = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+        if any(not hasattr(os, flag) for flag in required_flags) or os.open not in os.supports_dir_fd:
+            raise OSError(errno.ENOTSUP, "safe lease-file opening is unsupported")
+        parent_descriptor = os.open(
+            self._path.parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            descriptor = os.open(
+                self._path.name,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except BaseException:
+            os.close(parent_descriptor)
+            raise
+        return descriptor, parent_descriptor
+
+    def _open_windows_lock_file(self) -> int:  # pragma: win32 cover
+        """Open the reparse point itself and deny replacement while held."""
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(_WindowsFileInformation)]
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        generic_read_write = 0x80000000 | 0x40000000
+        share_read_write = 0x00000001 | 0x00000002
+        open_always = 4
+        file_attribute_normal = 0x00000080
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = 0x00000400
+        file_flag_open_reparse_point = 0x00200000
+        invalid_handle_value = ctypes.c_void_p(-1).value
+
+        handle = create_file(
+            os.fspath(self._path),
+            generic_read_write,
+            share_read_write,
+            None,
+            open_always,
+            file_attribute_normal | file_flag_open_reparse_point,
+            None,
+        )
+        if handle == invalid_handle_value:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        information = _WindowsFileInformation()
+        try:
+            if not get_information(handle, ctypes.byref(information)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            unsafe_attributes = file_attribute_directory | file_attribute_reparse_point
+            if information.file_attributes & unsafe_attributes or information.number_of_links != 1:
+                raise OSError(errno.EPERM, "unsafe lease-file object")
+            return msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+        except BaseException:
+            close_handle(handle)
+            raise
+
+    @staticmethod
+    def _validate_descriptor(descriptor: int) -> os.stat_result:
+        descriptor_info = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_info.st_mode) or descriptor_info.st_nlink != 1:
+            raise OSError(errno.EPERM, "unsafe lease-file object")
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        if getattr(descriptor_info, "st_file_attributes", 0) & reparse_attribute:
+            raise OSError(errno.EPERM, "unsafe lease-file object")
+        return descriptor_info
+
+    def _validate_posix_path_binding(self, descriptor: int, parent_descriptor: int) -> None:
+        """Ensure the path still names the regular inode that will be locked."""
+
+        if os.stat not in os.supports_dir_fd or os.stat not in os.supports_follow_symlinks:
+            raise OSError(errno.ENOTSUP, "safe lease-file validation is unsupported")
+        descriptor_info = self._validate_descriptor(descriptor)
+        path_info = os.stat(self._path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(path_info.st_mode)
+            or path_info.st_nlink != 1
+            or (path_info.st_dev, path_info.st_ino) != (descriptor_info.st_dev, descriptor_info.st_ino)
+        ):
+            raise OSError(errno.EPERM, "lease-file path changed during acquisition")
+
+    @staticmethod
+    def _lock_descriptor(descriptor: int) -> None:
+        if os.name == "nt":  # pragma: win32 cover
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:  # pragma: posix cover
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock_descriptor(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":  # pragma: win32 cover
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:  # pragma: posix cover
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
     def release(self) -> None:
-        """Release only the exact lock file this lease created."""
+        """Release this descriptor's lock while preserving the rendezvous file."""
 
-        descriptor, identity = self._descriptor, self._identity
+        descriptor = self._descriptor
         self._descriptor = None
-        self._identity = None
-        self._token = None
         if descriptor is None:
             return
         try:
-            if identity is not None:
-                try:
-                    current = self._path.stat()
-                except FileNotFoundError:
-                    current = None
-                if current is not None and (current.st_dev, current.st_ino) == identity:
-                    self._path.unlink()
+            self._unlock_descriptor(descriptor)
         finally:
             os.close(descriptor)
 
@@ -468,6 +608,7 @@ class PersistentSmartQueueMonitor:
         *,
         actor: str,
         vacated: bool,
+        candidate_memory: object,
     ) -> object | None:
         """Pass through only an explicitly candidate-owned outcome confirmation.
 
@@ -479,10 +620,10 @@ class PersistentSmartQueueMonitor:
         confirm = getattr(self._coordinator, "confirm_outcome", None)
         if not callable(confirm):
             raise TypeError("coordinator must provide confirm_outcome")
-        if actor != "user":
+        if type(actor) is not str or actor != "user":
             raise PermissionError("only the candidate may confirm an outcome")
-        if vacated is not True:
-            return None
+        if type(vacated) is not bool or vacated is not True:
+            raise PermissionError("the candidate must explicitly confirm vacated=True")
         # An outcome alone does not establish a vacancy: the candidate may be
         # on a manual application or continuation URL.  Serialize the explicit
         # attestation and coordinator mutation with reconciliation.
@@ -490,23 +631,13 @@ class PersistentSmartQueueMonitor:
             with self.lease() as acquired:
                 if not acquired:
                     return None
-                if self._confirm_accepts_vacated_attestation(confirm):
-                    return confirm(job_id, outcome, actor=actor, vacated=vacated)
-                return confirm(job_id, outcome, actor=actor)
-
-    @staticmethod
-    def _confirm_accepts_vacated_attestation(confirm: Callable[..., object]) -> bool:
-        """Preserve compatibility with the unchanged coordinator boundary."""
-
-        try:
-            parameters = inspect.signature(confirm).parameters.values()
-        except (TypeError, ValueError):
-            return False
-        return any(
-            parameter.name == "vacated"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
+                return confirm(
+                    job_id,
+                    outcome,
+                    actor=actor,
+                    vacated=vacated,
+                    candidate_memory=candidate_memory,
+                )
 
     @staticmethod
     def _cancelled(cancellation: CancellationSignal | None) -> bool:

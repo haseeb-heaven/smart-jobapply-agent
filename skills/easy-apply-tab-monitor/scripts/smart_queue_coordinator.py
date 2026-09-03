@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol, runtime_checkable
 
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
 
 
@@ -107,9 +108,11 @@ class SmartQueueCoordinator:
     def cycle(self, recommendations: Iterable[QueueCandidate] = ()) -> QueueCycle:
         """Run snapshot → plan → optional recommendations → open → snapshot.
 
-        A missing managed tab stays ``awaiting_outcome``. It is never reopened;
-        a later user-confirmed outcome and a genuinely absent URL are both
-        required before the queue plans a replacement.
+        A missing managed tab becomes ``released`` through its append-only
+        visibility event. It is never reopened; the same cycle may fill the
+        resulting vacancy only from distinct, already-admitted recommendations.
+        A later user-confirmed outcome remains required before CandidateMemory
+        can record an application outcome.
         """
 
         if isinstance(recommendations, (str, bytes)):
@@ -122,7 +125,11 @@ class SmartQueueCoordinator:
             self._queue.add_recommendations(supplied_recommendations)
 
         initial_snapshot = self._snapshot()
-        self._queue.record_visible_snapshot(initial_snapshot, actor="browser-bridge")
+        recovered_open_failed_job_ids = self._queue.record_visible_snapshot(
+            initial_snapshot,
+            actor="browser-bridge",
+            recover_stale_waiting=True,
+        )
         requested_action = self._queue.plan_refill(open_urls=initial_snapshot)
 
         attempted_job_ids: list[str] = []
@@ -137,7 +144,7 @@ class SmartQueueCoordinator:
 
         follow_up_snapshot = self._snapshot()
         self._queue.record_visible_snapshot(follow_up_snapshot, actor="browser-bridge")
-        open_failed_job_ids: list[str] = []
+        open_failed_job_ids = list(recovered_open_failed_job_ids)
         for job_id in attempted_job_ids:
             if self._queue.get(job_id).state == "waiting":
                 self._queue.record_open_failure(job_id, actor="browser-bridge")
@@ -152,14 +159,34 @@ class SmartQueueCoordinator:
             requested_open_job_ids=requested_action.job_ids,
             opened_job_ids=opened_job_ids,
             open_failed_job_ids=tuple(dict.fromkeys(open_failed_job_ids)),
-            search_needed=requested_action.search_needed,
+            search_needed=self._queue.refill_search_needed(open_urls=follow_up_snapshot),
         )
 
-    def confirm_outcome(self, job_id: str, outcome: str, *, actor: str) -> QueueOutcome:
-        """Record a candidate-owned outcome and return its opaque public view."""
+    def confirm_outcome(
+        self,
+        job_id: str,
+        outcome: str,
+        *,
+        actor: str,
+        vacated: bool,
+        candidate_memory: CandidateMemory,
+    ) -> QueueOutcome:
+        """Atomically finalize an explicit candidate outcome/vacancy attestation."""
 
-        confirmed = self._queue.confirm_outcome(job_id, outcome, actor=actor)
-        return QueueOutcome(job_id=confirmed.job_id, state=confirmed.state)
+        if type(actor) is not str or actor != "user":
+            raise QueuePolicyError("an application outcome must be confirmed by the exact user actor")
+        if type(vacated) is not bool or vacated is not True:
+            raise QueuePolicyError("an application outcome requires explicit vacated=True confirmation")
+        if not isinstance(candidate_memory, CandidateMemory):
+            raise TypeError("candidate_memory must be a CandidateMemory")
+        finalized = candidate_memory.finalize_queue_outcome(
+            queue=self._queue,
+            job_id=job_id,
+            outcome=outcome,
+            actor=actor,
+            vacated=vacated,
+        )
+        return QueueOutcome(job_id=job_id, state=finalized.outcome)
 
 
 __all__ = [

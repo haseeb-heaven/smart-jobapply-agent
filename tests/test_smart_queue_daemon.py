@@ -12,11 +12,13 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 from typing import Callable
 
 import pytest
 
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+from jobapply_agent.smart_queue import SmartJobQueue
 
 
 _SCRIPTS_DIR = Path(__file__).parents[1] / "skills" / "easy-apply-tab-monitor" / "scripts"
@@ -64,6 +66,16 @@ class UnavailableListingAdapter(FakeListingAdapter):
     def list_tab_urls(self) -> tuple[str, ...]:
         self.list_calls += 1
         raise RuntimeError("private bridge detail must not escape")
+
+
+class FailingLiveSnapshotAdapter(FakeListingAdapter):
+    """Pass daemon preflight, then fail the first live URL snapshot."""
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        self.list_calls += 1
+        if self.list_calls > 1:
+            raise RuntimeError("private live snapshot detail must not escape")
+        return ()
 
 
 class FakeMonitor:
@@ -231,6 +243,25 @@ def test_daemon_accepts_a_finite_tick_limit_and_returns_count_only_redacted_stat
     assert adapter.open_calls == []
 
 
+def test_daemon_reports_search_needed_when_a_released_vacancy_has_no_admitted_inventory(tmp_path: Path) -> None:
+    monitor = FakeMonitor((FakeMonitorTick((), (), (), search_needed=1),))
+    adapter = FakeListingAdapter()
+    factory_calls: list[object] = []
+    daemon = SmartQueueDaemon.from_config(
+        _valid_config(tmp_path),
+        adapter=adapter,
+        monitor_factory=_factory_for(monitor, factory_calls),
+    )
+
+    status = daemon.run(max_ticks=1)
+
+    assert len(factory_calls) == 1
+    assert status.requested_open_count == 0
+    assert status.opened_count == 0
+    assert status.search_needed == 1
+    assert adapter.open_calls == []
+
+
 def test_config_parser_rejects_candidate_list_json_input_without_leaking_it() -> None:
     private_candidate_url = "https://www.indeed.com/viewjob?jk=private-candidate"
     candidate_list_json = json.dumps(
@@ -273,6 +304,39 @@ def test_bridge_preflight_fails_before_queue_factory_or_monitor_creation(tmp_pat
     assert monitor_factory_calls == []
 
 
+def test_live_snapshot_failure_emits_degraded_bridge_tick_without_exiting(tmp_path: Path) -> None:
+    adapter = FailingLiveSnapshotAdapter()
+    cancellation = threading.Event()
+    emitted: list[object] = []
+
+    def queue_factory(_intake: Path, database: Path) -> SmartJobQueue:
+        return SmartJobQueue(database)
+
+    daemon = SmartQueueDaemon.from_config(
+        _valid_config(tmp_path),
+        adapter=adapter,
+        queue_factory=queue_factory,
+    )
+
+    def capture_status(status: object) -> None:
+        emitted.append(status)
+        cancellation.set()
+
+    daemon.run_forever(cancellation, capture_status)
+
+    assert (
+        _DAEMON_MODULE.SmartQueueCoordinator
+        is _DAEMON_MODULE._monitor_module.SmartQueueCoordinator
+    )
+    assert len(emitted) == 1
+    assert emitted[0].degraded is True
+    assert emitted[0].bridge_error is True
+    assert emitted[0].candidate_provider_error is False
+    assert "private live snapshot detail" not in repr(emitted[0])
+    assert adapter.list_calls == 2
+    assert adapter.open_calls == []
+
+
 def test_cli_accepts_documented_relative_private_paths_with_stdio_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -308,6 +372,33 @@ def test_cli_accepts_documented_relative_private_paths_with_stdio_bridge(
         "search_needed": 0,
         "ticks_completed": 0,
     }
+
+
+def test_cli_initialization_failure_emits_no_ready_capable_status_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class UnavailableCodexAdapter(UnavailableListingAdapter):
+        pass
+
+    intake = _active_intake(tmp_path)
+    database = _private_database(tmp_path)
+    monkeypatch.setattr(_DAEMON_MODULE, "CodexChromeExtensionAdapter", UnavailableCodexAdapter)
+
+    exit_code = _DAEMON_MODULE.main(
+        [
+            "--candidate-intake", str(intake),
+            "--database", str(database),
+            "--bridge-stdio",
+            "--max-ticks", "0",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "private bridge detail" not in captured.err
 
 
 @pytest.mark.parametrize(

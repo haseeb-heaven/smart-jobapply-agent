@@ -205,17 +205,17 @@ async function listTabUrls(chrome) {
   const tabs = await chrome.user.openTabs();
   if (!Array.isArray(tabs) || tabs.length === 0) fail("existing session is required");
   if (tabs.length > MAX_TAB_URLS) fail("invalid tab data");
-  const urls = new Set();
+  const urls = [];
   for (const tab of tabs) {
     if (typeof tab?.url !== "string" || tab.url.length === 0 || tab.url.length > MAX_TAB_URL_LENGTH) fail("invalid tab data");
     try {
       // Browser-private tabs are never sent over this bridge.
-      urls.add(canonicalListingUrl(tab.url));
+      urls.push(canonicalListingUrl(tab.url));
     } catch {
       // Unsupported tabs are deliberately not observable to the daemon.
     }
   }
-  return [...urls];
+  return urls;
 }
 
 async function openListing(chrome, url) {
