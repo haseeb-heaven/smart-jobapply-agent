@@ -830,6 +830,73 @@ class SmartJobQueue:
             self._close(connection)
         return active_pair
 
+    def bind_empty_queue_revisions(
+        self, profile_revision: str, matcher_policy_revision: str
+    ) -> None:
+        """Atomically seed an otherwise unused queue with one revision pair."""
+
+        revisions = _require_revision_pair(
+            profile_revision,
+            matcher_policy_revision,
+            allow_unversioned=False,
+        )
+        assert revisions[0] is not None and revisions[1] is not None
+        requested_pair = (revisions[0], revisions[1])
+        connection = self._transaction()
+        try:
+            has_stored_job = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM smart_queue_jobs)"
+            ).fetchone()
+            if has_stored_job is None:
+                raise QueueStorageError("smart queue stored jobs are unavailable")
+            if bool(has_stored_job[0]):
+                raise QueuePolicyError("queue revisions may be bound only while the queue is empty")
+
+            active_pair = self._read_active_revisions(connection)
+            if active_pair == (None, None):
+                self._write_active_revisions(connection, requested_pair)
+            elif active_pair != requested_pair:
+                raise QueuePolicyError("queue revisions conflict with the existing active pair")
+            connection.commit()
+        except (QueuePolicyError, QueueStorageError):
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
+    def reset_empty_queue_revisions(self) -> None:
+        """Restore an unused queue's newly bound revision pair to unbound.
+
+        This is the rollback half of :meth:`bind_empty_queue_revisions`.  It
+        never touches job rows, capacity, history, or outcomes.
+        """
+
+        connection = self._transaction()
+        try:
+            has_stored_job = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM smart_queue_jobs)"
+            ).fetchone()
+            if has_stored_job is None:
+                raise QueueStorageError("smart queue stored jobs are unavailable")
+            if bool(has_stored_job[0]):
+                raise QueuePolicyError("queue revisions may be reset only while the queue is empty")
+
+            active_pair = self._read_active_revisions(connection)
+            if active_pair != (None, None):
+                self._write_active_revisions(connection, (None, None))
+            connection.commit()
+        except (QueuePolicyError, QueueStorageError):
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
+
     def set_target_size(self, target_size: int, *, actor: str) -> int:
         """Persist a user-selected capacity without changing jobs or outcomes.
 

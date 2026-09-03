@@ -180,6 +180,119 @@ def test_versioned_recommendation_revisions_are_durable_and_initialize_active_pa
     assert restarted.get(candidate.job_id).matcher_policy_revision == "policy-v1"
 
 
+def test_bind_empty_queue_revisions_sets_and_durably_reuses_exact_pair(tmp_path: Path):
+    database = tmp_path / "queue.sqlite3"
+    queue = SmartJobQueue(database)
+
+    queue.bind_empty_queue_revisions("profile-r1", "policy-r1")
+    queue.bind_empty_queue_revisions("profile-r1", "policy-r1")
+
+    assert queue.active_revisions == ("profile-r1", "policy-r1")
+    assert SmartJobQueue(database).active_revisions == ("profile-r1", "policy-r1")
+
+
+@pytest.mark.parametrize(
+    ("profile_revision", "matcher_policy_revision"),
+    (("", "policy-r1"), ("profile-r1", ""), (None, "policy-r1"), ("profile-r1", None)),
+)
+def test_bind_empty_queue_revisions_rejects_incomplete_pair_without_mutation(
+    tmp_path: Path, profile_revision: str | None, matcher_policy_revision: str | None
+):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+
+    with pytest.raises(QueuePolicyError, match="revision"):
+        queue.bind_empty_queue_revisions(profile_revision, matcher_policy_revision)  # type: ignore[arg-type]
+
+    assert queue.active_revisions == (None, None)
+
+
+def test_bind_empty_queue_revisions_rejects_conflicting_pair_without_mutation(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    queue.bind_empty_queue_revisions("profile-r1", "policy-r1")
+
+    with pytest.raises(QueuePolicyError, match="conflict"):
+        queue.bind_empty_queue_revisions("profile-r2", "policy-r1")
+
+    assert queue.active_revisions == ("profile-r1", "policy-r1")
+
+
+def test_bind_empty_queue_revisions_rejects_versioned_or_unversioned_stored_jobs(
+    tmp_path: Path,
+):
+    versioned = SmartJobQueue(tmp_path / "versioned.sqlite3")
+    versioned.add_recommendations([_candidate(1, 99)])
+
+    with pytest.raises(QueuePolicyError, match="empty"):
+        versioned.bind_empty_queue_revisions(
+            _SYNTHETIC_PROFILE_REVISION, _SYNTHETIC_POLICY_REVISION
+        )
+
+    unversioned_database = tmp_path / "unversioned.sqlite3"
+    unversioned = SmartJobQueue(unversioned_database)
+    with sqlite3.connect(unversioned_database) as connection:
+        connection.execute(
+            """
+            INSERT INTO smart_queue_jobs
+                (job_id, source_url, fit_score, eligible, decision, evidence_json,
+                 profile_revision, matcher_policy_revision, created_at)
+            VALUES (?, ?, 99, 1, 'recommended', '[]', NULL, NULL, ?)
+            """,
+            (
+                "legacy-job",
+                "https://www.linkedin.com/jobs/view/legacy-queue-job",
+                "2026-09-03T00:00:00+00:00",
+            ),
+        )
+
+    with pytest.raises(QueuePolicyError, match="empty"):
+        unversioned.bind_empty_queue_revisions("profile-r1", "policy-r1")
+
+    assert unversioned.active_revisions == (None, None)
+
+
+def test_reset_empty_queue_revisions_restores_unbound_pair_idempotently(tmp_path: Path):
+    database = tmp_path / "queue.sqlite3"
+    queue = SmartJobQueue(database)
+    queue.bind_empty_queue_revisions("profile-r1", "policy-r1")
+
+    queue.reset_empty_queue_revisions()
+
+    assert queue.active_revisions == (None, None)
+    assert SmartJobQueue(database).active_revisions == (None, None)
+
+    queue.reset_empty_queue_revisions()
+
+    assert queue.active_revisions == (None, None)
+
+    queue.bind_empty_queue_revisions("profile-r2", "policy-r2")
+
+    assert queue.active_revisions == ("profile-r2", "policy-r2")
+
+
+def test_reset_empty_queue_revisions_is_a_noop_before_any_binding(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+
+    queue.reset_empty_queue_revisions()
+
+    assert queue.active_revisions == (None, None)
+    queue.bind_empty_queue_revisions("profile-r1", "policy-r1")
+    assert queue.active_revisions == ("profile-r1", "policy-r1")
+
+
+def test_reset_empty_queue_revisions_rejects_stored_job_without_mutation(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidate = _candidate(1, 99)
+    queue.add_recommendations([candidate])
+    bound_pair = queue.active_revisions
+    assert bound_pair != (None, None)
+
+    with pytest.raises(QueuePolicyError, match="empty"):
+        queue.reset_empty_queue_revisions()
+
+    assert queue.active_revisions == bound_pair
+    assert queue.get(candidate.job_id).source_url == candidate.source_url
+
+
 def test_active_revision_switch_excludes_stale_profile_or_policy_recommendations(tmp_path: Path):
     database = tmp_path / "queue.sqlite3"
     queue = SmartJobQueue(database)
