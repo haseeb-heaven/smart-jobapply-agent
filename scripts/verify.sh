@@ -14,17 +14,24 @@ if ! command -v ruff >/dev/null 2>&1; then
   exit 127
 fi
 
-echo "[1/8] full Python suite"
+echo "[1/9] full Python suite"
 python -m pytest
 
-echo "[2/8] Python lint"
+echo "[2/9] Node bounded Codex Chrome host contract"
+if ! command -v node >/dev/null 2>&1; then
+  echo "validation error: node is required for the bounded Codex Chrome host contract" >&2
+  exit 127
+fi
+node --test tests/test_codex_chrome_extension_host.mjs
+
+echo "[3/9] Python lint"
 # Keep the repository gate independent from a runner's user-level Ruff config
 # and from newly introduced rule families.  The project can expand this
 # baseline deliberately in a separate reviewed change.
 ruff check --isolated --select E4,E7,E9,F --line-length 120 --target-version py311 \
   jobapply_agent/src jobapply_agent/scripts tests
 
-echo "[3/8] bounded watcher line and branch coverage"
+echo "[4/9] bounded watcher line and branch coverage"
 python -m coverage erase
 python -m coverage run --branch \
   --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py' \
@@ -33,7 +40,7 @@ python -m coverage report \
   --include='*/skills/easy-apply-tab-monitor/scripts/chrome_tab_watcher.py' \
   --fail-under=100
 
-echo "[4/8] browser adapter line and branch coverage"
+echo "[5/9] browser adapter line and branch coverage"
 python -m coverage erase
 python -m coverage run --branch \
   --include='*/skills/easy-apply-tab-monitor/scripts/browser_tab_adapter.py' \
@@ -42,13 +49,13 @@ python -m coverage report \
   --include='*/skills/easy-apply-tab-monitor/scripts/browser_tab_adapter.py' \
   --fail-under=100
 
-echo "[5/8] Python bytecode compilation"
+echo "[6/9] Python bytecode compilation"
 python -m compileall -q \
   jobapply_agent/src \
   jobapply_agent/scripts \
   skills/easy-apply-tab-monitor/scripts
 
-echo "[6/8] shell static analysis"
+echo "[7/9] shell static analysis"
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck scripts/verify.sh jobapply_agent/scripts/cron_wrapper.sh
 else
@@ -56,11 +63,11 @@ else
   bash -n scripts/verify.sh jobapply_agent/scripts/cron_wrapper.sh
 fi
 
-echo "[7/8] patch whitespace integrity"
+echo "[8/9] patch whitespace integrity"
 git diff --check
 git diff --cached --check
 
-echo "[8/8] tracked candidate-data boundary"
+echo "[9/9] tracked candidate-data boundary"
 tracked_private="$(git ls-files 'jobapply_agent/private/**' 'resumes/**' 'codex-apply-*.*')"
 if [[ -n "$tracked_private" ]]; then
   echo "validation error: private candidate paths are tracked" >&2

@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Smart Job Queue replenishment and separate outcome recording</title>
+  <desc id="desc">A missing managed tab releases its slot without inferring an outcome, then a distinct admitted candidate may refill it. User-confirmed outcomes are recorded separately.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#07111d"/><stop offset="1" stop-color="#102847"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#63e6d3"/></marker>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#f6bd60"/></marker>
+    <style>
+      .sans{font-family:Inter,Segoe UI,Arial,sans-serif}.mono{font-family:SFMono-Regular,Consolas,Liberation Mono,monospace}
+      .eyebrow{font-size:18px;font-weight:700;letter-spacing:4px;fill:#5eead4}.title{font-size:44px;font-weight:760;fill:#f1f5f9}.subtitle{font-size:21px;fill:#a9bad2}
+      .section{font-size:15px;font-weight:700;letter-spacing:2px;fill:#5eead4}.heading{font-size:24px;font-weight:730;fill:#f8fafc}.body{font-size:17px;fill:#becce0}.small{font-size:15px;fill:#9fb0c8}
+      .tag{font-size:15px;font-weight:700;fill:#dffcf7}.code{font-size:14px;fill:#b8c6d9}.warn{font-size:17px;font-weight:700;fill:#ffd594}
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="70" y="62" class="sans eyebrow">SMART JOB QUEUE • CANDIDATE-CONTROLLED LOOP</text>
+  <text x="70" y="116" class="sans title">A missing tab releases a slot — never an outcome</text>
+  <text x="70" y="151" class="sans subtitle">Refill and candidate-owned outcome recording are intentionally separate flows.</text>
+
+  <g class="sans">
+    <rect x="70" y="190" width="355" height="476" rx="20" fill="#0d1d30" stroke="#315174"/>
+    <text x="96" y="226" class="section">ADMISSION</text>
+    <text x="96" y="264" class="heading">Evidence-ranked pool</text>
+    <rect x="96" y="287" width="303" height="64" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="116" y="314" class="body" font-weight="700">Candidate-approved intake</text>
+    <text x="116" y="338" class="small">Untrusted input → confirmed facts</text>
+    <line x1="247" y1="351" x2="247" y2="375" stroke="#63e6d3" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="96" y="380" width="303" height="64" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="116" y="407" class="body" font-weight="700">Eligibility before ranking</text>
+    <text x="116" y="431" class="small">Missing evidence stays uncertain</text>
+    <line x1="247" y1="444" x2="247" y2="468" stroke="#63e6d3" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="96" y="473" width="303" height="75" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="116" y="500" class="body" font-weight="700">Suppress exact prior URLs</text>
+    <text x="116" y="524" class="small">CandidateMemory filter, then admit</text>
+    <rect x="96" y="574" width="303" height="64" rx="14" fill="#12352f" stroke="#5eead4"/>
+    <text x="247" y="602" text-anchor="middle" class="tag">CAPACITY: 1–10 MANAGED TABS</text>
+    <text x="247" y="625" text-anchor="middle" class="small">candidate-selected • default 5</text>
+
+    <rect x="462" y="190" width="585" height="476" rx="20" fill="#0d1d30" stroke="#315174"/>
+    <text x="488" y="226" class="section">LIVE RECONCILIATION</text>
+    <text x="488" y="264" class="heading">URL-only snapshot of managed tabs</text>
+    <rect x="488" y="288" width="533" height="66" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="510" y="316" class="body" font-weight="700">Managed listing missing or closed?</text>
+    <text x="510" y="340" class="small">Only exact approved LinkedIn / Indeed URLs are compared.</text>
+    <line x1="754" y1="354" x2="754" y2="379" stroke="#f6bd60" stroke-width="2" marker-end="url(#arrow2)"/>
+    <rect x="488" y="385" width="533" height="112" rx="12" fill="#2b2016" stroke="#f6bd60"/>
+    <text x="510" y="417" class="warn">YES → state = released; slot freed immediately</text>
+    <text x="510" y="449" class="body">No submitted / skipped / rejected outcome is inferred.</text>
+    <text x="510" y="477" class="small">No candidate-memory write. The original URL is not reopened.</text>
+    <line x1="754" y1="497" x2="754" y2="522" stroke="#63e6d3" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="488" y="528" width="533" height="108" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="510" y="560" class="body" font-weight="700">Refill with a distinct, already-admitted candidate</text>
+    <text x="510" y="590" class="body">Available → open its exact approved listing URL.</text>
+    <text x="510" y="617" class="body">None available → report <tspan class="mono" fill="#c6a5ff">search_needed</tspan>.</text>
+
+    <rect x="1084" y="190" width="446" height="476" rx="20" fill="#0d1d30" stroke="#315174"/>
+    <text x="1110" y="226" class="section">BOUNDED AUTHORITY</text>
+    <text x="1110" y="264" class="heading">Existing session only</text>
+    <rect x="1110" y="289" width="394" height="93" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="1132" y="319" class="body" font-weight="700">Supervised Node host</text>
+    <text x="1132" y="347" class="small">list tab URLs • open exact listing URL</text>
+    <text x="1132" y="370" class="small">count-only redacted status</text>
+    <rect x="1110" y="399" width="394" height="104" rx="12" fill="#2a1621" stroke="#f472b6"/>
+    <text x="1132" y="430" class="body" font-weight="700" fill="#fecdd3">Never</text>
+    <text x="1132" y="459" class="body">close tabs • inspect content • fill forms</text>
+    <text x="1132" y="486" class="body">upload • click Apply • submit</text>
+    <rect x="1110" y="527" width="394" height="109" rx="12" fill="#102940" stroke="#3e698e"/>
+    <text x="1132" y="557" class="small" font-weight="700">QUEUE AUTHORITY</text>
+    <text x="1132" y="582" class="mono code">jobapply_agent/src/jobapply_agent/</text>
+    <text x="1132" y="605" class="mono code">smart_queue.py</text>
+    <text x="1132" y="628" class="small">Private durable DB stays ignored.</text>
+  </g>
+
+  <rect x="70" y="698" width="1460" height="144" rx="18" fill="#10261f" stroke="#4ade80" stroke-dasharray="8 7"/>
+  <text x="94" y="730" class="sans section" fill="#86efac">SEPARATE CANDIDATE-OWNED OUTCOME FLOW</text>
+  <rect x="94" y="750" width="485" height="67" rx="12" fill="#12352f" stroke="#4ade80"/>
+  <text x="116" y="777" class="sans body" font-weight="700">User explicitly confirms both:</text>
+  <text x="116" y="802" class="sans small">submitted / skipped / rejected + managed tab vacated</text>
+  <line x1="579" y1="783" x2="647" y2="783" stroke="#63e6d3" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="654" y="750" width="480" height="67" rx="12" fill="#12352f" stroke="#4ade80"/>
+  <text x="676" y="777" class="mono code">jobapply_agent/scripts/</text>
+  <text x="676" y="802" class="mono code">record_candidate_outcome.py --vacated</text>
+  <line x1="1134" y1="783" x2="1198" y2="783" stroke="#63e6d3" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="1205" y="750" width="301" height="67" rx="12" fill="#12352f" stroke="#4ade80"/>
+  <text x="1227" y="777" class="sans body" font-weight="700">Candidate memory</text>
+  <text x="1227" y="802" class="sans small">Persist exact canonical URL</text>
+</svg>

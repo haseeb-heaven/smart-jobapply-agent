@@ -76,6 +76,18 @@ def test_only_reviewed_job_can_move_to_ready_to_apply_and_submission_needs_user_
     assert tracker.history_for(application.job_id)[-1].actor == "user"
 
 
+@pytest.mark.parametrize("outcome", ("submitted", "rejected"))
+def test_legacy_tracker_application_outcomes_require_the_exact_user_actor(tmp_path: Path, outcome: str):
+    tracker = Tracker(tmp_path / f"{outcome}.sqlite3")
+    application = tracker.record_listing(_listing(), _match())
+    if outcome == "submitted":
+        reviewed = tracker.transition_application(application.job_id, "reviewed", actor="user")
+        application = tracker.transition_application(reviewed.job_id, "ready_to_apply", actor="user")
+
+    with pytest.raises(InvalidTransition, match="user actor"):
+        tracker.transition_application(application.job_id, outcome, actor="agent")
+
+
 @pytest.mark.parametrize("actor", ["User", " user ", "user "])
 def test_submission_requires_exact_user_actor_in_tracker(tmp_path: Path, actor: str):
     tracker = Tracker(tmp_path / "jobs.sqlite3")
@@ -102,6 +114,23 @@ def test_pure_transition_records_manual_submission_for_exact_user_actor():
 
     assert submitted.submitted_by == "user"
     assert submitted.submitted_at is not None
+
+
+@pytest.mark.parametrize("actor", ("user", "agent"))
+def test_candidate_owned_rejection_is_terminal(actor: str):
+    rejected = ApplicationRecord(job_id="job-1", status="rejected")
+
+    with pytest.raises(InvalidTransition, match="cannot move"):
+        transition_application(rejected, "reviewed", actor=actor)
+
+
+def test_tracker_does_not_allow_an_agent_to_reverse_a_candidate_rejection(tmp_path: Path):
+    tracker = Tracker(tmp_path / "jobs.sqlite3")
+    application = tracker.record_listing(_listing(), _match())
+    rejected = tracker.transition_application(application.job_id, "rejected", actor="user")
+
+    with pytest.raises(InvalidTransition, match="cannot move"):
+        tracker.transition_application(rejected.job_id, "reviewed", actor="agent")
 
 
 def test_csv_export_contains_auditable_tracker_columns(tmp_path: Path):

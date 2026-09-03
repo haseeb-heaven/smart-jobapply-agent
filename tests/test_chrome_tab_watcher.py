@@ -232,6 +232,27 @@ def test_apple_script_client_lists_and_opens_supported_urls():
         chrome.open_listing("https://example.test")
 
 
+def test_chrome_compatibility_open_script_never_creates_a_window_without_an_existing_session():
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    ChromeAppleScript(runner=runner).open_listing(LINKEDIN)
+
+    script = calls[0][2]
+    assert "count of windows" in script
+    assert "make new window" not in script.casefold()
+    assert "activate" not in script.casefold()
+
+
+def test_legacy_applescript_adapter_is_not_marked_as_a_live_smart_queue_adapter():
+    chrome = ChromeAppleScript(runner=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=""))
+
+    assert getattr(chrome, "smart_queue_adapter", None) is None
+
+
 def test_apple_script_error_is_redacted():
     def runner(_command: list[str], **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=1, stdout="")

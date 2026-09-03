@@ -5,6 +5,7 @@ import copy
 import pytest
 
 from jobapply_agent.intake import (
+    CandidateIntakeValidationError,
     activate_candidate_profile,
     completion_questions,
     pending_verification_batch,
@@ -276,6 +277,52 @@ def test_user_activation_creates_a_stable_revision_from_approved_facts():
     assert first["approved_facts"] == draft["approved_facts"]
     assert first["unknown_fields"] == []
     assert first["revision_hash"] == repeated["revision_hash"]
+
+
+@pytest.mark.parametrize("capacity", (1, 3, 10))
+def test_candidate_confirmed_smart_queue_capacity_is_validated_and_activated(capacity: int):
+    payload = _ready_payload()
+    payload["approved_facts"]["targets.smart_queue_capacity"] = capacity
+
+    active = activate_candidate_profile(validate_candidate_intake(payload), actor="user")
+
+    assert active["approved_facts"]["targets.smart_queue_capacity"] == capacity
+
+
+@pytest.mark.parametrize("capacity", (0, -1, 11, True, False, 3.0, "3", None))
+def test_candidate_smart_queue_capacity_rejects_invalid_types_and_ranges(capacity: object):
+    payload = _ready_payload()
+    payload["approved_facts"]["targets.smart_queue_capacity"] = capacity
+
+    with pytest.raises(CandidateIntakeValidationError, match="smart_queue_capacity|capacity"):
+        validate_candidate_intake(payload)
+
+
+def test_absent_candidate_smart_queue_capacity_remains_unset_until_candidate_chooses_it():
+    active = activate_candidate_profile(validate_candidate_intake(_ready_payload()), actor="user")
+
+    assert "targets.smart_queue_capacity" not in active["approved_facts"]
+
+
+def test_candidate_is_asked_a_safe_specific_question_when_smart_queue_capacity_is_unresolved():
+    payload = _ready_payload()
+    payload["pending_facts"] = [
+        {
+            "field": "targets.smart_queue_capacity",
+            "status": "VERIFY",
+            "question": "How many job tabs should stay open?",
+            "reason": "Candidate queue capacity was not confirmed.",
+        }
+    ]
+
+    draft = validate_candidate_intake(payload)
+
+    assert pending_verification_batch(draft)["pending_facts"] == [
+        {"field": "targets.smart_queue_capacity", "status": "VERIFY"}
+    ]
+    assert completion_questions(draft) == (
+        "How many managed job tabs do you want open at once? Choose 1 to 10; default is 5.",
+    )
 
 
 def test_persisted_active_profile_rejects_reintroduced_unknown_fields():

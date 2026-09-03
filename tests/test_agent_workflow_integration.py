@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.listing_extraction import (
     listing_from_validated_extraction,
@@ -20,7 +21,7 @@ from jobapply_agent.listing_extraction import (
 )
 from jobapply_agent.matcher import score_job
 from jobapply_agent.models import JobListing
-from jobapply_agent.smart_queue import QueueCandidate, SmartJobQueue
+from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
 from jobapply_agent.tracker_lifecycle import LifecycleTracker
 
 
@@ -184,9 +185,24 @@ def test_verified_profile_drives_five_job_queue_refill_and_user_owned_lifecycle(
     submitted_job_id = initial.job_ids[0]
     remaining_visible_urls = initial.urls_to_open[1:]
     queue.record_visible_snapshot(remaining_visible_urls, actor="agent")
-    assert queue.get(submitted_job_id).state == "awaiting_outcome"
+    assert queue.get(submitted_job_id).state == "released"
 
-    queue.confirm_outcome(submitted_job_id, "submitted", actor="user")
+    refill = queue.plan_refill(open_urls=remaining_visible_urls)
+    assert refill.job_ids == (recommendations[5].job_id,)
+    assert refill.urls_to_open == (recommendations[5].source_url,)
+    assert refill.search_needed == 0
+
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    queue.confirm_outcome(
+        submitted_job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
     assert queue.get(submitted_job_id).state == "submitted"
     assert queue.confirmed_submitted_count() == 1
 
@@ -197,12 +213,96 @@ def test_verified_profile_drives_five_job_queue_refill_and_user_owned_lifecycle(
     assert tracker.get_job(submitted_job_id).state == "interview"
     assert tracker.unique_manual_submitted_count() == 1
 
-    refill = queue.plan_refill(open_urls=remaining_visible_urls)
-    assert refill.job_ids == (recommendations[5].job_id,)
-    assert refill.urls_to_open == (recommendations[5].source_url,)
-    assert refill.search_needed == 0
     queue.record_visible_snapshot([*remaining_visible_urls, *refill.urls_to_open], actor="agent")
     assert sum(queue.get(candidate.job_id).state == "open" for candidate in recommendations) == 5
+
+
+def test_verified_profile_drives_candidate_selected_three_job_queue_refill(tmp_path: Path):
+    discover = _load_discover_module()
+    draft_payload = _ready_intake()
+    draft_payload["approved_facts"]["targets.smart_queue_capacity"] = 3
+    active = activate_candidate_profile(validate_candidate_intake(draft_payload), actor="user")
+    intake_path = tmp_path / "private" / "candidate_intake.json"
+    intake_path.parent.mkdir(parents=True)
+    intake_path.write_text(json.dumps(active), encoding="utf-8")
+
+    profile = discover.active_candidate_profile(intake_path)
+    queue = discover.smart_queue_for_active_intake(
+        intake_path,
+        tmp_path / "smart-queue.sqlite3",
+    )
+    recommendations: list[QueueCandidate] = []
+    for job_number in range(1, 6):
+        extraction = validate_listing_extraction(_listing_extraction(job_number))
+        result = score_job(profile, _job_listing(extraction))
+        assert result.decision == "recommended"
+        recommendations.append(
+            QueueCandidate(
+                job_id=str(extraction["source_job_id"]),
+                source_url=str(extraction["source_url"]),
+                fit_score=result.score,
+                eligible=True,
+                decision=result.decision,
+                evidence=tuple(result.reasons),
+                profile_revision="integration-profile-v1",
+                matcher_policy_revision="integration-policy-v1",
+            )
+        )
+
+    queue.add_recommendations(recommendations)
+    initial = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(initial.urls_to_open, actor="browser-bridge")
+    manually_closed = initial.job_ids[0]
+    remaining = initial.urls_to_open[1:]
+    queue.record_visible_snapshot(remaining, actor="browser-bridge")
+
+    assert initial.job_ids == tuple(candidate.job_id for candidate in recommendations[:3])
+    assert len(initial.urls_to_open) == 3
+    assert queue.get(manually_closed).state == "released"
+    replacement = queue.plan_refill(open_urls=remaining)
+
+    assert replacement.job_ids == (recommendations[3].job_id,)
+    assert replacement.urls_to_open == (recommendations[3].source_url,)
+
+
+def test_active_intake_queue_capacity_defaults_and_rejects_unconfirmed_or_conflicting_hosts(
+    tmp_path: Path,
+):
+    discover = _load_discover_module()
+    approved_payload = _ready_intake()
+    approved_payload["approved_facts"]["targets.smart_queue_capacity"] = 3
+    active = activate_candidate_profile(validate_candidate_intake(approved_payload), actor="user")
+    active_path = tmp_path / "private" / "active.json"
+    active_path.parent.mkdir(parents=True)
+    active_path.write_text(json.dumps(active), encoding="utf-8")
+
+    queue = discover.smart_queue_for_active_intake(active_path, tmp_path / "queue.sqlite3")
+
+    assert queue.target_size == 3
+    with pytest.raises(QueuePolicyError, match="conflict|target_size|capacity"):
+        discover.smart_queue_for_active_intake(
+            active_path,
+            tmp_path / "queue.sqlite3",
+            target_size=5,
+        )
+
+    default_draft = validate_candidate_intake(_ready_intake())
+    default_active = activate_candidate_profile(default_draft, actor="user")
+    default_path = tmp_path / "private" / "default.json"
+    default_path.write_text(json.dumps(default_active), encoding="utf-8")
+    assert discover.smart_queue_for_active_intake(
+        default_path,
+        tmp_path / "default-queue.sqlite3",
+    ).target_size == 5
+
+    unconfirmed_path = tmp_path / "private" / "unconfirmed.json"
+    unconfirmed_path.write_text(json.dumps(validate_candidate_intake(_ready_intake())), encoding="utf-8")
+    with pytest.raises(ValueError, match="active"):
+        discover.smart_queue_for_active_intake(
+            unconfirmed_path,
+            tmp_path / "unconfirmed-queue.sqlite3",
+        )
+    assert not (tmp_path / "unconfirmed-queue.sqlite3").exists()
 
 
 def test_unsupported_mandatory_skill_is_rejected_before_queue_admission(tmp_path: Path):

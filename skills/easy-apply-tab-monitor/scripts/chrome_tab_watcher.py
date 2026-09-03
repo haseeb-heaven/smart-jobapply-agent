@@ -54,7 +54,9 @@ _SAFE_TRACKING_QUERY_KEYS = frozenset(
 
 _LIST_TAB_URLS = """
 set allUrls to {}
+if application "Google Chrome" is not running then error "Chrome is not running"
 tell application "Google Chrome"
+    if (count of windows) = 0 then error "Chrome has no existing window"
     repeat with aWindow in windows
         repeat with aTab in tabs of aWindow
             set end of allUrls to (URL of aTab)
@@ -68,10 +70,10 @@ return allUrls as text
 _OPEN_LISTING = """
 on run argv
     set targetUrl to item 1 of argv
+    if application "Google Chrome" is not running then error "Chrome is not running"
     tell application "Google Chrome"
-        if (count of windows) = 0 then make new window
-        tell front window to make new tab at end of tabs with properties {URL:targetUrl}
-        activate
+        if (count of windows) = 0 then error "Chrome has no existing window"
+        tell window 1 to make new tab at end of tabs with properties {URL:targetUrl}
     end tell
 end run
 """
@@ -255,6 +257,12 @@ def _run_osascript(script: str, args: Sequence[str], runner: Callable[..., subpr
 
 
 class ChromeAppleScript:
+    # This optional adapter is for the legacy fixed-round watcher only. Smart
+    # Queue execution receives a host-supplied, browser-neutral two-operation
+    # adapter and never selects this compatibility path. The optional Codex
+    # Chrome host is one reference integration. The legacy scripts refuse to
+    # create a Chrome window, but Apple Events cannot provide the live queue's
+    # required atomic session boundary.
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> None:
         self._runner = runner
 

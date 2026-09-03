@@ -19,9 +19,28 @@ application_policy:
       - compose_evidence_grounded_explanations
       - prepare_local_field_suggestions_for_candidate_review
       - record_missing_answer_prompts
-      - plan_five_listing_smart_queue_replenishment
-      - mark_missing_tabs_as_awaiting_outcome
+      - bind_outcome_empty_candidate_memory_to_authenticated_durable_queue_id_on_first_nonempty_batch
+      - validate_candidate_revision_pairs_against_authenticated_queue_before_suppression
+      - preserve_exact_url_suppression_across_same_queue_profile_or_policy_revisions
+      - reject_different_queue_memory_pairing_without_mutation
+      - reject_populated_unscoped_legacy_memory_before_migration_mutation
+      - plan_candidate_selected_one_to_ten_listing_smart_queue_replenishment
+      - mark_missing_or_closed_tabs_as_released_without_inferring_an_outcome
+      - recover_stale_waiting_from_reliable_initial_snapshot_as_open_or_open_failed
+      - preserve_current_cycle_waiting_when_follow_up_snapshot_fails
+      - refill_released_slots_only_from_distinct_already_admitted_candidates
+      - report_search_needed_when_no_admitted_candidate_can_refill_a_released_slot
       - track_candidate_recorded_review_state
+
+  persistent_host_health:
+    running: live_child_and_bridge_streams
+    ready: complete_valid_redacted_status_received_on_live_status_stream
+    healthy: running_and_ready
+    cannot_mark_ready_or_healthy:
+      - partial_or_invalid_status
+      - initialization_failure
+      - status_stream_end_or_error
+      - terminal_frame_or_process_state
 
   bounded_tab_watcher:
     authority: skills/easy-apply-tab-monitor/SKILL.md
@@ -39,6 +58,7 @@ application_policy:
       - inspect_browser_credentials_or_cookies
       - enter_an_application_flow
       - close_or_replace_a_target_with_a_new_search_result
+      - infer_an_application_outcome_or_candidate_memory_entry_from_a_tab_close
       - click_any_page_control
       - type_any_field_value
       - upload_any_document
