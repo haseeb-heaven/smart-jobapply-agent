@@ -235,6 +235,12 @@ _SENIORITY_DEFAULT = (
         ({"roles": {"include": ["Backend Developer"]}}, _SENIORITY_DEFAULT),
         ({"roles": {"exclude_title_terms": ["junior"]}}, ("junior",)),
         ({"exclude_title_terms": ["Junior Backend Developer"]}, ("Junior Backend Developer",)),
+        # YAML ``null`` decodes to None and means the default has not been overridden.
+        ({"exclude_title_terms": None}, _SENIORITY_DEFAULT),
+        ({"roles": {"exclude_title_terms": None}}, _SENIORITY_DEFAULT),
+        # Malformed scalar values must not silently disable the seniority guard.
+        ({"exclude_title_terms": 42}, _SENIORITY_DEFAULT),
+        ({"roles": {"exclude_title_terms": 42}}, _SENIORITY_DEFAULT),
         # An explicit empty list is a deliberate override and wins over the default.
         ({"exclude_title_terms": []}, ()),
         ({"roles": {"exclude_title_terms": []}}, ()),

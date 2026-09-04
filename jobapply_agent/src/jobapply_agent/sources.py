@@ -32,6 +32,17 @@ _SAFE_TRACKING_QUERY_KEYS = frozenset(
 )
 
 
+def _normalize_supported_platform(platform: object, *, context: str) -> str:
+    """Return one supported platform without exposing untrusted input in errors."""
+
+    if not isinstance(platform, str):
+        raise ValueError(f"Unsupported {context} platform")
+    normalized = platform.casefold().strip()
+    if normalized not in SUPPORTED_PLATFORMS:
+        raise ValueError(f"Unsupported {context} platform")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class SearchProfile:
     """One transparent, platform-specific query for the review queue."""
@@ -41,11 +52,9 @@ class SearchProfile:
     location: str = ""
 
     def __post_init__(self) -> None:
-        platform = self.platform.casefold().strip()
+        platform = _normalize_supported_platform(self.platform, context="search")
         keywords = " ".join(self.keywords.split())
         location = " ".join(self.location.split())
-        if platform not in SUPPORTED_PLATFORMS:
-            raise ValueError(f"Unsupported search platform: {self.platform!r}")
         if not keywords or not _HIGH_FIT_QUERY.search(keywords):
             raise ValueError("Search profiles must target Python, FastAPI, or API integration work")
         if is_non_mid_level_title(keywords):
@@ -109,7 +118,7 @@ def build_search_url(profile: SearchProfile) -> str:
         return build_linkedin_search_url(profile.keywords, profile.location)
     if profile.platform == "indeed":
         return build_indeed_search_url(profile.keywords, profile.location)
-    raise ValueError(f"Unsupported search platform: {profile.platform!r}")
+    raise ValueError("Unsupported search platform")
 
 
 def build_search_urls(profiles: Iterable[SearchProfile]) -> tuple[str, ...]:
@@ -124,6 +133,7 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
     Unknown payload keys, including any cookie/session metadata, are ignored.
     """
 
+    normalized_platform = _normalize_supported_platform(platform, context="listing")
     extraction: object | None = payload.get("extraction")
     if extraction is None and {"schema_version", "source_url", "requirements"} <= set(payload):
         extraction = payload
@@ -131,7 +141,7 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
         if not isinstance(extraction, Mapping):
             raise ValueError("Visible listing extraction must be an object")
         listing = listing_from_validated_extraction(extraction)
-        if listing.platform != platform.casefold().strip():
+        if listing.platform != normalized_platform:
             raise ValueError("Validated listing extraction platform does not match the visible source")
         return listing
 
@@ -139,7 +149,7 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
     url = str(payload.get("url", payload.get("job_url", ""))).strip()
     if not title or not url:
         raise ValueError("Visible listing payloads require non-empty title and url fields")
-    _validate_listing_url(url, platform)
+    _validate_listing_url(url, normalized_platform)
     return JobListing(
         title=title,
         url=url,
@@ -151,7 +161,7 @@ def listing_from_visible_payload(payload: Mapping[str, Any], *, platform: str) -
         posted_at=payload.get("posted_at"),
         discovered_at=payload.get("discovered_at"),
         source_job_id=str(payload["source_job_id"]) if payload.get("source_job_id") is not None else None,
-        platform=platform,
+        platform=normalized_platform,
     )
 
 
@@ -170,11 +180,9 @@ def canonical_listing_url(url: str, platform: str | None = None) -> str:
 
     if not isinstance(url, str) or not url.strip():
         raise ValueError("Visible listing URLs must be non-empty strings")
-    if platform is not None and not isinstance(platform, str):
-        raise ValueError(f"Unsupported listing platform: {platform!r}")
-    normalized_platform = None if platform is None else platform.casefold().strip()
-    if normalized_platform is not None and normalized_platform not in SUPPORTED_PLATFORMS:
-        raise ValueError(f"Unsupported listing platform: {platform!r}")
+    normalized_platform = (
+        None if platform is None else _normalize_supported_platform(platform, context="listing")
+    )
     parsed: SplitResult = urlsplit(url.strip())
     try:
         port = parsed.port
@@ -245,6 +253,8 @@ def _validate_listing_url(url: str, platform: str) -> None:
 def _build_search_profile(entry: Mapping[str, str]) -> SearchProfile:
     """Construct one validated profile, fail-closed when keywords are absent."""
 
+    if "platform" not in entry:
+        raise ValueError("Search profiles must declare platform")
     if "keywords" not in entry:
         raise ValueError("Search profiles must declare keywords")
     return SearchProfile(**entry)

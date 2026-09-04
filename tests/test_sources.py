@@ -131,11 +131,44 @@ def test_load_search_profiles_rejects_profiles_that_declare_platform_without_key
         load_search_profiles(path)
 
 
+def test_load_search_profiles_rejects_profiles_that_omit_platform(tmp_path: Path):
+    path = _write(tmp_path, "profiles:\n  - keywords: python\n")
+
+    with pytest.raises(ValueError, match="must declare platform"):
+        load_search_profiles(path)
+
+
 def test_load_search_profiles_rejects_unsupported_platforms(tmp_path: Path):
     path = _write(tmp_path, "profiles:\n  - platform: monster\n    keywords: python\n")
 
     with pytest.raises(ValueError, match="Unsupported search platform"):
         load_search_profiles(path)
+
+
+@pytest.mark.parametrize("platform", (None, 7, "candidate-secret-platform"))
+def test_search_and_visible_listing_platform_boundaries_reject_invalid_values_without_echoing_them(
+    platform: object,
+):
+    factories = (
+        lambda: SearchProfile(platform=platform, keywords="python"),  # type: ignore[arg-type]
+        lambda: listing_from_visible_payload(
+            {"title": "Python Developer", "url": "https://www.linkedin.com/jobs/view/1"},
+            platform=platform,  # type: ignore[arg-type]
+        ),
+    )
+
+    for factory in factories:
+        with pytest.raises(ValueError, match="Unsupported .* platform") as error:
+            factory()
+        assert "candidate-secret-platform" not in str(error.value)
+
+
+@pytest.mark.parametrize("platform", (7, "candidate-secret-platform"))
+def test_canonical_listing_url_rejects_invalid_declared_platforms_without_echoing_them(platform: object):
+    with pytest.raises(ValueError, match="Unsupported listing platform") as error:
+        canonical_listing_url("https://www.linkedin.com/jobs/view/1", platform=platform)  # type: ignore[arg-type]
+
+    assert "candidate-secret-platform" not in str(error.value)
 
 
 @pytest.mark.parametrize("name", ("empty.yaml", "missing.yaml"))

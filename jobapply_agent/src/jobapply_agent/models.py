@@ -40,6 +40,18 @@ DEFAULT_EXCLUDED_TITLE_TERMS: tuple[str, ...] = (
 )
 
 
+def _excluded_title_terms(value: Any) -> tuple[str, ...]:
+    """Preserve the safe default unless exclusions use the supported YAML shapes."""
+
+    if value is None:
+        return DEFAULT_EXCLUDED_TITLE_TERMS
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return _as_strings(value)
+    return DEFAULT_EXCLUDED_TITLE_TERMS
+
+
 @dataclass(frozen=True, slots=True)
 class JobRequirement:
     """One validated listing requirement consumed by deterministic policy.
@@ -180,6 +192,13 @@ class CandidateProfile:
         for skill in _as_strings(learning):
             evidence.setdefault(skill, "learning_or_exposure")
 
+        if "exclude_title_terms" in data:
+            excluded_title_terms = data["exclude_title_terms"]
+        elif "exclude_title_terms" in roles:
+            excluded_title_terms = roles["exclude_title_terms"]
+        else:
+            excluded_title_terms = DEFAULT_EXCLUDED_TITLE_TERMS
+
         return cls(
             professional_skills=_as_strings(professional),
             personal_open_source_skills=_as_strings(personal),
@@ -189,11 +208,7 @@ class CandidateProfile:
                 experience.get("years_experience", experience.get("total_years")),
             ),
             role_targets=_as_strings(data.get("role_targets", roles.get("include", positioning.get("focus", ())))),
-            excluded_title_terms=_as_strings(
-                data.get("exclude_title_terms", roles.get("exclude_title_terms"))
-                if "exclude_title_terms" in data or "exclude_title_terms" in roles
-                else DEFAULT_EXCLUDED_TITLE_TERMS
-            ),
+            excluded_title_terms=_excluded_title_terms(excluded_title_terms),
             mandatory_excluded_requirements=_as_strings(
                 data.get("mandatory_excluded_requirements", hard_exclusions.get("mandatory_requirements", ()))
             ),
