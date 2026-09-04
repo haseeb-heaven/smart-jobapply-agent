@@ -218,17 +218,17 @@ class ExternalCommandAdapter:
                 close_fds=True,
                 start_new_session=True,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
             raise BrowserAdapterError("browser adapter command failed") from None
-        # Capture the process group while the leader is still alive: it may
+        # With start_new_session=True the child is the deterministic leader
+        # of a new process group, so its pgid equals its pid. Capture it
+        # directly instead of resolving it via getpgid(): the leader may
         # exit immediately while a pipe-holding helper survives, after which
-        # resolving the group from the leader's pid can fail.
-        getpgid = getattr(os, "getpgid", None)
-        if os.name != "nt" and callable(getpgid):
-            try:
-                spawn_pgid: int | None = getpgid(child.pid)
-            except (OSError, ProcessLookupError):
-                spawn_pgid = None
+        # getpgid() can fail for the leader's pid (and it is unavailable on
+        # Windows), leaving the timeout with no group to kill and the wait
+        # unbounded. No command, argument, URL, or output data is recorded.
+        if os.name != "nt":
+            spawn_pgid: int | None = child.pid
         else:
             spawn_pgid = None
         timer = threading.Timer(

@@ -323,6 +323,61 @@ def test_default_runner_open_listing_uses_argv_without_shell(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="process-group timeout behavior is POSIX-only")
+def test_default_runner_bounds_helper_wait_without_getpgid(monkeypatch: pytest.MonkeyPatch):
+    """The group kill stays bounded even when getpgid is unavailable.
+
+    With start_new_session=True the pgid deterministically equals the child
+    pid, so the timeout kill must not depend on resolving the group via
+    getpgid() (which races leader exit) or on Windows-only fallbacks. A
+    helper holding the stdout pipe still cannot stall the bridge past the
+    timeout, and failure output stays redacted.
+    """
+
+    import sys
+    import time
+
+    def unavailable_getpgid(_pid: int) -> int:
+        raise OSError("getpgid unavailable")
+
+    monkeypatch.setattr(os, "getpgid", unavailable_getpgid, raising=False)
+
+    script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+    )
+    adapter = ExternalCommandAdapter((sys.executable, "-c", script), timeout_seconds=2)
+
+    started = time.monotonic()
+    with pytest.raises(BrowserAdapterError) as raised:
+        adapter.list_tab_urls()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 25
+    assert LINKEDIN not in str(raised.value)
+
+
+@pytest.mark.parametrize("failure", (ValueError("bad argv"), TypeError("bad argv"), AttributeError("bad pipe")))
+def test_default_runner_construction_failure_is_redacted(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+):
+    """Popen construction failures stay redacted without echoing argv."""
+
+    secret = "super-secret-bridge-token"
+
+    def exploding_popen(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(subprocess, "Popen", exploding_popen)
+
+    adapter = ExternalCommandAdapter(("fake-bridge", secret), timeout_seconds=5)
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        adapter.list_tab_urls()
+
+    assert secret not in str(raised.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process-group timeout behavior is POSIX-only")
 def test_default_runner_bounds_fd_inheriting_helpers_on_the_wall_clock():
     """A helper holding the stdout pipe cannot stall the bridge past timeout.
 

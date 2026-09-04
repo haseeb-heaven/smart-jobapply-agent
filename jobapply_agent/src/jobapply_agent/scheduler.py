@@ -37,7 +37,14 @@ except ModuleNotFoundError:  # pragma: no cover - platform dependent
 from .matcher import matcher_policy_revision, score_job
 from .models import CandidateProfile, JobListing
 from .normalize import listing_fingerprint, normalize_listing
-from .sources import SearchProfile, VisiblePageAdapter, _validate_listing_url, build_search_url, listing_from_visible_payload
+from .sources import (
+    SearchProfile,
+    VisiblePageAdapter,
+    _validate_listing_url,
+    build_search_url,
+    canonical_listing_url,
+    listing_from_visible_payload,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -449,11 +456,19 @@ class JobDiscoveryScheduler:
                 try:
                     listing = listing_from_visible_payload(payload, platform=search.platform)
                     listing = normalize_listing(listing)
+                    # Fingerprint the STRICT canonical URL, not the loose one:
+                    # loose canonicalization retains harmless tracking tags
+                    # (such as ``from``) that the strict form strips, so a
+                    # loose fingerprint would mint a new job identity per
+                    # tracking variant and fail a cross-batch re-export closed
+                    # on source-URL job_id mismatch. Title/company stay as-is,
+                    # so a title edit still changes the fingerprint (fail closed).
+                    strict_url = canonical_listing_url(listing.url, listing.platform)
                 except (TypeError, ValueError) as error:
                     malformed += 1
                     errors.append(f"{search.platform} visible payload rejected: {type(error).__name__}")
                     continue
-                fingerprint = listing_fingerprint(listing.platform, listing.url, listing.title, listing.company)
+                fingerprint = listing_fingerprint(listing.platform, strict_url, listing.title, listing.company)
                 if fingerprint in known or fingerprint in run_seen:
                     duplicates += 1
                     continue

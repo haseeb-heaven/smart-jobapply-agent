@@ -202,6 +202,61 @@ def test_repeated_runs_dedupe_and_never_take_application_actions(tmp_path: Path)
     assert rows[0]["application_actions"] == 0
 
 
+def test_tracking_variant_reexport_keeps_a_stable_fingerprint(tmp_path: Path):
+    """The same job with different tracking tags must share one fingerprint.
+
+    Tracking query data (such as a ``from`` tag) is not job identity: the
+    fingerprint hashes the strict-canonical URL, so a re-export carrying a
+    different harmless tracking tag is stable instead of minting a second job
+    identity that would fail a later batch closed on a source-URL job_id
+    mismatch. Title/company still participate, so a title edit keeps failing
+    closed (see the admission title-edit test).
+    """
+
+    search = SearchProfile("linkedin", "Python Backend Developer")
+    search_url = build_search_url(search)
+    description = "Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL."
+
+    def payloads_for(variant: str) -> dict[str, list[dict[str, str]]]:
+        return {
+            search_url: [
+                {
+                    "title": "Python Backend Developer",
+                    "company": "Acme",
+                    "url": f"https://www.linkedin.com/jobs/view/123?from={variant}",
+                    "description": description,
+                }
+            ]
+        }
+
+    first_state = tmp_path / "first-state.json"
+    first_export = tmp_path / "first-jobs.jsonl"
+    first = JobDiscoveryScheduler(profile(), [search], state_path=first_state, export_path=first_export).run(
+        MappingVisiblePageAdapter(payloads_for("search"))
+    )
+    assert first.recommended_exports == 1
+
+    second_state = tmp_path / "second-state.json"
+    second_export = tmp_path / "second-jobs.jsonl"
+    second = JobDiscoveryScheduler(profile(), [search], state_path=second_state, export_path=second_export).run(
+        MappingVisiblePageAdapter(payloads_for("other"))
+    )
+    assert second.recommended_exports == 1
+
+    first_rows = [json.loads(line) for line in first_export.read_text(encoding="utf-8").splitlines()]
+    second_rows = [json.loads(line) for line in second_export.read_text(encoding="utf-8").splitlines()]
+    assert len(first_rows) == 1
+    assert len(second_rows) == 1
+    assert first_rows[0]["fingerprint"] == second_rows[0]["fingerprint"]
+
+    reexport = JobDiscoveryScheduler(profile(), [search], state_path=first_state, export_path=first_export).run(
+        MappingVisiblePageAdapter(payloads_for("other"))
+    )
+    assert reexport.recommended_exports == 0
+    assert reexport.duplicate_listings == 1
+    assert len(first_export.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_profile_revision_re_evaluates_same_listing_and_preserves_same_revision_dedupe(tmp_path: Path):
     """A safe evidence revision must not inherit seen state from an older profile."""
 
