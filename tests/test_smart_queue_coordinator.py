@@ -316,6 +316,36 @@ def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recom
     assert [queue.get(candidate.job_id).state for candidate in candidates[5:]] == ["recommended"] * 2
 
 
+def test_cycle_rejects_mismatched_revision_recommendations_without_opening(tmp_path: Path):
+    """The coordinator inherits the queue's active-pair admission check.
+
+    A bound queue admits only its active pair, so caller-supplied
+    recommendations from another revision fail closed atomically: no rows
+    are stored, no tabs open, and no snapshot is consumed for them.
+    """
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    coordinator.cycle([_candidate(1)])
+
+    mismatched = QueueCandidate(
+        job_id="coordinator-job-stale",
+        source_url="https://www.linkedin.com/jobs/view/70999",
+        fit_score=99,
+        eligible=True,
+        decision="recommended",
+        evidence=("synthetic verified evidence stale",),
+        profile_revision="coordinator-profile-stale",
+        matcher_policy_revision=_POLICY_REVISION,
+    )
+    with pytest.raises(QueuePolicyError, match="conflict"):
+        coordinator.cycle([mismatched])
+
+    assert queue.active_revisions == (_PROFILE_REVISION, _POLICY_REVISION)
+    with pytest.raises(KeyError):
+        queue.get(mismatched.job_id)
+    assert browser.opened_urls == [queue.get("coordinator-job-1").source_url]
+
+
 @pytest.mark.parametrize("target_size", (1, 3, 10))
 def test_cycle_opens_exactly_the_candidate_selected_number_of_listing_tabs(
     tmp_path: Path, target_size: int

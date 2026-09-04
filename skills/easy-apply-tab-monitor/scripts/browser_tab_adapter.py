@@ -12,8 +12,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -115,6 +117,42 @@ def is_listing_url(value: object) -> bool:
     return True
 
 
+def _kill_bridge_process_tree(
+    child: subprocess.Popen[str], *, pgid: int | None = None
+) -> None:
+    """Kill one bridge child and any helpers sharing its process session.
+
+    ``pgid`` is captured at spawn time because the group leader may exit
+    (becoming an unreaped zombie) while a helper still holds the captured
+    pipe open; on some platforms ``getpgid`` then fails for the leader's
+    pid even though the group survives. Falls back to resolving the group
+    from the live child, then to the direct child where process groups are
+    unavailable. Never raises and never reports process, command, or URL
+    details.
+    """
+
+    try:
+        killpg = getattr(os, "killpg", None)
+        getpgid = getattr(os, "getpgid", None)
+        resolved_pgid = pgid
+        if resolved_pgid is None and os.name != "nt" and callable(getpgid):
+            try:
+                resolved_pgid = getpgid(child.pid)
+            except (OSError, ProcessLookupError):
+                resolved_pgid = None
+        if os.name != "nt" and callable(killpg) and resolved_pgid is not None:
+            try:
+                killpg(resolved_pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            child.kill()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 class ExternalCommandAdapter:
     """Delegate the two permitted actions to an explicit argv-based bridge.
 
@@ -159,6 +197,15 @@ class ExternalCommandAdapter:
         stay redacted) so a voluminous stderr cannot block the child either.
         ``shell`` stays ``False`` and no command, argument, URL, or output
         bytes ever enter the raised error.
+
+        The child starts in its own process session with no inherited file
+        descriptors, so a bridge that spawns background helpers cannot hold
+        the captured pipe open past the timeout: the timeout kills the whole
+        process group (falling back to the direct child where process groups
+        are unavailable), which bounds the wall clock even when a helper
+        inherits the stdout descriptor. The group id is captured at spawn
+        because the leader may exit while a helper survives, after which the
+        group can no longer be resolved from the leader's pid.
         """
 
         try:
@@ -168,10 +215,28 @@ class ExternalCommandAdapter:
                 stderr=subprocess.DEVNULL,
                 text=True,
                 shell=False,
+                close_fds=True,
+                start_new_session=True,
             )
         except (OSError, subprocess.SubprocessError):
             raise BrowserAdapterError("browser adapter command failed") from None
-        timer = threading.Timer(self._timeout_seconds, child.kill)
+        # Capture the process group while the leader is still alive: it may
+        # exit immediately while a pipe-holding helper survives, after which
+        # resolving the group from the leader's pid can fail.
+        getpgid = getattr(os, "getpgid", None)
+        if os.name != "nt" and callable(getpgid):
+            try:
+                spawn_pgid: int | None = getpgid(child.pid)
+            except (OSError, ProcessLookupError):
+                spawn_pgid = None
+        else:
+            spawn_pgid = None
+        timer = threading.Timer(
+            self._timeout_seconds,
+            _kill_bridge_process_tree,
+            args=(child,),
+            kwargs={"pgid": spawn_pgid},
+        )
         try:
             timer.start()
             chunks: list[str] = []
@@ -190,10 +255,7 @@ class ExternalCommandAdapter:
                     oversize = True
                     break
                 chunks.append(piece)
-            try:
-                child.kill()
-            except Exception:
-                pass
+            _kill_bridge_process_tree(child, pgid=spawn_pgid)
             try:
                 child.wait(timeout=5)
             except Exception:
@@ -208,16 +270,10 @@ class ExternalCommandAdapter:
                 raise BrowserAdapterError("browser adapter command failed")
             return subprocess.CompletedProcess(argv, returncode, "".join(chunks), "")
         except BrowserAdapterError:
-            try:
-                child.kill()
-            except Exception:
-                pass
+            _kill_bridge_process_tree(child, pgid=spawn_pgid)
             raise
         except (OSError, subprocess.SubprocessError):
-            try:
-                child.kill()
-            except Exception:
-                pass
+            _kill_bridge_process_tree(child, pgid=spawn_pgid)
             raise BrowserAdapterError("browser adapter command failed") from None
         finally:
             timer.cancel()

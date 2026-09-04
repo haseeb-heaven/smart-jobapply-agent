@@ -293,43 +293,124 @@ def test_reset_empty_queue_revisions_rejects_stored_job_without_mutation(tmp_pat
     assert queue.get(candidate.job_id).source_url == candidate.source_url
 
 
-def test_active_revision_switch_excludes_stale_profile_or_policy_recommendations(tmp_path: Path):
+def test_bound_queue_rejects_mismatched_revision_batch_atomically(tmp_path: Path):
+    """A bound queue admits only its active pair; mismatches fail closed.
+
+    Inserting a mismatched batch would create dead rows that refill
+    selection can never reach, so the whole batch is rejected before any
+    recommendation is stored.
+    """
     database = tmp_path / "queue.sqlite3"
     queue = SmartJobQueue(database)
     queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
-    stale = [
-        _candidate(
-            number,
-            100 - number,
-            profile_revision="profile-v1",
-            matcher_policy_revision="policy-v1",
-        )
-        for number in range(1, 6)
-    ]
-    stale_policy = _candidate(
-        6,
-        100,
-        profile_revision="profile-v1",
-        matcher_policy_revision="policy-v2",
+    queue.add_recommendations(
+        [_candidate(number, 100 - number, profile_revision="profile-v1", matcher_policy_revision="policy-v1") for number in range(1, 4)]
     )
-    fresh = [
-        _candidate(
-            number,
-            90 - number,
-            profile_revision="profile-v2",
-            matcher_policy_revision="policy-v2",
+    with sqlite3.connect(database) as connection:
+        before = (
+            connection.execute("SELECT COUNT(*) FROM smart_queue_jobs").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM smart_queue_events").fetchone()[0],
         )
-        for number in range(7, 12)
-    ]
-    queue.add_recommendations([*stale, stale_policy, *fresh])
 
-    queue.set_active_revisions("profile-v2", "policy-v2", actor="host")
+    mismatched = _candidate(4, 99, profile_revision="profile-v2", matcher_policy_revision="policy-v2")
+    matching = _candidate(5, 98, profile_revision="profile-v1", matcher_policy_revision="policy-v1")
+    with pytest.raises(QueuePolicyError, match="conflict"):
+        queue.add_recommendations([matching, mismatched])
+
+    assert queue.active_revisions == ("profile-v1", "policy-v1")
+    with sqlite3.connect(database) as connection:
+        after = (
+            connection.execute("SELECT COUNT(*) FROM smart_queue_jobs").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM smart_queue_events").fetchone()[0],
+        )
+    assert after == before
+    with pytest.raises(KeyError):
+        queue.get(mismatched.job_id)
+
+
+def test_bound_queue_rejects_multi_pair_batch_even_without_prior_rows(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
+
+    with pytest.raises(QueuePolicyError, match="conflict"):
+        queue.add_recommendations(
+            [
+                _candidate(1, 99, profile_revision="profile-v1", matcher_policy_revision="policy-v1"),
+                _candidate(2, 98, profile_revision="profile-v1", matcher_policy_revision="policy-v2"),
+            ]
+        )
+
+    assert queue.active_revisions == ("profile-v1", "policy-v1")
+
+
+def test_set_active_revisions_refuses_nonempty_queue_for_a_new_pair(tmp_path: Path):
+    """Rewriting the pair under stored rows would strand them outside refill."""
+    database = tmp_path / "queue.sqlite3"
+    queue = SmartJobQueue(database)
+    queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
+    queue.add_recommendations([_candidate(1, 99, profile_revision="profile-v1", matcher_policy_revision="policy-v1")])
+
+    with pytest.raises(QueuePolicyError, match="empty"):
+        queue.set_active_revisions("profile-v2", "policy-v2", actor="host")
+
+    assert queue.active_revisions == ("profile-v1", "policy-v1")
+    binding_events = queue.revision_history()
+    assert len(binding_events) == 1
+    assert binding_events[0].prior_profile_revision is None
+    assert binding_events[0].profile_revision == "profile-v1"
+    assert queue.get("job-1").profile_revision == "profile-v1"
+
+
+def test_set_active_revisions_accepts_same_pair_idempotently_without_event(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
+    queue.add_recommendations([_candidate(1, 99, profile_revision="profile-v1", matcher_policy_revision="policy-v1")])
+    before = queue.revision_history()
+
+    assert queue.set_active_revisions("profile-v1", "policy-v1", actor="host") == ("profile-v1", "policy-v1")
+
+    assert queue.active_revisions == ("profile-v1", "policy-v1")
+    assert queue.revision_history() == before
+
+
+def test_set_active_revisions_on_empty_queue_changes_pair_with_history_event(tmp_path: Path):
+    database = tmp_path / "queue.sqlite3"
+    queue = SmartJobQueue(database)
+    queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
+    first_events = queue.revision_history()
+    assert len(first_events) == 1
+    assert first_events[0].prior_profile_revision is None
+    assert first_events[0].prior_matcher_policy_revision is None
+
+    assert queue.set_active_revisions("profile-v2", "policy-v2", actor="host") == ("profile-v2", "policy-v2")
+
+    events = queue.revision_history()
+    assert len(events) == 2
+    change = events[-1]
+    assert change.prior_profile_revision == "profile-v1"
+    assert change.prior_matcher_policy_revision == "policy-v1"
+    assert change.profile_revision == "profile-v2"
+    assert change.matcher_policy_revision == "policy-v2"
+    assert change.actor == "host"
+    assert change.queue_id == queue.queue_id
+    assert change.occurred_at.endswith("+00:00")
+
     restarted = SmartJobQueue(database)
-    action = restarted.plan_refill(open_urls=[])
-
     assert restarted.active_revisions == ("profile-v2", "policy-v2")
-    assert action.job_ids == tuple(candidate.job_id for candidate in fresh)
-    assert {restarted.get(candidate.job_id).state for candidate in [*stale, stale_policy]} == {"recommended"}
+    assert restarted.revision_history() == events
+
+    assert queue.set_active_revisions("profile-v2", "policy-v2", actor="host") == ("profile-v2", "policy-v2")
+    assert queue.revision_history() == events
+
+
+def test_set_active_revisions_on_unbound_empty_queue_is_accepted_with_event(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    assert queue.active_revisions == (None, None)
+
+    assert queue.set_active_revisions("profile-v1", "policy-v1") == ("profile-v1", "policy-v1")
+
+    assert queue.active_revisions == ("profile-v1", "policy-v1")
+    assert len(queue.revision_history()) == 1
 
 
 def test_legacy_queue_schema_migrates_without_rewriting_history_or_losing_unversioned_behavior(tmp_path: Path):
@@ -569,6 +650,96 @@ def test_decreasing_candidate_capacity_never_closes_tabs_or_infers_outcomes(tmp_
     assert {candidate.job_id: queue.history_for(candidate.job_id) for candidate in candidates[:5]} == before
     assert {queue.get(candidate.job_id).state for candidate in candidates[:5]} == {"open"}
     assert queue.confirmed_outcome_events() == ()
+
+
+_INTAKE_HASH = "ab" * 32
+
+
+def test_set_target_size_nondefault_without_proof_records_host_configured(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+
+    assert queue.set_target_size(3, actor="user") == 3
+
+    assert queue.target_size == 3
+    assert queue.capacity_provenance == "host-configured"
+    assert queue.has_active_intake_capacity_provenance is False
+
+
+def test_set_target_size_with_active_intake_proof_keeps_live_authorization(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+
+    assert (
+        queue.set_target_size(
+            3,
+            actor="user",
+            capacity_provenance="active-candidate-intake",
+            intake_revision_hash=_INTAKE_HASH,
+        )
+        == 3
+    )
+
+    assert queue.target_size == 3
+    assert queue.capacity_provenance == "active-candidate-intake"
+    assert queue.has_active_intake_capacity_provenance is True
+
+
+def test_set_target_size_clears_stale_intake_proof_instead_of_reproving(tmp_path: Path):
+    queue = SmartJobQueue.for_active_candidate_intake(
+        tmp_path / "queue.sqlite3",
+        target_size=3,
+        intake_revision_hash=_INTAKE_HASH,
+    )
+    assert queue.has_active_intake_capacity_provenance is True
+
+    assert queue.set_target_size(4, actor="user") == 4
+
+    assert queue.capacity_provenance == "host-configured"
+    assert queue.has_active_intake_capacity_provenance is False
+
+    assert queue.set_target_size(5, actor="user") == 5
+    assert queue.capacity_provenance == "default"
+    assert queue.has_active_intake_capacity_provenance is False
+
+
+@pytest.mark.parametrize(
+    ("target_size", "provenance_kwargs"),
+    (
+        (3, {"capacity_provenance": "default"}),
+        (3, {"capacity_provenance": "legacy-unverified"}),
+        (3, {"capacity_provenance": "active-candidate-intake"}),
+        (
+            3,
+            {
+                "capacity_provenance": "host-configured",
+                "intake_revision_hash": _INTAKE_HASH,
+            },
+        ),
+        (5, {"capacity_provenance": "host-configured"}),
+        (5, {"intake_revision_hash": _INTAKE_HASH}),
+        (3, {"capacity_provenance": "unsupported"}),
+    ),
+    ids=(
+        "default-label-with-nondefault-size",
+        "legacy-label-with-nondefault-size",
+        "intake-proof-without-hash",
+        "hash-without-intake-provenance",
+        "nondefault-label-with-default-size",
+        "hash-with-default-size",
+        "unknown-provenance",
+    ),
+)
+def test_set_target_size_rejects_inconsistent_provenance_without_mutation(
+    tmp_path: Path, target_size: int, provenance_kwargs: dict[str, str]
+):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    before_history = queue.capacity_history()
+
+    with pytest.raises(QueuePolicyError, match="provenance|revision|default"):
+        queue.set_target_size(target_size, actor="user", **provenance_kwargs)
+
+    assert queue.target_size == 5
+    assert queue.capacity_provenance == "default"
+    assert queue.capacity_history() == before_history
 
 
 def test_rejected_ineligible_duplicate_and_historic_jobs_are_never_selected(tmp_path: Path):

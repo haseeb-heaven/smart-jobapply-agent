@@ -1625,6 +1625,27 @@ def _validate_admission_paths(
     return intake_path, export_path, queue_path, memory_path, private_root
 
 
+def _revalidate_admission_file(path: Path) -> None:
+    """Re-check one admission input immediately before reading it.
+
+    The admission paths are validated with ``lstat`` without following
+    links, but a local writer could replace a file between that validation
+    and the read. Re-checking that the path is still a non-link regular
+    file narrows that window and fails closed on any violation. This keeps
+    a local-attacker-only assumption explicit: admission inputs must live
+    in OS-permission-confined private runtime directories, and the monitor
+    lease serializes concurrent admitters rather than defending against a
+    privileged local writer.
+    """
+
+    try:
+        status = os.lstat(path)
+    except OSError:
+        _admission_path_error()
+    if _is_link_like(path, status) or not stat.S_ISREG(status.st_mode):
+        _admission_path_error()
+
+
 def _admission_text(value: object, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise AdmissionError("queue admission failed")
@@ -1657,6 +1678,7 @@ def _validated_admission_candidates(
     candidates: list[QueueCandidate] = []
     fingerprints: set[str] = set()
     source_urls: set[str] = set()
+    _revalidate_admission_file(export_path)
     try:
         lines = export_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -1695,10 +1717,16 @@ def _validated_admission_candidates(
         if not isinstance(fingerprint, str) or _ADMISSION_FINGERPRINT.fullmatch(fingerprint) is None:
             raise AdmissionError("queue admission failed")
         try:
+            # Re-canonicalize with the strict listing canonicalizer and store
+            # only its output. Discovery exports may carry harmless tracking
+            # query data (for example an Indeed ``from=search`` tag) that the
+            # strict form strips; comparing canonical-to-canonical keeps those
+            # rows admissible while suppression keys stay in strict form. A
+            # row whose URL cannot be strict-canonicalized still fails closed.
             canonical_url = canonical_listing_url(row["url"], row["platform"])
         except ValueError:
             raise AdmissionError("queue admission failed") from None
-        if row["url"] != canonical_url or fingerprint in fingerprints or canonical_url in source_urls:
+        if fingerprint in fingerprints or canonical_url in source_urls:
             raise AdmissionError("queue admission failed")
         try:
             _admission_text(row["run_id"])
@@ -1828,6 +1856,22 @@ def admit_current_recommendations_for_active_queue(
 
     The only non-error exclusion is durable exact-URL suppression.  This
     service neither reads browser state nor accepts application actions.
+
+    Admission is single-admitter via the monitor's exact sibling-file
+    ``DatabaseLease``: the lease is held across intake/export reads,
+    revision binding, memory suppression, and durable insertion, so a
+    concurrent admitter for the same queue database fails closed without
+    mutating queue or memory state. SQLite transactions alone do not span
+    the whole operation; the lease is the serialization boundary.
+
+    Re-exports that reference an already-known listing URL must repeat
+    that row byte-identically (same fingerprint, score, evidence, and
+    revisions); any conflicting re-export of a known URL fails the whole
+    batch closed rather than rewriting immutable recommendation history.
+
+    Admission inputs are re-validated as non-link regular files immediately
+    before reading. This assumes a local-attacker-only model: inputs must
+    live in OS-permission-confined private runtime directories.
     """
 
     try:
@@ -1836,6 +1880,8 @@ def admit_current_recommendations_for_active_queue(
         )
         lease = _monitor_database_lease(queue_path)
         with lease:
+            _revalidate_admission_file(intake_path)
+            _revalidate_admission_file(export_path)
             profile = active_candidate_profile(intake_path)
             profile_revision = candidate_profile_revision(profile)
             policy_revision = matcher_policy_revision()

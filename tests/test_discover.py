@@ -2058,7 +2058,7 @@ def test_admit_queue_accepts_a_valid_current_five_row_batch(private_test_dir: Pa
         pytest.param(lambda rows: {**rows[-1], "matcher_policy_revision": "0" * 64}, id="stale-policy"),
         pytest.param(lambda rows: {**rows[-1], "platform": "unsupported"}, id="unsupported-platform"),
         pytest.param(
-            lambda rows: {**rows[-1], "url": rows[-1]["url"].replace("/viewjob", "/viewjob/")},
+            lambda rows: {**rows[-1], "url": rows[-1]["url"] + "&unexpected=1"},
             id="noncanonical-url",
         ),
         pytest.param(lambda rows: {**rows[-1], "is_test_fixture": True}, id="fixture-flag"),
@@ -2352,3 +2352,100 @@ def test_admit_queue_rejects_malformed_jsonl_export_without_durable_mutation(
 
     assert admission_database_counts(queue_path) == (0, 0)
     assert not memory_path.exists()
+
+
+def test_admit_queue_accepts_tracking_tagged_indeed_urls_and_stores_strict_form(
+    private_test_dir: Path,
+):
+    """Loose-but-strict-canonicalizable export URLs admit in strict form.
+
+    Discovery exports may carry harmless tracking query data such as an
+    Indeed ``from=search`` tag. Admission re-canonicalizes each row URL
+    with the strict canonicalizer, compares canonical-to-canonical for
+    duplicates, and stores only the strict form that suppression keys use.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    for row in rows:
+        assert row["platform"] == "indeed"
+        row["url"] = f"{row['url']}&from=search"
+    write_admission_export(export_path, rows)
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+    with sqlite3.connect(queue_path) as connection:
+        stored_urls = [
+            row[0]
+            for row in connection.execute("SELECT source_url FROM smart_queue_jobs ORDER BY rowid").fetchall()
+        ]
+    assert len(stored_urls) == 5
+    assert all("from=" not in url for url in stored_urls)
+    assert stored_urls == [f"https://www.indeed.com/viewjob?jk=admit{index + 1:04d}" for index in range(5)]
+
+
+def test_admit_queue_contending_lease_holder_fails_closed_without_mutation(
+    private_test_dir: Path,
+):
+    """Admission is single-admitter via the monitor's sibling-file lease.
+
+    While another holder owns the lease for the same queue database, the
+    whole admission operation fails closed before reading intake/export
+    state into durable queue or memory rows.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+
+    with discover._monitor_database_lease(queue_path):
+        with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path, export_path, queue_path, memory_path
+            )
+
+    assert not queue_path.exists()
+    assert not memory_path.exists()
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+
+def test_admit_queue_title_edited_reexport_of_known_url_fails_whole_batch_closed(
+    private_test_dir: Path,
+):
+    """Re-exports of URL-known rows must be byte-identical or fail closed.
+
+    A title edit changes the discovery fingerprint, so the re-exported row
+    carries a new job identity for an already-known listing URL. Admission
+    keeps failing the whole batch closed rather than rewriting the
+    immutable recommendation history. No output-field changes are involved.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+    edited = [dict(row) for row in rows]
+    edited[0] = {
+        **edited[0],
+        "title": "Senior Python Backend Developer",
+        "fingerprint": f"{0xED17ED:064x}",
+    }
+    write_admission_export(export_path, edited)
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert admission_database_counts(queue_path) == (5, 5)

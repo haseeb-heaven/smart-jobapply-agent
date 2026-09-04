@@ -9,6 +9,7 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -319,6 +320,34 @@ def test_default_runner_open_listing_uses_argv_without_shell(tmp_path):
     adapter.open_listing(LINKEDIN)
 
     assert json.loads(probe.read_text(encoding="utf-8")) == ["open-listing", LINKEDIN]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process-group timeout behavior is POSIX-only")
+def test_default_runner_bounds_fd_inheriting_helpers_on_the_wall_clock():
+    """A helper holding the stdout pipe cannot stall the bridge past timeout.
+
+    The child exits at once while a background helper inherits the captured
+    stdout descriptor and sleeps. Killing only the direct child would leave
+    the pipe open and the wall clock unbounded; the process-group kill
+    bounds it instead. Failure output stays redacted.
+    """
+
+    import sys
+    import time
+
+    script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+    )
+    adapter = ExternalCommandAdapter((sys.executable, "-c", script), timeout_seconds=2)
+
+    started = time.monotonic()
+    with pytest.raises(BrowserAdapterError) as raised:
+        adapter.list_tab_urls()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 25
+    assert LINKEDIN not in str(raised.value)
 
 
 @pytest.mark.parametrize(

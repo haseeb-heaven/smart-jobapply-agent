@@ -147,6 +147,25 @@ class CapacityPolicyEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RevisionPolicyEvent:
+    """One immutable, attributable active-revision-pair change.
+
+    Prior revisions are ``None`` only when the queue moved out of the
+    unbound state. Event rows carry no listing URLs, candidate facts, or
+    browser state.
+    """
+
+    event_id: int
+    prior_profile_revision: str | None
+    prior_matcher_policy_revision: str | None
+    profile_revision: str
+    matcher_policy_revision: str
+    actor: str
+    occurred_at: str
+    queue_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class QueueAction:
     """A data-only refill plan for a caller-controlled browser adapter."""
 
@@ -548,7 +567,7 @@ class SmartJobQueue:
 
     @staticmethod
     def _write_active_revisions(
-        connection: sqlite3.Connection, revisions: tuple[str, str]
+        connection: sqlite3.Connection, revisions: tuple[str | None, str | None]
     ) -> None:
         cursor = connection.execute(
             """
@@ -611,6 +630,16 @@ class SmartJobQueue:
                     occurred_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS smart_queue_revision_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prior_profile_revision TEXT,
+                    prior_matcher_policy_revision TEXT,
+                    profile_revision TEXT NOT NULL,
+                    matcher_policy_revision TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_smart_queue_events_job
                     ON smart_queue_events(job_id, event_id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_queue_one_outcome
@@ -618,6 +647,8 @@ class SmartJobQueue:
                     WHERE name IN ('submitted', 'rejected', 'skipped');
                 CREATE INDEX IF NOT EXISTS idx_smart_queue_capacity_events
                     ON smart_queue_capacity_events(event_id);
+                CREATE INDEX IF NOT EXISTS idx_smart_queue_revision_events
+                    ON smart_queue_revision_events(event_id);
 
                 CREATE TRIGGER IF NOT EXISTS smart_queue_jobs_no_update
                 BEFORE UPDATE ON smart_queue_jobs
@@ -653,6 +684,18 @@ class SmartJobQueue:
                 BEFORE DELETE ON smart_queue_capacity_events
                 BEGIN
                     SELECT RAISE(ABORT, 'smart queue capacity events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS smart_queue_revision_events_no_update
+                BEFORE UPDATE ON smart_queue_revision_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'smart queue revision events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS smart_queue_revision_events_no_delete
+                BEFORE DELETE ON smart_queue_revision_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'smart queue revision events are append-only');
                 END;
                 """
             )
@@ -795,6 +838,48 @@ class SmartJobQueue:
             (prior_target_size, target_size, actor, _utc_now()),
         )
 
+    @staticmethod
+    def _append_revision_policy_event(
+        connection: sqlite3.Connection,
+        *,
+        prior_revisions: tuple[str | None, str | None],
+        revisions: tuple[str, str],
+        actor: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO smart_queue_revision_events
+                (prior_profile_revision, prior_matcher_policy_revision,
+                 profile_revision, matcher_policy_revision, actor, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prior_revisions[0],
+                prior_revisions[1],
+                revisions[0],
+                revisions[1],
+                actor,
+                _utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _write_capacity_provenance(
+        connection: sqlite3.Connection,
+        provenance: str,
+        intake_revision: str | None,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE smart_queue_metadata
+            SET capacity_provenance = ?, capacity_intake_revision = ?
+            WHERE metadata_id = 1
+            """,
+            (provenance, intake_revision),
+        )
+        if cursor.rowcount != 1:
+            raise QueueStorageError("smart queue capacity provenance could not be persisted")
+
     def set_active_revisions(
         self,
         profile_revision: str,
@@ -804,8 +889,13 @@ class SmartJobQueue:
     ) -> tuple[str, str]:
         """Explicitly select the revision pair eligible for future refills.
 
-        This changes queue metadata only. It never changes recommendation rows,
-        queue history, or candidate-confirmed outcomes.
+        The pair may change only while the queue holds no stored
+        recommendations; rewriting it underneath stored rows would strand
+        them outside refill selection with no auditable recovery. Repeating
+        the current pair is an idempotent no-op. An accepted change writes
+        one append-only revision-policy event. Legacy queues that already
+        hold unversioned rows therefore stay unbound; this never changes
+        recommendation rows, queue history, or candidate-confirmed outcomes.
         """
 
         revisions = _require_revision_pair(
@@ -818,9 +908,29 @@ class SmartJobQueue:
         active_pair = (revisions[0], revisions[1])
         connection = self._transaction()
         try:
+            current_pair = self._read_active_revisions(connection)
+            if active_pair == current_pair:
+                connection.rollback()
+                assert current_pair[0] is not None and current_pair[1] is not None
+                return (current_pair[0], current_pair[1])
+            has_stored_job = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM smart_queue_jobs)"
+            ).fetchone()
+            if has_stored_job is None:
+                raise QueueStorageError("smart queue stored jobs are unavailable")
+            if bool(has_stored_job[0]):
+                raise QueuePolicyError(
+                    "queue revisions may be changed only while the queue is empty"
+                )
             self._write_active_revisions(connection, active_pair)
+            self._append_revision_policy_event(
+                connection,
+                prior_revisions=current_pair,
+                revisions=active_pair,
+                actor=actor,
+            )
             connection.commit()
-        except QueueStorageError:
+        except (QueuePolicyError, QueueStorageError):
             connection.rollback()
             raise
         except sqlite3.Error:
@@ -897,23 +1007,89 @@ class SmartJobQueue:
         finally:
             self._close(connection)
 
-    def set_target_size(self, target_size: int, *, actor: str) -> int:
+    def set_target_size(
+        self,
+        target_size: int,
+        *,
+        actor: str,
+        capacity_provenance: str | None = None,
+        intake_revision_hash: str | None = None,
+    ) -> int:
         """Persist a user-selected capacity without changing jobs or outcomes.
 
         Reducing capacity never closes visible tabs, releases reservations, or
         infers an application outcome. Refill planning simply remains idle
         until candidate-controlled activity naturally creates a vacancy.
+
+        Capacity provenance is explicit and never inferred. The documented
+        default of five always resolves to ``default`` provenance and needs
+        no proof. Any other capacity resolves to ``host-configured`` unless
+        the caller supplies ``capacity_provenance="active-candidate-intake"``
+        with the fresh intake revision hash that attests it; a user choice
+        is therefore never silently marked intake-proven. A
+        ``host-configured`` non-default capacity is honestly recorded but is
+        not live-authorized: the live coordinator refuses non-default
+        capacity without active-intake proof, so keeping a live queue
+        authorized across a resize requires binding fresh intake proof (for
+        example through the active-intake factory). Inconsistent
+        combinations -- a non-default size labeled ``default``, an intake
+        revision without active-intake provenance, or proof supplied for the
+        default size -- fail closed without mutation.
         """
 
         target_size = _require_target_size(target_size)
         actor = _require_actor(actor)
         if actor != "user":
             raise QueuePolicyError("target_size may be changed only by the exact user actor")
+        if capacity_provenance is None:
+            requested_provenance: str | None = None
+        else:
+            requested_provenance = _require_capacity_provenance(capacity_provenance)
+        if requested_provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE:
+            requested_intake_revision: str | None = _require_intake_revision_hash(
+                intake_revision_hash
+            )
+        elif intake_revision_hash is not None:
+            raise QueuePolicyError("only active intake capacity provenance may include an intake revision")
+        else:
+            requested_intake_revision = None
+        if target_size == _DEFAULT_TARGET_SIZE:
+            if requested_provenance not in (None, _CAPACITY_PROVENANCE_DEFAULT):
+                raise QueuePolicyError(
+                    "default capacity provenance requires the default target_size"
+                )
+            resolved_provenance = _CAPACITY_PROVENANCE_DEFAULT
+            resolved_intake_revision = None
+        elif requested_provenance is None:
+            resolved_provenance = _CAPACITY_PROVENANCE_HOST_CONFIGURED
+            resolved_intake_revision = None
+        elif requested_provenance == _CAPACITY_PROVENANCE_HOST_CONFIGURED:
+            resolved_provenance = _CAPACITY_PROVENANCE_HOST_CONFIGURED
+            resolved_intake_revision = None
+        elif requested_provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE:
+            resolved_provenance = _CAPACITY_PROVENANCE_ACTIVE_INTAKE
+            resolved_intake_revision = requested_intake_revision
+        else:
+            raise QueuePolicyError(
+                "non-default target_size requires host-configured or active intake capacity provenance"
+            )
         connection = self._transaction()
         try:
             previous_target_size = self._read_target_size(connection)
+            stored_provenance, stored_intake_revision = self._read_capacity_provenance(connection)
+            if (
+                target_size == previous_target_size
+                and resolved_provenance == stored_provenance
+                and resolved_intake_revision == stored_intake_revision
+            ):
+                connection.rollback()
+                self._target_size = previous_target_size
+                return previous_target_size
+            self._write_target_size(connection, target_size)
+            self._write_capacity_provenance(
+                connection, resolved_provenance, resolved_intake_revision
+            )
             if target_size != previous_target_size:
-                self._write_target_size(connection, target_size)
                 self._append_capacity_policy_event(
                     connection,
                     prior_target_size=previous_target_size,
@@ -980,6 +1156,70 @@ class SmartJobQueue:
         """Compatibility alias for the read-only capacity-policy event stream."""
 
         return self.capacity_history(after_event_id=after_event_id)
+
+    def revision_history(self, *, after_event_id: int = 0) -> tuple[RevisionPolicyEvent, ...]:
+        """Return the append-only, attributable active-revision-pair stream.
+
+        This exposes no listing URLs, candidate facts, or browser state. A
+        revision event is written only when :meth:`set_active_revisions`
+        changes the durable pair on an empty queue; repeating the current
+        pair does not fabricate a policy revision.
+        """
+
+        if (
+            isinstance(after_event_id, bool)
+            or not isinstance(after_event_id, int)
+            or after_event_id < 0
+        ):
+            raise QueuePolicyError("after_event_id must be a non-negative integer")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_id, prior_profile_revision, prior_matcher_policy_revision,
+                       profile_revision, matcher_policy_revision, actor, occurred_at
+                FROM smart_queue_revision_events
+                WHERE event_id > ?
+                ORDER BY event_id
+                """,
+                (after_event_id,),
+            ).fetchall()
+            events: list[RevisionPolicyEvent] = []
+            for row in rows:
+                try:
+                    prior_pair = _require_revision_pair(
+                        row["prior_profile_revision"],
+                        row["prior_matcher_policy_revision"],
+                        allow_unversioned=True,
+                    )
+                    pair = _require_revision_pair(
+                        row["profile_revision"],
+                        row["matcher_policy_revision"],
+                        allow_unversioned=False,
+                    )
+                    assert pair[0] is not None and pair[1] is not None
+                    actor = _require_actor(row["actor"])
+                except QueuePolicyError:
+                    raise QueueStorageError("smart queue revision history is invalid") from None
+                events.append(
+                    RevisionPolicyEvent(
+                        event_id=int(row["event_id"]),
+                        prior_profile_revision=prior_pair[0],
+                        prior_matcher_policy_revision=prior_pair[1],
+                        profile_revision=pair[0],
+                        matcher_policy_revision=pair[1],
+                        actor=actor,
+                        occurred_at=str(row["occurred_at"]),
+                        queue_id=self.queue_id,
+                    )
+                )
+            return tuple(events)
+        except QueueStorageError:
+            raise
+        except sqlite3.Error:
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
 
     @staticmethod
     def _rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -1140,6 +1380,18 @@ class SmartJobQueue:
                 pair = next(iter(candidate_revision_pairs))
                 assert pair[0] is not None and pair[1] is not None
                 self._write_active_revisions(connection, (pair[0], pair[1]))
+            elif (
+                active_revisions != (None, None)
+                and candidate_revision_pairs
+                and candidate_revision_pairs != {active_revisions}
+            ):
+                # A bound queue admits only its active pair. Inserting a
+                # mismatched batch would create dead rows that refill
+                # selection can never reach, so the whole batch fails
+                # closed atomically before any recommendation is stored.
+                raise QueuePolicyError(
+                    "recommendation batch revisions conflict with the active queue pair"
+                )
 
             batch_by_id: dict[str, QueueCandidate] = {}
             batch_by_url: dict[str, QueueCandidate] = {}
