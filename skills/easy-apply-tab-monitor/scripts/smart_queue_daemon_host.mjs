@@ -51,9 +51,12 @@ function daemonArguments(value) {
   return [...value];
 }
 
+const MAX_BINDING_ID_LENGTH = 128;
+
 function optionalBindingId(value) {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.includes("\0")) throw new TypeError("bindingId must be a string");
+  if (value.length > MAX_BINDING_ID_LENGTH) throw new TypeError("bindingId is invalid");
   return value.length > 0 ? value : undefined;
 }
 
@@ -134,6 +137,10 @@ function toBridgeBinding(browserBinding) {
         async new() {
           return {
             async goto(url) { await generic.openListing(url); },
+            // Accepted downgrade: handoff-marking is a Codex-session
+            // affordance with no generic counterpart, so the synthetic tab's
+            // markHandoff is a harmless no-op. Generic opens still go through
+            // the host's own openListing with an exact approved URL only.
             async markHandoff() {},
           };
         },
@@ -318,12 +325,11 @@ function observeExit(child) {
 function runtimeKey(configuration) {
   // The supervisor intentionally keys only local process configuration, never
   // browser bindings, URLs, candidate data, or external service identifiers.
-  // An explicit non-empty bindingId selects a separate singleton slot.
-  if (configuration.bindingId !== undefined) {
-    return JSON.stringify([
-      configuration.executable, configuration.daemonPath, configuration.daemonArgs, configuration.bindingId,
-    ]);
-  }
+  // The creation bindingId is stored alongside the entry, never in the key:
+  // a later request carrying a different non-empty bindingId fails closed so
+  // a second session cannot silently reuse the first session's browser
+  // binding. Same-session restarts pass fresh but equivalent binding objects
+  // under the same bindingId, so object identity is never compared here.
   return JSON.stringify([configuration.executable, configuration.daemonPath, configuration.daemonArgs]);
 }
 
@@ -466,18 +472,27 @@ export function startSmartQueueDaemonHost(browserBinding, options) {
  *
  * This opt-in helper retains the active handle until it exits, so repeated
  * calls cannot create duplicate monitors for the same private queue process.
- * It deliberately does not retain a browser binding as part of the key unless
- * the caller supplies an explicit non-empty bindingId.
+ * The creation bindingId is retained with the entry but never compared by
+ * object identity: a repeat call with the same (or absent) bindingId reuses
+ * the live host, while a different non-empty bindingId fails closed with a
+ * redacted TypeError so the caller supplies a distinct daemon configuration
+ * for the second session instead of silently routing to the wrong browser.
  */
 export function startOrGetSmartQueueDaemonHost(browserBinding, options) {
   const configuration = daemonHostConfiguration(options);
   const key = runtimeKey(configuration);
   const existing = supervisedHosts.get(key);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) {
+    if (configuration.bindingId !== undefined && existing.bindingId !== configuration.bindingId) {
+      throw new TypeError("browser binding belongs to a different session; use a distinct daemon configuration");
+    }
+    return existing.host;
+  }
   const host = startSmartQueueDaemonHost(browserBinding, options);
-  supervisedHosts.set(key, host);
+  const entry = { host, bindingId: configuration.bindingId };
+  supervisedHosts.set(key, entry);
   host.finished.then(() => {
-    if (supervisedHosts.get(key) === host) supervisedHosts.delete(key);
+    if (supervisedHosts.get(key) === entry) supervisedHosts.delete(key);
   });
   return host;
 }

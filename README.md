@@ -608,9 +608,14 @@ When that refill reports `search_needed`, the host agent — never the daemon,
 bridge, or CLI — closes the loop. The agent gathers already-visible listing
 facts with its own tools, runs the existing evidence-first discovery against
 the current active intake (deterministic eligibility decided before ranking),
-then invokes the deterministic, agent-only admission command:
+stages the producer export into the ignored private runtime directory
+(discovery's default `--output-dir` writes `recommended_jobs.jsonl` under
+`jobapply_agent/data/`, while the admission sample below reads the staged
+`jobapply_agent/private/discovery.jsonl`), then invokes the deterministic,
+agent-only admission command:
 
 ```sh
+cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
 python3 jobapply_agent/scripts/discover.py admit-queue \
   --candidate-intake jobapply_agent/private/candidate_intake.json \
   --discovery-export jobapply_agent/private/discovery.jsonl \
@@ -639,7 +644,9 @@ control a browser, inspect page content, fill forms, upload documents, or
 submit applications. The candidate owns every application action.
 
 For persistent Smart Queue monitoring, start the dedicated live entry point;
-do not use the legacy watcher. The host starts it through the Node parent that
+do not use the legacy watcher. Use one of exactly two startup paths:
+
+(a) stdio mode: the host starts it through the Node parent that
 owns the already-connected browser binding, never by invoking Python
 directly. Use the supervised helper, which retains one active host singleton
 until it finishes so repeated startup calls cannot create a duplicate daemon
@@ -657,6 +664,20 @@ const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
 });
 ```
 
+(b) standalone external mode with NO Node parent, via exactly:
+
+```sh
+python3 skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --database jobapply_agent/private/smart-queue.sqlite3 \
+  --adapter external \
+  --adapter-command <bridge> [--max-ticks N]
+```
+
+The external bridge argv must implement `<cmd> list-tabs` (JSON URL array on
+stdout) and `<cmd> open-listing <url>` (open the exact approved listing URL).
+Direct Python launch stays forbidden for stdio mode (path (a)).
+
 The unsupervised `startSmartQueueDaemonHost` function is a low-level,
 test-only primitive; persistent agent operation must use the supervised helper
 above. The Codex Chrome extension bridge is one tested reference integration
@@ -671,8 +692,9 @@ stream, terminal frame, or exited process cannot make the host ready or healthy.
 
 `smart_queue_daemon.py` builds the queue only from the active,
 integrity-checked candidate intake, uses a durable database under the ignored
-private runtime directory, and attaches only through a Node-parented strict
-NDJSON stdio bridge to an already-connected browser session. The Codex Chrome
+private runtime directory, and in stdio mode attaches only through a Node-parented strict
+NDJSON stdio bridge to an already-connected browser session (in standalone
+external mode it instead spawns the explicit argv bridge itself per call). The Codex Chrome
 extension bridge is one tested reference integration for such a session. The daemon
 writes bridge requests to stderr and reads one matching response from stdin;
 its stdout consists only of redacted count-only JSON status lines. The parent

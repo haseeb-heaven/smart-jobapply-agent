@@ -210,7 +210,18 @@ class CandidateMemory:
         cls,
         connection: sqlite3.Connection,
     ) -> None:
-        """Reject populated legacy memory before migration mutates its schema."""
+        """Reject populated legacy memory before migration mutates its schema.
+
+        Private-API coupling note: this preflight reads the outcomes and
+        queue-scope tables directly instead of going through the public
+        outcome surface (``is_suppressed`` /
+        ``filter_unsuppressed_candidates``) or the scope binder
+        (``_bind_or_validate_queue_scope``), because it must run inside
+        ``_initialize`` before the schema it inspects is guaranteed to
+        exist. A future refactor could replace the direct reads with a
+        public scope-introspection method plus ``_require_queue_id``; no
+        such refactor is attempted here.
+        """
 
         tables = {
             str(row["name"])

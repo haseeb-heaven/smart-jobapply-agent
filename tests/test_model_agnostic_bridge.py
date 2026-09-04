@@ -4,12 +4,10 @@ These tests assert the CONTRACT for the model-agnostic bridge migration and
 never modify production behavior. They use injected streams/runners only and
 never start a browser, inspect page content, or perform an application action.
 
-Pending-on-implementer policy: assertions that need a production symbol which
-does not exist yet (``browser_bridge_adapter.Std​ioBridgeAdapter``,
-``smart_queue_daemon`` external ``--adapter`` CLI, or
-``smart_queue_daemon_host.mjs``) skip with an explicit pending message instead
-of creating production code. Strict behavioral assertions against existing
-symbols fail loudly until the Implementer lands them.
+The contract symbols (``browser_bridge_adapter.Std​ioBridgeAdapter``,
+``smart_queue_daemon`` external ``--adapter`` CLI, and
+``smart_queue_daemon_host.mjs``) have landed, so assertions bind them
+directly and fail loudly on regression.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ import pytest
 
 
 _SCRIPTS_DIR = Path(__file__).parents[1] / "skills" / "easy-apply-tab-monitor" / "scripts"
+_REPO_ROOT = Path(__file__).parents[1]
 _HOST_PATH = _SCRIPTS_DIR / "smart_queue_daemon_host.mjs"
 
 
@@ -80,8 +79,7 @@ del _path_loaded_name
 
 
 def _needs_bridge() -> Any:
-    if StdioBridgeAdapter is None:
-        pytest.skip("pending-on-implementer: browser_bridge_adapter.StdioBridgeAdapter missing")
+    assert StdioBridgeAdapter is not None
     return StdioBridgeAdapter
 
 
@@ -260,6 +258,23 @@ def _private_paths(tmp_path: Path) -> tuple[str, str]:
             encoding="utf-8",
         )
     return str(intake), str(runtime / "queue.sqlite3")
+
+
+def test_stdio_timeout_reader_thread_is_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading as threading_module
+
+    captured: dict[str, object] = {}
+    real_thread = threading_module.Thread
+
+    def recording_thread(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(_BRIDGE.threading, "Thread", recording_thread)
+    adapter, _requests, _responses = _stdio({"id": "request-1", "ok": True, "urls": []})
+
+    assert adapter.list_tab_urls() == ()
+    assert captured.get("daemon") is True
 
 
 def test_daemon_config_accepts_host_provided_and_external_kinds() -> None:
@@ -492,6 +507,17 @@ def test_external_list_ignores_rather_than_returns_non_listing_urls(bad_url: str
     assert _EXTERNAL(("fake-bridge",), runner=runner).list_tab_urls() == (LINKEDIN,)
 
 
+def test_external_oversize_stdout_is_a_redacted_error() -> None:
+    oversized = "[" + json.dumps(LINKEDIN) + "," + " " * 1_048_576 + "]"
+    runner = _external_runner(oversized)
+
+    with pytest.raises(_TAB_ERROR) as raised:
+        _EXTERNAL(("fake-bridge",), runner=runner).list_tab_urls()
+
+    assert LINKEDIN not in str(raised.value)
+    assert oversized[:100] not in str(raised.value)
+
+
 def test_external_list_ignores_mixed_batch_without_raising() -> None:
     payload = json.dumps([
         "https://mail.example.test/inbox?private=value",
@@ -613,10 +639,25 @@ def test_external_runner_timeout_is_redacted() -> None:
 
 
 def test_generic_daemon_host_exports_model_agnostic_starters() -> None:
-    if not _HOST_PATH.is_file():
-        pytest.skip("pending-on-implementer: smart_queue_daemon_host.mjs missing")
-    source = _HOST_PATH.read_text(encoding="utf-8")
-    assert "startSmartQueueDaemonHost" in source
-    assert "startOrGetSmartQueueDaemonHost" in source
-    assert "listTabUrls" in source
-    assert "openListing" in source
+    """Behaviorally assert the generic host module loads and exports both starters.
+
+    This runs the real Node module (no browser needed) instead of grepping
+    source text, so it proves the importable contract the docs promise.
+    """
+
+    completed = subprocess.run(
+        [
+            "node", "-e",
+            "import('./skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs')"
+            ".then(m=>console.log(typeof m.startSmartQueueDaemonHost,"
+            " typeof m.startOrGetSmartQueueDaemonHost))",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "function function"

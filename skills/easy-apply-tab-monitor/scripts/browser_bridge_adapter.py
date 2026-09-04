@@ -110,6 +110,10 @@ class StdioBridgeAdapter:
                 completed.set()
 
         try:
+            # Accepted: the reader is a daemon thread, so a timed-out read
+            # leaks at most one blocked daemon reader that cannot keep the
+            # process alive. The stream is marked terminal on timeout and is
+            # never reused, so no timeout-machinery redesign is needed.
             threading.Thread(target=read, daemon=True).start()
         except Exception:
             raise BrowserAdapterError("browser bridge is unavailable") from None

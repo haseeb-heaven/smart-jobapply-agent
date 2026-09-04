@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 DEFAULT_TIMEOUT_SECONDS = 15.0
 _MAX_TAB_URLS = 512
 _MAX_TAB_URL_LENGTH = 8_192
+_MAX_STDOUT_BYTES = 1_048_576
 _LINKEDIN_LISTING_PATH = re.compile(r"^/jobs/view/[A-Za-z0-9_-]+/?$")
 _INDEED_JOB_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_TRACKING_QUERY_KEYS = frozenset(
@@ -174,8 +175,11 @@ class ExternalCommandAdapter:
         there is a protocol violation and the whole batch fails closed.
         """
         completed = self._invoke("list-tabs")
+        stdout = completed.stdout
+        if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > _MAX_STDOUT_BYTES:
+            raise BrowserAdapterError("browser adapter returned invalid tab data")
         try:
-            payload = json.loads(completed.stdout)
+            payload = json.loads(stdout)
         except (AttributeError, TypeError, json.JSONDecodeError):
             raise BrowserAdapterError("browser adapter returned invalid tab data") from None
         if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):

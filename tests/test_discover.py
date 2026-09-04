@@ -2116,6 +2116,37 @@ def test_admit_queue_cli_keeps_success_and_failure_output_redacted_and_count_onl
         assert secret not in failed.stdout + failed.stderr
 
 
+def test_documented_admission_path_with_staged_export_end_to_end(
+    private_test_dir: Path, tmp_path: Path
+):
+    """Prove the documented producer-stage-admit path works against temp DBs.
+
+    Discovery's default ``--output-dir`` writes ``recommended_jobs.jsonl``;
+    the documented handoff stages it to ``jobapply_agent/private/discovery.jsonl``
+    and runs the exact documented ``admit-queue`` flag spelling as a subprocess.
+    """
+    discover, intake_path, staged_export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    assert staged_export_path.name == "discovery.jsonl"
+
+    producer_export = tmp_path / "recommended_jobs.jsonl"
+    write_admission_export(producer_export, rows)
+    staged_export_path.unlink()
+    shutil.copy(producer_export, staged_export_path)
+
+    completed = run_admit_queue_cli(intake_path, staged_export_path, queue_path, memory_path)
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "admitted_count": 5,
+        "suppressed_count": 0,
+        "validated_count": 5,
+    }
+    assert admission_database_counts(queue_path) == (5, 5)
+
+
 def test_admit_queue_rejects_nonprivate_paths_symlinks_and_database_collisions(
     private_test_dir: Path,
     tmp_path: Path,
@@ -2266,6 +2297,42 @@ def test_admit_queue_failure_after_prior_binding_keeps_preexisting_pair_and_scop
     assert SmartJobQueue(queue_path).active_revisions == bound_pair
     assert admission_database_counts(queue_path) == (5, 5)
     assert _memory_scope_queue_ids(memory_path) == scope_before
+
+
+def test_admit_queue_skips_blank_lines_like_scheduler(private_test_dir: Path):
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    export_path.write_text(
+        "\n".join(["", *[json.dumps(row, sort_keys=True) for row in rows], "", ""]),
+        encoding="utf-8",
+    )
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+
+
+def test_admission_export_root_lstat_rejects_links(tmp_path: Path):
+    discover = load_discover_module()
+
+    assert discover._validate_admission_export_root(tmp_path / "missing-root") is None
+    assert discover._validate_admission_export_root(tmp_path) == tmp_path.absolute()
+
+    target = tmp_path / "target"
+    target.mkdir()
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(target, target_is_directory=True)
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover._validate_admission_export_root(linked_dir)
+
+    regular_file = tmp_path / "regular-file"
+    regular_file.write_text("x", encoding="utf-8")
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover._validate_admission_export_root(regular_file)
 
 
 def test_admit_queue_rejects_malformed_jsonl_export_without_durable_mutation(

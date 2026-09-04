@@ -10,7 +10,7 @@ import test from "node:test";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { startCodexChromeExtensionHost } from "../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs";
+import { startCodexChromeExtensionHost, canonicalListingUrl } from "../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs";
 import {
   startCodexSmartQueueDaemonHost,
   startOrGetCodexSmartQueueDaemonHost,
@@ -1229,7 +1229,7 @@ test("an ambiguous dual-shape binding fails closed without exposing binding deta
   assert.deepEqual(child.killCalls, ["SIGTERM"]);
 });
 
-test("distinct bindingIds select distinct singleton slots; empty normalizes to absent", async () => {
+test("same bindingId reuses the live host while a different bindingId fails closed", async () => {
   let spawnCalls = 0;
   const { binding } = chromeBinding();
   const optionsFor = (extra) => ({
@@ -1244,15 +1244,105 @@ test("distinct bindingIds select distinct singleton slots; empty normalizes to a
 
   const first = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" }));
   assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" })), first);
-  const other = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b" }));
+  assert.equal(spawnCalls, 1);
+  // A second session must not silently reuse the first session's browser
+  // binding; the redacted error requires a distinct daemon configuration.
+  // The long IDs below must never be reflected in the failure.
+  const privateA = `queue-a-private-${"a".repeat(16)}`;
+  const privateB = `queue-b-private-${"b".repeat(16)}`;
+  const named = startOrGetSmartQueueDaemonHost(binding, {
+    ...optionsFor({}),
+    daemonPath: "/safe/binding-id-redaction-daemon.py",
+    bindingId: privateA,
+  });
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, {
+      ...optionsFor({}),
+      daemonPath: "/safe/binding-id-redaction-daemon.py",
+      bindingId: privateB,
+    }),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.match(error.message, /distinct daemon configuration/);
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    },
+  );
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b" })),
+    /distinct daemon configuration/,
+  );
+  assert.equal(spawnCalls, 2);
+  // A distinct daemon configuration still selects a distinct singleton slot.
+  const other = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b", daemonPath: "/safe/binding-id-daemon-b.py" }));
   assert.notEqual(other, first);
-  const unnamed = startOrGetSmartQueueDaemonHost(binding, optionsFor({}));
-  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "" })), unnamed);
   assert.equal(spawnCalls, 3);
 
   await first.stop();
+  await named.stop();
   await other.stop();
+});
+
+test("absent bindingId reuses the live host and empty normalizes to absent", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-absent-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const unnamed = startOrGetSmartQueueDaemonHost(binding, optionsFor({}));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({})), unnamed);
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "" })), unnamed);
+  assert.equal(spawnCalls, 1);
+  // A later named request against the unnamed live host fails closed rather
+  // than silently adopting the first session's browser binding.
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" })),
+    /distinct daemon configuration/,
+  );
+  assert.equal(spawnCalls, 1);
+
   await unnamed.stop();
+});
+
+test("bindingId is capped at 128 characters with a redacted error", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-length-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const longest = `q-${"x".repeat(126)}`;
+  assert.equal(longest.length, 128);
+  const host = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: longest }));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: longest })), host);
+  assert.equal(spawnCalls, 1);
+
+  const overlong = `q-${"y".repeat(127)}`;
+  assert.equal(overlong.length, 129);
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: overlong })),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.doesNotMatch(error.message, /y{8}/);
+      return true;
+    },
+  );
+  assert.equal(spawnCalls, 1);
+
+  await host.stop();
 });
 
 test("the generic wrapper fails closed on malformed listTabUrls without echo", async () => {
@@ -1281,4 +1371,45 @@ test("the generic wrapper fails closed on malformed listTabUrls without echo", a
     assert.doesNotMatch(replies.join(""), /https:|\[object/);
     await host.stop();
   }
+});
+
+test("canonicalListingUrl matches the Python canonicalizer on parity vectors", () => {
+  // Whitespace padding is stripped and Indeed trailing slashes collapse,
+  // exactly like browser_tab_adapter.canonical_listing_url.
+  assert.equal(canonicalListingUrl("  https://www.linkedin.com/jobs/view/123456  "), LINKEDIN);
+  assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob/?jk=abc_123"), INDEED);
+  assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob//?jk=abc_123"), INDEED);
+  // Doubly-slashed LinkedIn paths and inner whitespace stay rejected.
+  assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/123456//"), /listing URL is invalid/);
+  assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/12 3456"), /listing URL is invalid/);
+});
+
+test("the generic synthetic tab carries a harmless markHandoff no-op and opens stay exact-URL-only", async () => {
+  const child = daemonChild();
+  const opened = [];
+  const generic = {
+    listTabUrls: async () => [LINKEDIN],
+    openListing: async (url) => { opened.push(url); },
+  };
+  const host = startSmartQueueDaemonHost(generic, {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/synthetic-handoff-daemon.py",
+    spawn: () => child,
+  });
+  const replies = [];
+  child.stdin.on("data", (chunk) => replies.push(chunk.toString("utf8")));
+  // The strict bridge demands an already-canonical URL; the generic binding
+  // has no handoff-marking of its own, so the synthetic tab's markHandoff
+  // must be a harmless no-op for the open to succeed.
+  child.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await bounded(
+    (async () => {
+      while (replies.join("").trim() === "") await new Promise((resolve) => setImmediate(resolve));
+    })(),
+    "generic open reply",
+  );
+  const frames = replies.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(frames, [{ id: "open", ok: true }]);
+  assert.deepEqual(opened, [LINKEDIN]);
+  await host.stop();
 });

@@ -32,7 +32,10 @@ Use this skill when the candidate wants job listings opened for manual applicati
 - The live Smart Queue host supplies already-validated `QueueCandidate` values
   directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
   recommendation-file CLI. It accepts any host-supplied adapter that implements
-  exactly the two bounded tab operations. The optional Codex Chrome extension
+  exactly the two bounded tab operations. Generic bindings open exact approved
+  URLs through the host's own `openListing`; handoff-marking is a Codex-session
+  affordance with no generic counterpart, so the synthetic tab's `markHandoff`
+  is a harmless no-op and opens remain exact-URL-only. The optional Codex Chrome extension
   bridge is a reference integration for an already-connected session, not a
   claim that the core can prove a host browser identity. Its local queue
   database must resolve under `jobapply_agent/private/`, which is ignored,
@@ -94,10 +97,13 @@ and validation pass. The agent never fills, uploads, applies, or submits.
 ## Persistent monitoring
 
 For persistent Smart Queue monitoring after the current interaction, start
-`scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Give
+`scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Use
+one of exactly two startup paths:
+
+(a) stdio mode through the Node parent, never as a raw Python process. Give
 it an active private candidate intake, a durable private database, and the
-exact `--bridge-stdio` argument through the Node parent, never as a raw Python
-process. The Node parent owns the already-connected browser session. Use
+exact `--bridge-stdio` argument through the Node parent. The Node parent owns
+the already-connected browser session. Use
 the supervised helper, which retains one active host singleton until it
 finishes so repeated startup calls cannot create a duplicate daemon for the
 same runtime configuration:
@@ -113,6 +119,20 @@ const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
   ],
 });
 ```
+
+(b) standalone external mode with NO Node parent, via exactly:
+
+```sh
+python3 skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --database jobapply_agent/private/smart-queue.sqlite3 \
+  --adapter external \
+  --adapter-command <bridge> [--max-ticks N]
+```
+
+The external bridge argv must implement `<cmd> list-tabs` (JSON URL array on
+stdout) and `<cmd> open-listing <url>` (open the exact approved listing URL).
+Direct Python launch stays forbidden for stdio mode (path (a)).
 
 The unsupervised `startSmartQueueDaemonHost` function is a low-level,
 test-only primitive and is not the persistent agent startup path. The Codex
@@ -151,10 +171,15 @@ candidate-approved `QueueCandidate` values before they enter the queue.
 
 When the daemon reports `search_needed`, the host agent — never the daemon,
 bridge, or CLI — gathers already-visible listing facts with its own tools,
-runs the existing evidence-first discovery, then invokes the deterministic,
+runs the existing evidence-first discovery, stages the producer export into
+the ignored private runtime directory (discovery's default `--output-dir`
+writes `recommended_jobs.jsonl` under `jobapply_agent/data/`, while the
+admission sample below reads the staged
+`jobapply_agent/private/discovery.jsonl`), then invokes the deterministic,
 agent-only admission command:
 
 ```sh
+cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
 python3 jobapply_agent/scripts/discover.py admit-queue \
   --candidate-intake jobapply_agent/private/candidate_intake.json \
   --discovery-export jobapply_agent/private/discovery.jsonl \

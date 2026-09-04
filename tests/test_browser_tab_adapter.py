@@ -250,6 +250,43 @@ def test_external_adapter_strips_safe_tracking_before_opening_the_canonical_list
     assert observed == [["fake-bridge", "open-listing", LINKEDIN]]
 
 
+def test_external_adapter_rejects_oversize_stdout_without_echo():
+    oversized = "[" + json.dumps(LINKEDIN) + "," + " " * 1_048_576 + "]"
+
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=oversized, stderr="")
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        ExternalCommandAdapter(("fake-bridge",), runner=runner).list_tab_urls()
+
+    assert LINKEDIN not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    (
+        ("  https://www.linkedin.com/jobs/view/123456  ", LINKEDIN),
+        ("https://in.indeed.com/viewjob/?jk=abc_123", INDEED),
+        ("https://in.indeed.com/viewjob//?jk=abc_123", INDEED),
+    ),
+)
+def test_canonicalizer_parity_vectors_match_js_bridge(raw: str, canonical: str):
+    """Whitespace padding and trailing slashes canonicalize like the JS bridge."""
+
+    assert _MODULE.canonical_listing_url(raw) == canonical
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "https://www.linkedin.com/jobs/view/123456//",
+        "https://www.linkedin.com/jobs/view/12 3456",
+    ),
+)
+def test_canonicalizer_parity_rejections_match_js_bridge(raw: str):
+    assert is_listing_url(raw) is False
+
+
 def test_factory_requires_explicit_adapter_selection_and_external_command():
     def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout="[]", stderr="")

@@ -23,13 +23,21 @@ function safeTrackingKey(key) {
 
 /** Return a canonical supported listing URL, or throw without exposing input. */
 export function canonicalListingUrl(value) {
-  if (typeof value !== "string" || value.length === 0 || value.length > MAX_TAB_URL_LENGTH) fail("listing URL is invalid");
+  if (typeof value !== "string") fail("listing URL is invalid");
+  // Match the Python canonicalizer, which strips surrounding whitespace: the
+  // WHATWG URL parser would also drop it, but trim explicitly so both sides
+  // accept the same padded inputs.
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_TAB_URL_LENGTH) fail("listing URL is invalid");
   let parsed;
   try {
-    parsed = new URL(value);
+    parsed = new URL(trimmed);
   } catch {
     fail("listing URL is invalid");
   }
+  // Accepted divergence: host case uses toLowerCase here while Python uses
+  // casefold. The allowlist below is ASCII-only and both agree on ASCII, so
+  // every non-listing is still rejected identically on both sides.
   const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
   if (
     parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.hash || !host ||
@@ -41,7 +49,9 @@ export function canonicalListingUrl(value) {
   }
   if (host === "indeed.com" || host.endsWith(".indeed.com")) {
     const jobIds = parsed.searchParams.getAll("jk");
-    if (parsed.pathname.replace(/\/$/, "") !== "/viewjob" || jobIds.length !== 1 || !INDEED_JOB_ID.test(jobIds[0])) {
+    // Strip all trailing slashes like Python's path.rstrip("/"), so
+    // "/viewjob//" canonicalizes identically on both sides.
+    if (parsed.pathname.replace(/\/+$/, "") !== "/viewjob" || jobIds.length !== 1 || !INDEED_JOB_ID.test(jobIds[0])) {
       fail("listing URL is invalid");
     }
     return `https://${host}/viewjob?jk=${encodeURIComponent(jobIds[0])}`;
@@ -224,7 +234,7 @@ async function openListing(chrome, url, fence) {
   if (fence.closed()) return false;
   if (!Array.isArray(tabs) || tabs.length === 0) fail("existing session is required");
   const tab = await fence.mutate(() => chrome.tabs.new());
-  if (tab === null || fence.closed()) return false;
+  if (fence.closed()) return false;
   if (tab == null || typeof tab.goto !== "function" || typeof tab.markHandoff !== "function") fail("invalid handoff tab");
   await fence.mutate(() => tab.goto(url));
   if (fence.closed()) return false;

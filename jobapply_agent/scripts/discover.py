@@ -1563,6 +1563,26 @@ def _validate_admission_private_root() -> Path:
     return root
 
 
+def _validate_admission_export_root(root: Path) -> Path | None:
+    """lstat one discovery-export root without following links.
+
+    Missing roots are skipped so an absent ``data/`` or ``output/``
+    directory cannot fail admission for exports staged elsewhere. A root
+    that is a link (or not a directory) fails closed.
+    """
+
+    candidate = _admission_absolute_path(root)
+    try:
+        status = os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _admission_path_error()
+    if _is_link_like(candidate, status) or not stat.S_ISDIR(status.st_mode):
+        _admission_path_error()
+    return candidate
+
+
 def _validate_admission_paths(
     candidate_intake: Path | str,
     discovery_export: Path | str,
@@ -1587,7 +1607,11 @@ def _validate_admission_paths(
             _admission_path_error()
 
     export_path = _admission_absolute_path(discovery_export)
-    export_roots = (private_root, PROJECT_ROOT / "data", PROJECT_ROOT / "output")
+    export_roots = [private_root]
+    for runtime_root in _ADMISSION_RUNTIME_ROOTS[1:]:
+        validated_root = _validate_admission_export_root(runtime_root)
+        if validated_root is not None:
+            export_roots.append(validated_root)
     for root in export_roots:
         try:
             export_path = _validate_admission_path(
@@ -1639,7 +1663,10 @@ def _validated_admission_candidates(
         raise AdmissionError("queue admission failed") from None
     for line in lines:
         if not line.strip():
-            raise AdmissionError("queue admission failed")
+            # Skip blank lines exactly like the scheduler read path
+            # (jobapply_agent.scheduler), which treats them as separators
+            # rather than malformed rows.
+            continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
