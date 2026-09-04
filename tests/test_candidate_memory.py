@@ -308,42 +308,36 @@ def test_first_nonempty_filter_batch_binds_memory_to_one_queue_and_mixed_revisio
     ) == (profile_two,)
 
 
-def test_same_queue_profile_revision_update_retains_exact_url_suppression(
+def test_same_durable_queue_revision_advance_preserves_history_and_exact_url_suppression(
     tmp_path: Path,
 ) -> None:
-    """Exact-URL suppression survives a revision update without rewriting rows.
-
-    Active revisions cannot change underneath stored recommendations, so a
-    revision switch on a non-empty queue fails closed and the submitted
-    row keeps its original pair. Suppression stays keyed on the exact
-    canonical URL: a same-pair resubmission of the known URL is filtered
-    out, while a     cross-pair batch fails closed instead of stranding rows.
-    """
+    """A durable queue retains outcomes while its active revision pair advances."""
     queue, profile_one = _queue_with_open_job(tmp_path)
     private_root = tmp_path / "private"
     memory = CandidateMemory(private_root / "candidate-memory.sqlite3", private_root=private_root)
     assert memory.filter_unsuppressed_candidates([profile_one], queue=queue) == (profile_one,)
-    memory.finalize_queue_outcome(
+    finalized = memory.finalize_queue_outcome(
         queue=queue,
         job_id=profile_one.job_id,
         outcome="submitted",
         actor="user",
         vacated=True,
     )
-    with pytest.raises(QueuePolicyError, match="empty"):
-        queue.set_active_revisions(
-            "candidate-memory-profile-v2",
-            "candidate-memory-policy-v2",
-        )
+    prior_history = queue.revision_history()
+    advanced_pair = (
+        "candidate-memory-profile-v2",
+        "candidate-memory-policy-v2",
+    )
+
+    assert queue.set_active_revisions(*advanced_pair) == advanced_pair
     assert queue.active_revisions == (
-        profile_one.profile_revision,
-        profile_one.matcher_policy_revision,
+        *advanced_pair,
     )
     refreshed_candidate = _candidate(
         "refreshed-job",
         _LINKEDIN_URL,
-        profile_revision="candidate-memory-profile-v2",
-        matcher_policy_revision="candidate-memory-policy-v2",
+        profile_revision=advanced_pair[0],
+        matcher_policy_revision=advanced_pair[1],
     )
 
     with sqlite3.connect(memory.database_path) as connection:
@@ -351,20 +345,13 @@ def test_same_queue_profile_revision_update_retains_exact_url_suppression(
             "SELECT queue_id, event_id, job_id, source_url, outcome, actor, vacated, recorded_at "
             "FROM candidate_memory_outcomes ORDER BY queue_id, event_id"
         ).fetchall()
-    with pytest.raises(CandidateMemoryPolicyError, match="revision"):
-        memory.filter_unsuppressed_candidates(
-            [refreshed_candidate], queue=queue
-        )
-    assert memory.is_suppressed(profile_one.source_url) is True
-    same_pair_resubmission = _candidate(
-        "resubmitted-job",
-        _LINKEDIN_URL,
-        profile_revision=profile_one.profile_revision,
-        matcher_policy_revision=profile_one.matcher_policy_revision,
-    )
-    assert memory.filter_unsuppressed_candidates(
-        [same_pair_resubmission], queue=queue
-    ) == ()
+    assert memory.filter_unsuppressed_candidates([refreshed_candidate], queue=queue) == ()
+    assert queue.get(profile_one.job_id).state == "submitted"
+    assert queue.revision_history()[:-1] == prior_history
+    assert queue.revision_history()[-1].prior_profile_revision == profile_one.profile_revision
+    assert queue.revision_history()[-1].prior_matcher_policy_revision == profile_one.matcher_policy_revision
+    assert queue.revision_history()[-1].profile_revision == advanced_pair[0]
+    assert queue.revision_history()[-1].matcher_policy_revision == advanced_pair[1]
     with sqlite3.connect(memory.database_path) as connection:
         after = connection.execute(
             "SELECT queue_id, event_id, job_id, source_url, outcome, actor, vacated, recorded_at "
@@ -373,6 +360,7 @@ def test_same_queue_profile_revision_update_retains_exact_url_suppression(
 
     assert after == before
     assert len(after) == 1
+    assert after[0][1] == finalized.event_id
     assert memory.is_suppressed(profile_one.source_url) is True
 
 

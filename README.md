@@ -93,7 +93,7 @@ separately in candidate memory.
 ```text
 Resume/Profile
       ↓
-GPT-5.6 Sol
+Your LLM runtime
       ↓
 Find + rank jobs
       ↓
@@ -198,11 +198,12 @@ managed tab becomes `released` and frees its slot immediately; it never records
 an application. In the same reconciliation cycle, `plan_refill` may return a
 data-only exact URL only for a distinct, already-admitted candidate. If the
 admitted pool is short, it returns `search_needed`; the host LLM then separately
-searches, deterministically validates, and suppresses candidates before
-admission. The host creates the live queue
-with `discover.smart_queue_for_active_intake(intake_path, database_path)`, and
-then passes that integrity-bound queue to the skill-level
-`SmartQueueCoordinator(queue, browser)`. A non-default live capacity is rejected
+searches, deterministically validates, and admits candidates with the
+agent-only `discover.py admit-queue` command before monitoring. The host then
+creates the live queue with
+`discover.smart_queue_for_active_intake(intake_path, database_path)`, passes
+that integrity-bound queue to `SmartQueueCoordinator(queue, browser)`, and
+runs a no-candidate reconciliation cycle. A non-default live capacity is rejected
 unless its durable metadata is bound to the active candidate intake revision;
 the default of five remains compatible. That coordinator accepts a host-provided
 listing-only adapter; the optional Codex
@@ -629,10 +630,14 @@ canonical listing URLs.
 The command never fetches pages or touches a browser. It validates the
 complete discovery export as one atomic batch — any malformed, stale,
 unsupported, duplicate, below-threshold, non-recommended, or conflicting row
-rejects the entire batch — then binds revisions only to an empty queue,
-suppresses through `CandidateMemory.filter_unsuppressed_candidates` before
-`add_recommendations` (suppression is the only non-error exclusion), and admits
-the surviving candidates. Success output is count-only JSON with validated,
+rejects the entire batch — then first binds an empty queue or advances the same
+durable queue's active pair, suppresses through
+`CandidateMemory.filter_unsuppressed_candidates` before `add_recommendations`
+(suppression is the only non-error exclusion), and admits the surviving
+candidates. A failed later-pair admission atomically restores the prior pair
+with a retained append-only provisional-advance event and an
+`admission-rollback` compensating audit event; revision history is never
+rewritten. Success output is count-only JSON with validated,
 suppressed, and admitted counts; failure emits a single redacted error object.
 Neither ever includes URLs, candidate facts, or discovery rows. The intake,
 queue, and memory databases must resolve under the

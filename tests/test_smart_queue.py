@@ -343,22 +343,31 @@ def test_bound_queue_rejects_multi_pair_batch_even_without_prior_rows(tmp_path: 
     assert queue.active_revisions == ("profile-v1", "policy-v1")
 
 
-def test_set_active_revisions_refuses_nonempty_queue_for_a_new_pair(tmp_path: Path):
-    """Rewriting the pair under stored rows would strand them outside refill."""
+def test_set_active_revisions_advances_nonempty_queue_without_rewriting_historical_rows(
+    tmp_path: Path,
+):
+    """A durable queue advances future-refill policy while preserving history."""
     database = tmp_path / "queue.sqlite3"
     queue = SmartJobQueue(database)
     queue.set_active_revisions("profile-v1", "policy-v1", actor="user")
     queue.add_recommendations([_candidate(1, 99, profile_revision="profile-v1", matcher_policy_revision="policy-v1")])
 
-    with pytest.raises(QueuePolicyError, match="empty"):
-        queue.set_active_revisions("profile-v2", "policy-v2", actor="host")
+    assert queue.set_active_revisions("profile-v2", "policy-v2", actor="host") == (
+        "profile-v2",
+        "policy-v2",
+    )
 
-    assert queue.active_revisions == ("profile-v1", "policy-v1")
+    assert queue.active_revisions == ("profile-v2", "policy-v2")
     binding_events = queue.revision_history()
-    assert len(binding_events) == 1
+    assert len(binding_events) == 2
     assert binding_events[0].prior_profile_revision is None
     assert binding_events[0].profile_revision == "profile-v1"
+    assert binding_events[1].prior_profile_revision == "profile-v1"
+    assert binding_events[1].prior_matcher_policy_revision == "policy-v1"
+    assert binding_events[1].profile_revision == "profile-v2"
+    assert binding_events[1].matcher_policy_revision == "policy-v2"
     assert queue.get("job-1").profile_revision == "profile-v1"
+    assert queue.get("job-1").matcher_policy_revision == "policy-v1"
 
 
 def test_set_active_revisions_accepts_same_pair_idempotently_without_event(tmp_path: Path):

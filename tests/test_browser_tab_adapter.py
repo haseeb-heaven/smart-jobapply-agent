@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import builtins
 import importlib.util
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -291,6 +292,196 @@ def test_default_runner_bounds_oversize_stdout_before_parse_without_echo():
     rendered = str(raised.value)
     assert LINKEDIN not in rendered
     assert len(rendered) < 1_048_576
+
+
+def test_default_runner_rejects_non_string_completed_stdout_without_echoing_bridge_data():
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=None, stderr="private-stderr")
+
+    with pytest.raises(BrowserAdapterError, match="invalid tab data") as raised:
+        ExternalCommandAdapter(("private-bridge",), runner=runner).list_tab_urls()
+
+    assert "private-bridge" not in str(raised.value)
+    assert "private-stderr" not in str(raised.value)
+
+
+class _NoopTimer:
+    """Timer seam for deterministic default-runner subprocess failure tests."""
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.started = False
+        self.cancelled = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _FakeChild:
+    """Minimal Popen seam with controllable stdout, wait, and return-code behavior."""
+
+    def __init__(
+        self,
+        *,
+        stdout: object,
+        returncode: object = 0,
+        wait_error: Exception | None = None,
+    ) -> None:
+        self.pid = 4242
+        self.stdout = stdout
+        self._returncode = returncode
+        self._wait_error = wait_error
+        self.kill_calls = 0
+
+    @property
+    def returncode(self) -> object:
+        if isinstance(self._returncode, Exception):
+            raise self._returncode
+        return self._returncode
+
+    def wait(self, **_kwargs: Any) -> None:
+        if self._wait_error is not None:
+            raise self._wait_error
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+class _ExplodingReader:
+    def read(self, _size: int) -> str:
+        raise RuntimeError("private bridge read failure")
+
+
+class _EmptyReader:
+    def read(self, _size: int) -> str:
+        return ""
+
+
+def _default_adapter_with_fake_child(
+    monkeypatch: pytest.MonkeyPatch,
+    child: _FakeChild,
+) -> tuple[ExternalCommandAdapter, list[int | None]]:
+    killed_groups: list[int | None] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(_MODULE.threading, "Timer", _NoopTimer)
+    monkeypatch.setattr(
+        _MODULE,
+        "_kill_bridge_process_tree",
+        lambda _child, *, pgid=None: killed_groups.append(pgid),
+    )
+    return ExternalCommandAdapter(("private-bridge",), timeout_seconds=1), killed_groups
+
+
+def test_default_runner_redacts_stdout_read_and_returncode_property_failures(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    read_adapter, read_kills = _default_adapter_with_fake_child(
+        monkeypatch,
+        _FakeChild(stdout=_ExplodingReader()),
+    )
+
+    with pytest.raises(BrowserAdapterError, match="command failed") as read_error:
+        read_adapter.list_tab_urls()
+
+    assert "private bridge read failure" not in str(read_error.value)
+    assert read_kills == [4242]
+
+    returncode_adapter, returncode_kills = _default_adapter_with_fake_child(
+        monkeypatch,
+        _FakeChild(stdout=_EmptyReader(), returncode=RuntimeError("private returncode failure")),
+    )
+    with pytest.raises(BrowserAdapterError, match="command failed") as returncode_error:
+        returncode_adapter.list_tab_urls()
+
+    assert "private returncode failure" not in str(returncode_error.value)
+    assert returncode_kills == [4242, 4242]
+
+
+def test_default_runner_tolerates_wait_failure_but_rejects_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    wait_adapter, wait_kills = _default_adapter_with_fake_child(
+        monkeypatch,
+        _FakeChild(stdout=StringIO("[]"), wait_error=RuntimeError("private wait failure")),
+    )
+
+    assert wait_adapter.list_tab_urls() == ()
+    assert wait_kills == [4242]
+
+    nonzero_adapter, nonzero_kills = _default_adapter_with_fake_child(
+        monkeypatch,
+        _FakeChild(stdout=_EmptyReader(), returncode=7),
+    )
+    with pytest.raises(BrowserAdapterError, match="command failed"):
+        nonzero_adapter.list_tab_urls()
+    assert nonzero_kills == [4242, 4242]
+
+
+def test_default_runner_windows_branch_uses_no_process_group(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(_MODULE, "os", SimpleNamespace(name="nt"))
+    adapter, killed_groups = _default_adapter_with_fake_child(
+        monkeypatch,
+        _FakeChild(stdout=StringIO("[]")),
+    )
+
+    assert adapter.list_tab_urls() == ()
+    assert killed_groups == [None]
+
+
+def test_default_runner_timer_start_os_error_is_redacted_and_kills_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _FailingTimer(_NoopTimer):
+        def start(self) -> None:
+            raise OSError("private timer failure")
+
+    child = _FakeChild(stdout=_EmptyReader())
+    adapter, killed_groups = _default_adapter_with_fake_child(monkeypatch, child)
+    monkeypatch.setattr(_MODULE.threading, "Timer", _FailingTimer)
+
+    with pytest.raises(BrowserAdapterError, match="command failed") as raised:
+        adapter.list_tab_urls()
+
+    assert "private timer failure" not in str(raised.value)
+    assert killed_groups == [4242]
+
+
+def test_process_tree_killer_handles_group_lookup_and_child_kill_failures(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _ExplodingKillChild:
+        pid = 9
+
+        def kill(self) -> None:
+            raise RuntimeError("private kill failure")
+
+    monkeypatch.setattr(_MODULE.os, "name", "posix")
+    monkeypatch.setattr(_MODULE.os, "getpgid", lambda _pid: (_ for _ in ()).throw(OSError()))
+    _MODULE._kill_bridge_process_tree(_ExplodingKillChild())
+
+    killed: list[int] = []
+    monkeypatch.setattr(_MODULE.os, "getpgid", lambda _pid: 77)
+    monkeypatch.setattr(_MODULE.os, "killpg", lambda pgid, _signal: killed.append(pgid))
+    _MODULE._kill_bridge_process_tree(_ExplodingKillChild())
+
+    assert killed == [77]
+
+
+def test_process_tree_killer_swallows_unexpected_group_resolution_errors(monkeypatch: pytest.MonkeyPatch):
+    class _BrokenPidChild:
+        @property
+        def pid(self) -> int:
+            raise RuntimeError("private pid failure")
+
+        def kill(self) -> None:
+            raise AssertionError("child kill must not run after broken pid")
+
+    monkeypatch.setattr(_MODULE.os, "name", "posix")
+    monkeypatch.setattr(_MODULE.os, "getpgid", lambda _pid: 1)
+
+    _MODULE._kill_bridge_process_tree(_BrokenPidChild())
 
 
 def test_invoke_enforces_byte_cap_on_injected_stdout_before_parse():

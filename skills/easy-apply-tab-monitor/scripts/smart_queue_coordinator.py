@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 from typing import Iterable, Protocol, runtime_checkable
 
 from jobapply_agent.candidate_memory import CandidateMemory
@@ -60,15 +61,24 @@ class QueueOutcome:
 class SmartQueueCoordinator:
     """Coordinate a private live queue through a bounded host tab adapter."""
 
-    def __init__(self, queue: SmartJobQueue, browser: BrowserTabAdapter) -> None:
+    def __init__(
+        self,
+        queue: SmartJobQueue,
+        browser: BrowserTabAdapter,
+        *,
+        candidate_memory: CandidateMemory | None = None,
+    ) -> None:
         if not isinstance(queue, SmartJobQueue):
             raise TypeError("queue must be a SmartJobQueue")
         self._require_private_runtime_database(queue)
         self._require_live_capacity_provenance(queue)
         if not isinstance(browser, BrowserTabAdapter):
             raise TypeError("browser must implement the listing-only BrowserTabAdapter protocol")
+        if candidate_memory is not None and not isinstance(candidate_memory, CandidateMemory):
+            raise TypeError("candidate_memory must be a CandidateMemory")
         self._queue = queue
         self._browser = browser
+        self._candidate_memory = candidate_memory
 
     @staticmethod
     def _require_private_runtime_database(queue: SmartJobQueue) -> None:
@@ -105,6 +115,28 @@ class SmartQueueCoordinator:
         except Exception:
             raise QueueCoordinatorError("browser tab snapshot failed") from None
 
+    @staticmethod
+    def _memory_scope_preexists(candidate_memory: CandidateMemory) -> bool:
+        """Observe scope presence before a first-batch rollback boundary.
+
+        CandidateMemory intentionally exposes no candidate facts here.  This
+        narrow check distinguishes a preexisting immutable scope from the
+        empty-memory scope that ``filter_unsuppressed_candidates`` may bind
+        for the first successful batch, so an admission failure never removes
+        an established scope.
+        """
+
+        try:
+            connection = sqlite3.connect(candidate_memory.database_path, timeout=10)
+            try:
+                return connection.execute(
+                    "SELECT 1 FROM candidate_memory_queue_scope WHERE scope_id = 1"
+                ).fetchone() is not None
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            raise QueueCoordinatorError("candidate-memory scope is unavailable") from None
+
     def cycle(self, recommendations: Iterable[QueueCandidate] = ()) -> QueueCycle:
         """Run snapshot → plan → optional recommendations → open → snapshot.
 
@@ -122,7 +154,58 @@ class SmartQueueCoordinator:
         except TypeError:
             raise QueuePolicyError("recommendations must be an iterable of QueueCandidate values") from None
         if supplied_recommendations:
-            self._queue.add_recommendations(supplied_recommendations)
+            if any(not isinstance(candidate, QueueCandidate) for candidate in supplied_recommendations):
+                raise QueuePolicyError("recommendations must contain only QueueCandidate values")
+            if self._candidate_memory is None:
+                raise QueueCoordinatorError(
+                    "coordinator admission requires candidate-memory suppression"
+                )
+            candidate_pairs = {
+                (candidate.profile_revision, candidate.matcher_policy_revision)
+                for candidate in supplied_recommendations
+            }
+            active_pair = self._queue.active_revisions
+            revisions_newly_bound = False
+            scope_preexisted = self._memory_scope_preexists(self._candidate_memory)
+            if active_pair == (None, None):
+                if len(candidate_pairs) != 1:
+                    raise QueuePolicyError(
+                        "recommendation batch revisions conflict with the active queue pair"
+                    )
+                profile_revision, matcher_policy_revision = next(iter(candidate_pairs))
+                # CandidateMemory requires an active queue pair to validate
+                # the prevalidated batch. This changes only queue metadata;
+                # it creates no recommendation row before suppression. Only
+                # an empty queue may receive this first binding, allowing a
+                # failure below to restore its prior unbound state exactly.
+                self._queue.bind_empty_queue_revisions(profile_revision, matcher_policy_revision)
+                revisions_newly_bound = True
+            elif candidate_pairs != {active_pair}:
+                raise QueuePolicyError(
+                    "recommendation batch revisions conflict with the active queue pair"
+                )
+            # CandidateMemory authenticates this exact durable queue, checks
+            # the active revision pair, and suppresses only exact canonical
+            # URLs before any queue mutation. The coordinator never accepts
+            # unfiltered host/provider recommendations.
+            try:
+                unsuppressed = self._candidate_memory.filter_unsuppressed_candidates(
+                    supplied_recommendations,
+                    queue=self._queue,
+                )
+                self._queue.add_recommendations(unsuppressed)
+            except BaseException:
+                # The first-batch operations span two private SQLite files.
+                # Each has a purpose-built empty-state rollback that preserves
+                # durable history and an already-bound memory scope.
+                try:
+                    if revisions_newly_bound:
+                        self._queue.reset_empty_queue_revisions()
+                    if not scope_preexisted:
+                        self._candidate_memory.discard_outcome_empty_queue_scope()
+                except BaseException:
+                    pass
+                raise
 
         initial_snapshot = self._snapshot()
         recovered_open_failed_job_ids = self._queue.record_visible_snapshot(

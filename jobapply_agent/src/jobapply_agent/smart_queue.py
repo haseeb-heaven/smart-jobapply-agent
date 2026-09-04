@@ -889,13 +889,14 @@ class SmartJobQueue:
     ) -> tuple[str, str]:
         """Explicitly select the revision pair eligible for future refills.
 
-        The pair may change only while the queue holds no stored
-        recommendations; rewriting it underneath stored rows would strand
-        them outside refill selection with no auditable recovery. Repeating
-        the current pair is an idempotent no-op. An accepted change writes
-        one append-only revision-policy event. Legacy queues that already
-        hold unversioned rows therefore stay unbound; this never changes
-        recommendation rows, queue history, or candidate-confirmed outcomes.
+        Revisions select only the candidates eligible for *future* refills.
+        Existing recommendation rows, their event history, and any
+        candidate-confirmed outcomes are immutable historical records, so a
+        later active pair may safely supersede them without rewriting or
+        deleting those records. Repeating the current pair is an idempotent
+        no-op. An accepted change writes one append-only revision-policy event.
+        Legacy queues with unversioned rows may likewise advance to an
+        explicit pair without mutating their historical rows.
         """
 
         revisions = _require_revision_pair(
@@ -913,15 +914,6 @@ class SmartJobQueue:
                 connection.rollback()
                 assert current_pair[0] is not None and current_pair[1] is not None
                 return (current_pair[0], current_pair[1])
-            has_stored_job = connection.execute(
-                "SELECT EXISTS(SELECT 1 FROM smart_queue_jobs)"
-            ).fetchone()
-            if has_stored_job is None:
-                raise QueueStorageError("smart queue stored jobs are unavailable")
-            if bool(has_stored_job[0]):
-                raise QueuePolicyError(
-                    "queue revisions may be changed only while the queue is empty"
-                )
             self._write_active_revisions(connection, active_pair)
             self._append_revision_policy_event(
                 connection,
@@ -939,6 +931,65 @@ class SmartJobQueue:
         finally:
             self._close(connection)
         return active_pair
+
+    def _rollback_active_revision_advance(
+        self,
+        *,
+        prior_revisions: tuple[str, str],
+        attempted_revisions: tuple[str, str],
+    ) -> None:
+        """Compensate for one failed admission's revision advance.
+
+        Candidate-memory suppression must observe the requested active pair,
+        but it lives in a separate private SQLite database.  A later failure
+        therefore needs to restore the previously active pair.  The initial
+        advance and this compensating transition are both durable append-only
+        events: audit history must show that the provisional pair was selected
+        and subsequently abandoned, rather than concealing either fact.
+        """
+
+        prior_pair = _require_revision_pair(*prior_revisions, allow_unversioned=False)
+        attempted_pair = _require_revision_pair(*attempted_revisions, allow_unversioned=False)
+        assert prior_pair[0] is not None and prior_pair[1] is not None
+        assert attempted_pair[0] is not None and attempted_pair[1] is not None
+
+        connection = self._transaction()
+        try:
+            if self._read_active_revisions(connection) != attempted_pair:
+                raise QueueStorageError("smart queue active revisions changed during admission rollback")
+            event = connection.execute(
+                """
+                SELECT event_id, prior_profile_revision, prior_matcher_policy_revision,
+                       profile_revision, matcher_policy_revision
+                FROM smart_queue_revision_events
+                ORDER BY event_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if event is None or (
+                event["prior_profile_revision"],
+                event["prior_matcher_policy_revision"],
+                event["profile_revision"],
+                event["matcher_policy_revision"],
+            ) != (*prior_pair, *attempted_pair):
+                raise QueueStorageError("smart queue revision rollback event is unavailable")
+
+            self._write_active_revisions(connection, prior_pair)
+            self._append_revision_policy_event(
+                connection,
+                prior_revisions=attempted_pair,
+                revisions=prior_pair,
+                actor="admission-rollback",
+            )
+            connection.commit()
+        except QueueStorageError:
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise QueueStorageError("smart queue storage operation failed") from None
+        finally:
+            self._close(connection)
 
     def bind_empty_queue_revisions(
         self, profile_revision: str, matcher_policy_revision: str
@@ -1162,8 +1213,9 @@ class SmartJobQueue:
 
         This exposes no listing URLs, candidate facts, or browser state. A
         revision event is written only when :meth:`set_active_revisions`
-        changes the durable pair on an empty queue; repeating the current
-        pair does not fabricate a policy revision.
+        changes the durable pair; repeating the current pair does not
+        fabricate a policy revision. Existing recommendation records remain
+        immutable when the active pair advances.
         """
 
         if (

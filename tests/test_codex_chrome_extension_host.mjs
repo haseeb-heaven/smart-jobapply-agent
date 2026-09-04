@@ -383,6 +383,7 @@ sys.path.insert(0, str(root / "skills" / "easy-apply-tab-monitor" / "scripts"))
 
 from codex_chrome_extension_adapter import CodexChromeExtensionAdapter
 from smart_queue_coordinator import SmartQueueCoordinator
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
 
 private_root = root / "jobapply_agent" / "private"
@@ -399,7 +400,15 @@ with TemporaryDirectory(prefix="node-coordinator-duplicate-", dir=private_root) 
         profile_revision="duplicate-probe-profile",
         matcher_policy_revision="duplicate-probe-policy",
     )
-    coordinator = SmartQueueCoordinator(queue, CodexChromeExtensionAdapter())
+    memory = CandidateMemory(
+        Path(temporary) / "candidate-memory.sqlite3",
+        private_root=Path(temporary),
+    )
+    coordinator = SmartQueueCoordinator(
+        queue,
+        CodexChromeExtensionAdapter(),
+        candidate_memory=memory,
+    )
     try:
         coordinator.cycle((candidate,))
     except QueuePolicyError as error:

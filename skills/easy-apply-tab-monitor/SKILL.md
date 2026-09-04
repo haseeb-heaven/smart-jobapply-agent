@@ -29,17 +29,18 @@ Use this skill when the candidate wants job listings opened for manual applicati
   observed missing URL never supplies an outcome or candidate-memory
   confirmation. The legacy fixed-round watcher reopens the same URL only when
   the candidate explicitly requests that behavior.
-- The live Smart Queue host supplies already-validated `QueueCandidate` values
-  directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
-  recommendation-file CLI. It accepts any host-supplied adapter that implements
-  exactly the two bounded tab operations. Generic bindings open exact approved
-  URLs through the host's own `openListing`; handoff-marking is a Codex-session
-  affordance with no generic counterpart, so the synthetic tab's `markHandoff`
-  is a harmless no-op and opens remain exact-URL-only. The optional Codex Chrome extension
-  bridge is a reference integration for an already-connected session, not a
-  claim that the core can prove a host browser identity. Its local queue
-  database must resolve under `jobapply_agent/private/`, which is ignored,
-  never at repository root.
+- The daemon and coordinator have no recommendation-file CLI or JSON
+  recommendation input. The host admits prevalidated candidates separately
+  through the agent-only `discover.py admit-queue` path, then runs the
+  coordinator with no candidates to reconcile the durable queue. It accepts
+  any host-supplied adapter that implements exactly the two bounded tab
+  operations. Generic bindings open exact approved URLs through the host's own
+  `openListing`; handoff-marking is a Codex-session affordance with no generic
+  counterpart, so the synthetic tab's `markHandoff` is a harmless no-op and
+  opens remain exact-URL-only. The optional Codex Chrome extension bridge is a
+  reference integration for an already-connected session, not a claim that the
+  core can prove a host browser identity. Its local queue database must resolve
+  under `jobapply_agent/private/`, which is ignored, never at repository root.
 
 ## Workflow
 
@@ -53,10 +54,16 @@ Use this skill when the candidate wants job listings opened for manual applicati
    `CandidateMemory.filter_unsuppressed_candidates(candidates, queue=queue)`
    with the authenticated `SmartJobQueue` and the prevalidated `QueueCandidate`
    values, then admit only the returned values. On its first non-empty valid
-   batch, an outcome-empty memory binds once to that queue's durable opaque
-   `queue_id`, and every candidate's profile/policy revision pair must match the
-   queue's active pair. The same queue may advance revisions while exact-URL
-   suppression persists; pairing the memory with another queue fails closed.
+   batch, admission binds the empty queue to that batch's revision pair and an
+   outcome-empty memory binds once to that queue's durable opaque `queue_id`.
+   A later valid batch may advance the same durable queue's active pair while
+   its older recommendation rows and outcomes remain immutable and exact-URL
+   suppression persists. If a later-pair admission fails after that temporary
+   advance, admission atomically restores the prior pair while retaining the
+   provisional-advance audit event and appending an `admission-rollback`
+   compensating audit event; revision history is never rewritten.
+   Every candidate must match the active pair; pairing memory with another
+   queue fails closed.
    A populated legacy memory without durable queue scope fails before migration
    mutation. This filter is suppression only; it never converts uncertain
    evidence into verified fit.
@@ -67,17 +74,18 @@ Use this skill when the candidate wants job listings opened for manual applicati
    content or opens a form.
 4. Read prior-application state from the local tracker. Anything not explicitly
    candidate-confirmed remains `unknown`.
-5. In Smart Queue mode, the host gives `SmartQueueCoordinator(queue, browser)`
-   up to the candidate-selected capacity of prevalidated candidates directly.
-   It compares visible managed listing URLs and records missing jobs as
+5. In Smart Queue mode, the host first uses the `admit-queue` handoff below
+   for candidate-bearing work. It then runs
+   `SmartQueueCoordinator(queue, browser).cycle()` with no recommendations.
+   That cycle compares visible managed listing URLs and records missing jobs as
    `released` and frees each missing/closed managed slot immediately. It may
    then open only returned exact listing URLs for distinct, already-admitted
    candidates. If the pool is short, report `search_needed` to the host agent,
    which must separately obtain candidate-approved, deterministically
-   validated, unsuppressed candidates before admission. Do not treat a missing
-   URL as an outcome or candidate-memory confirmation. A capacity reduction
-   never grants close authority: the agent opens no replacements while the
-   queue is already at or above the reduced capacity.
+   validated, unsuppressed candidates before a later `admit-queue` pass. Do
+   not treat a missing URL as an outcome or candidate-memory confirmation. A
+   capacity reduction never grants close authority: the agent opens no
+   replacements while the queue is already at or above the reduced capacity.
 6. The coordinator result contains counts and opaque queue IDs only; URLs and
    snapshots remain inside the skill. Stop after the requested monitoring cycle
    unless the candidate asks for another cycle.
@@ -188,8 +196,10 @@ python3 jobapply_agent/scripts/discover.py admit-queue \
 ```
 
 The next existing-session-only monitor tick opens exactly the admitted
-canonical URLs. The command validates the discovery export all-or-nothing,
-binds revisions only to an empty queue, runs
+canonical URLs. The command validates the discovery export all-or-nothing:
+its first non-empty batch binds an empty queue to the active revision pair,
+while a later valid batch advances that same durable queue pair without
+rewriting historical recommendation or outcome rows. It runs
 `CandidateMemory.filter_unsuppressed_candidates` before `add_recommendations`
 (suppression is the only non-error exclusion), and prints count-only
 validated/suppressed/admitted results — never URLs or candidate facts. The

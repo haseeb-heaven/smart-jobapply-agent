@@ -2299,6 +2299,134 @@ def test_admit_queue_failure_after_prior_binding_keeps_preexisting_pair_and_scop
     assert _memory_scope_queue_ids(memory_path) == scope_before
 
 
+@pytest.mark.parametrize("failure_stage", ("suppression", "insertion"))
+def test_changed_revision_admission_failure_restores_prior_pair_history_scope_and_jobs(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+):
+    """A failed advance compensates append-only; a later valid advance succeeds."""
+
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.smart_queue import QueueStorageError, SmartJobQueue
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+    prior_queue = SmartJobQueue(queue_path)
+    prior_pair = prior_queue.active_revisions
+    prior_history = prior_queue.revision_history()
+    prior_jobs = admission_database_counts(queue_path)
+    prior_scope = _memory_scope_queue_ids(memory_path)
+    assert prior_pair != (None, None)
+    assert prior_scope == [prior_queue.queue_id]
+
+    active_intake = json.loads(intake_path.read_text(encoding="utf-8"))
+    revised_draft = {
+        key: active_intake[key]
+        for key in (
+            "schema_version",
+            "documents",
+            "approved_facts",
+            "unknown_fields",
+            "contradictions",
+            "pending_facts",
+        )
+    }
+    revised_draft["approved_facts"] = {
+        **revised_draft["approved_facts"],
+        "experience": {"total_years": 4},
+    }
+    intake_path.write_text(
+        json.dumps(
+            activate_candidate_profile(
+                validate_candidate_intake(revised_draft),
+                actor="user",
+            )
+        ),
+        encoding="utf-8",
+    )
+    revised_profile = discover.active_candidate_profile(intake_path)
+    revised_profile_revision = discover.candidate_profile_revision(revised_profile)
+    revised_policy_revision = "b" * 64
+    monkeypatch.setattr(discover, "matcher_policy_revision", lambda: revised_policy_revision)
+    revised_rows = [
+        {
+            **row,
+            "fingerprint": f"{100 + index:064x}",
+            "profile_revision": revised_profile_revision,
+            "matcher_policy_revision": revised_policy_revision,
+            "url": f"https://www.indeed.com/viewjob?jk=advance{100 + index:04d}",
+        }
+        for index, row in enumerate(rows)
+    ]
+    write_admission_export(export_path, revised_rows)
+
+    with monkeypatch.context() as failure_patch:
+        if failure_stage == "suppression":
+            def fail_suppression(self, candidates, *, queue):
+                raise CandidateMemoryPolicyError("synthetic suppression failure after revision advance")
+
+            failure_patch.setattr(CandidateMemory, "filter_unsuppressed_candidates", fail_suppression)
+        else:
+            def fail_insertion(self, candidates):
+                raise QueueStorageError("synthetic insertion failure after revision advance")
+
+            failure_patch.setattr(SmartJobQueue, "add_recommendations", fail_insertion)
+
+        with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path, export_path, queue_path, memory_path
+            )
+
+    restored = SmartJobQueue(queue_path)
+    assert restored.active_revisions == prior_pair
+    restored_history = restored.revision_history()
+    assert restored_history[: len(prior_history)] == prior_history
+    assert len(restored_history) == len(prior_history) + 2
+    provisional_advance, compensation = restored_history[len(prior_history) :]
+    assert provisional_advance.prior_profile_revision == prior_pair[0]
+    assert provisional_advance.prior_matcher_policy_revision == prior_pair[1]
+    assert provisional_advance.profile_revision == revised_profile_revision
+    assert provisional_advance.matcher_policy_revision == revised_policy_revision
+    assert provisional_advance.actor == "host"
+    assert compensation.prior_profile_revision == revised_profile_revision
+    assert compensation.prior_matcher_policy_revision == revised_policy_revision
+    assert compensation.profile_revision == prior_pair[0]
+    assert compensation.matcher_policy_revision == prior_pair[1]
+    assert compensation.actor == "admission-rollback"
+    assert compensation.event_id == provisional_advance.event_id + 1
+    assert admission_database_counts(queue_path) == prior_jobs
+    assert _memory_scope_queue_ids(memory_path) == prior_scope
+
+    successful_advance = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert successful_advance == discover.AdmissionStatus(
+        validated_count=5,
+        suppressed_count=0,
+        admitted_count=5,
+    )
+    advanced = SmartJobQueue(queue_path)
+    assert advanced.active_revisions == (revised_profile_revision, revised_policy_revision)
+    advanced_history = advanced.revision_history()
+    assert advanced_history[:-1] == restored_history
+    assert advanced_history[-1].prior_profile_revision == prior_pair[0]
+    assert advanced_history[-1].prior_matcher_policy_revision == prior_pair[1]
+    assert advanced_history[-1].profile_revision == revised_profile_revision
+    assert advanced_history[-1].matcher_policy_revision == revised_policy_revision
+    assert advanced_history[-1].actor == "host"
+    assert admission_database_counts(queue_path) == (10, 10)
+    assert _memory_scope_queue_ids(memory_path) == prior_scope
+
+
 def test_admit_queue_skips_blank_lines_like_scheduler(private_test_dir: Path):
     discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
         private_test_dir

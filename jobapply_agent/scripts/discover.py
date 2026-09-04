@@ -1900,11 +1900,17 @@ def admit_current_recommendations_for_active_queue(
             active_revisions = queue.active_revisions
             requested_revisions = (profile_revision, policy_revision)
             revisions_newly_bound = False
+            prior_active_revisions: tuple[str, str] | None = None
             if active_revisions == (None, None):
                 queue.bind_empty_queue_revisions(*requested_revisions)
                 revisions_newly_bound = True
             elif active_revisions != requested_revisions:
-                raise AdmissionError("queue admission failed")
+                # Revision selection controls only future refill candidates.
+                # Historical recommendation and outcome rows stay immutable,
+                # while CandidateMemory remains durably scoped to queue_id.
+                queue.set_active_revisions(*requested_revisions)
+                assert active_revisions[0] is not None and active_revisions[1] is not None
+                prior_active_revisions = (active_revisions[0], active_revisions[1])
 
             try:
                 unsuppressed = memory.filter_unsuppressed_candidates(candidates, queue=queue)
@@ -1917,9 +1923,24 @@ def admit_current_recommendations_for_active_queue(
                     admitted_count=sum(candidate.job_id not in existing_ids for candidate in unsuppressed),
                 )
             except BaseException:
+                # A later-pair filter needs the queue's active pair to be
+                # visible. If admission fails, append a compensating revision
+                # transition and restore the prior pair in one internal queue
+                # transaction; neither the provisional advance nor its
+                # compensation is ever removed from audit history. A first
+                # binding instead returns to its genuinely unbound empty
+                # state.
                 try:
                     if revisions_newly_bound:
                         queue.reset_empty_queue_revisions()
+                    elif prior_active_revisions is not None:
+                        queue._rollback_active_revision_advance(
+                            prior_revisions=prior_active_revisions,
+                            attempted_revisions=requested_revisions,
+                        )
+                except BaseException:
+                    pass  # Rollback failures never mask the original failure.
+                try:
                     if not scope_preexisted:
                         memory.discard_outcome_empty_queue_scope()
                 except BaseException:

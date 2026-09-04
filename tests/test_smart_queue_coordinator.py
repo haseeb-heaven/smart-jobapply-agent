@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from jobapply_agent.candidate_memory import CandidateMemory
+from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueuePolicyError, SmartJobQueue
 
@@ -102,7 +102,12 @@ class FollowUpUnavailableBrowser(SnapshotBrowser):
 
 
 def _coordinator(
-    tmp_path: Path, browser: SnapshotBrowser, *, target_size: int = 5
+    tmp_path: Path,
+    browser: SnapshotBrowser,
+    *,
+    target_size: int = 5,
+    candidate_memory: CandidateMemory | None = None,
+    bind_active_revisions: bool = True,
 ) -> tuple[SmartJobQueue, SmartQueueCoordinator]:
     runtime_name = f"{tmp_path.parent.name}-{tmp_path.name}"
     runtime_directory = (
@@ -120,7 +125,10 @@ def _coordinator(
             _active_intake_with_capacity(tmp_path, target_size),
             database,
         )
-    return queue, SmartQueueCoordinator(queue, browser)
+    if bind_active_revisions and queue.active_revisions == (None, None):
+        queue.bind_empty_queue_revisions(_PROFILE_REVISION, _POLICY_REVISION)
+    memory = candidate_memory or _candidate_memory(queue)
+    return queue, SmartQueueCoordinator(queue, browser, candidate_memory=memory)
 
 
 def _private_runtime_database(tmp_path: Path, name: str) -> Path:
@@ -314,6 +322,120 @@ def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recom
     assert browser.list_calls >= 2  # A post-open snapshot verifies every claimed open.
     assert [queue.get(candidate.job_id).state for candidate in candidates[:5]] == ["open"] * 5
     assert [queue.get(candidate.job_id).state for candidate in candidates[5:]] == ["recommended"] * 2
+
+
+def test_cycle_rejects_nonempty_admission_without_candidate_memory_before_snapshot_or_queue_mutation(
+    tmp_path: Path,
+):
+    """Raw caller recommendations never bypass candidate-memory suppression."""
+
+    browser = SnapshotBrowser()
+    queue, _memory_bound_coordinator = _coordinator(tmp_path, browser)
+    coordinator = SmartQueueCoordinator(queue, browser)
+
+    with pytest.raises(QueueCoordinatorError, match="candidate.memory|admission"):
+        coordinator.cycle([_candidate(1)])
+
+    with pytest.raises(KeyError):
+        queue.get("coordinator-job-1")
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_cycle_uses_candidate_memory_filter_before_adding_a_suppressed_canonical_url(
+    tmp_path: Path,
+):
+    """A memory-suppressed exact URL cannot be re-admitted through the coordinator."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser, target_size=1)
+    memory = _candidate_memory(queue)
+    original = _candidate(1)
+    queue.add_recommendations([original])
+    action = queue.plan_refill(open_urls=())
+    queue.record_visible_snapshot(action.urls_to_open, actor="synthetic-browser-bridge")
+    memory.finalize_queue_outcome(
+        queue=queue,
+        job_id=original.job_id,
+        outcome="skipped",
+        actor="user",
+        vacated=True,
+    )
+    replay = QueueCandidate(
+        job_id="coordinator-suppressed-replay",
+        source_url=original.source_url,
+        fit_score=99,
+        eligible=True,
+        decision="recommended",
+        evidence=("synthetic verified evidence replay",),
+        profile_revision=_PROFILE_REVISION,
+        matcher_policy_revision=_POLICY_REVISION,
+    )
+
+    result = coordinator.cycle([replay])
+
+    with pytest.raises(KeyError):
+        queue.get(replay.job_id)
+    assert result.search_needed == 1
+    assert browser.opened_urls == []
+
+
+def test_first_memory_bound_cycle_binds_the_candidate_revision_pair_before_suppression(
+    tmp_path: Path,
+):
+    """First admission is usable without bypassing CandidateMemory on a fresh queue."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(
+        tmp_path,
+        browser,
+        bind_active_revisions=False,
+    )
+    candidate = _candidate(1)
+
+    result = coordinator.cycle([candidate])
+
+    assert queue.active_revisions == (
+        candidate.profile_revision,
+        candidate.matcher_policy_revision,
+    )
+    assert queue.get(candidate.job_id).state == "open"
+    assert result.opened_job_ids == (candidate.job_id,)
+    assert browser.opened_urls == [candidate.source_url]
+
+
+def test_first_memory_bound_cycle_rolls_back_new_revision_binding_when_suppression_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed first suppression check cannot leave an active revision behind."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(
+        tmp_path,
+        browser,
+        bind_active_revisions=False,
+    )
+
+    def fail_suppression(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        del self, candidates, queue
+        raise CandidateMemoryPolicyError("synthetic suppression failure")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", fail_suppression)
+
+    with pytest.raises(CandidateMemoryPolicyError, match="synthetic suppression failure"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (None, None)
+    with pytest.raises(KeyError):
+        queue.get("coordinator-job-1")
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
 
 
 def test_cycle_rejects_mismatched_revision_recommendations_without_opening(tmp_path: Path):
@@ -669,7 +791,12 @@ def test_live_coordinator_accepts_verified_active_intake_capacity_and_opens_exac
         _active_intake_with_capacity(tmp_path, 3),
         _private_runtime_database(tmp_path, "verified-three"),
     )
-    coordinator = SmartQueueCoordinator(queue, browser)
+    queue.bind_empty_queue_revisions(_PROFILE_REVISION, _POLICY_REVISION)
+    coordinator = SmartQueueCoordinator(
+        queue,
+        browser,
+        candidate_memory=_candidate_memory(queue),
+    )
     candidates = [_candidate(number) for number in range(1, 5)]
 
     cycle = coordinator.cycle(candidates)
