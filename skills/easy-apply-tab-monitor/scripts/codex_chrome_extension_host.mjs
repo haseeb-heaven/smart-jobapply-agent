@@ -4,6 +4,10 @@
  */
 
 const MAX_REQUEST_BYTES = 16 * 1024;
+// This is deliberately identical to browser_bridge_adapter.py.  The Python
+// stdio client reads one complete response frame and must never receive a
+// response which it cannot retain as a single bounded envelope.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_TAB_URLS = 512;
 const MAX_TAB_URL_LENGTH = 8192;
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -250,7 +254,7 @@ function failure(id = null) {
 
 async function writeJson(output, payload) {
   const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
-  if (bytes.length > MAX_TAB_URLS * (MAX_TAB_URL_LENGTH + 4) + 256) fail("response is invalid");
+  if (bytes.length > MAX_RESPONSE_BYTES) fail("response is invalid");
   if (output.write(bytes)) return;
   await new Promise((resolve, reject) => {
     const drain = () => { output.off("error", error); resolve(); };
@@ -260,6 +264,14 @@ async function writeJson(output, payload) {
   });
 }
 
+function boundedResponse(payload, id) {
+  // A full tab snapshot can be syntactically valid while exceeding the shared
+  // stdio response envelope.  Return the fixed failure envelope instead of
+  // emitting a prefix that would desynchronize the Python client.
+  const bytes = Buffer.byteLength(`${JSON.stringify(payload)}\n`, "utf8");
+  return bytes <= MAX_RESPONSE_BYTES ? payload : failure(id);
+}
+
 async function handle(chrome, line, fence) {
   const requestId = requestIdFromLine(line);
   try {
@@ -267,10 +279,10 @@ async function handle(chrome, line, fence) {
     if (fence.closed()) return null;
     if (request.operation === "list_tab_urls") {
       const urls = await listTabUrls(chrome);
-      return fence.closed() ? null : { id: request.id, ok: true, urls };
+      return fence.closed() ? null : boundedResponse({ id: request.id, ok: true, urls }, request.id);
     }
     const opened = await openListing(chrome, request.url, fence);
-    return opened ? { id: request.id, ok: true } : null;
+    return opened ? boundedResponse({ id: request.id, ok: true }, request.id) : null;
   } catch {
     // Never reflect URLs, browser state, or binding exceptions.
     return fence.closed() ? null : failure(requestId);

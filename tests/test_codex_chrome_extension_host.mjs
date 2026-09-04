@@ -161,6 +161,41 @@ test("oversized ID-bearing frames echo their bounded opaque ID", async () => {
   assert.deepEqual(events, []);
 });
 
+test("an over-1MiB valid tab snapshot returns one fixed failure and the next frame remains usable", async () => {
+  // Each URL is individually permitted (and already canonical), but the
+  // aggregate response exceeds Python's one-frame 1MiB response boundary.
+  const nearMaxListing = `https://www.linkedin.com/jobs/view/${"a".repeat(8192 - "https://www.linkedin.com/jobs/view/".length)}`;
+  assert.equal(nearMaxListing.length, 8192);
+  const snapshots = [
+    Array.from({ length: 512 }, () => tab(nearMaxListing)),
+    [tab(LINKEDIN)],
+  ];
+  const { binding, events } = chromeBinding();
+  binding.user.openTabs = async () => {
+    events.push(["openTabs"]);
+    return snapshots.shift();
+  };
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const responses = [];
+  output.on("data", (chunk) => responses.push(Buffer.from(chunk)));
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+
+  input.end([
+    JSON.stringify({ id: "oversized", operation: "list_tab_urls" }),
+    JSON.stringify({ id: "recovered", operation: "list_tab_urls" }),
+  ].join("\n") + "\n");
+  await service.finished;
+
+  const raw = Buffer.concat(responses).toString("utf8");
+  assert.equal(raw.includes(nearMaxListing), false);
+  assert.deepEqual(raw.trim().split("\n").map((line) => JSON.parse(line)), [
+    { id: "oversized", ok: false, error: "request_failed" },
+    { id: "recovered", ok: true, urls: [LINKEDIN] },
+  ]);
+  assert.deepEqual(events, [["openTabs"], ["openTabs"]]);
+});
+
 test("request handling is serialized", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });

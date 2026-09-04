@@ -168,6 +168,46 @@ def test_stdio_id_echo_mismatch_is_a_redacted_error() -> None:
     _assert_redacted(raised.value, "request-2")
 
 
+def test_stdio_unsafe_response_terminals_before_a_second_request_write() -> None:
+    """An unsafe response cannot be consumed as a later request's reply."""
+
+    private_url = "https://mail.example.test/inbox?private=value"
+    adapter, requests, _responses = _stdio(
+        {"id": "request-2", "ok": True, "urls": [private_url]},
+        {"id": "request-2", "ok": True, "urls": []},
+    )
+
+    with pytest.raises(_TAB_ERROR) as raised:
+        adapter.list_tab_urls()
+
+    _assert_redacted(raised.value, private_url, "request-2")
+    assert adapter.terminal is True
+    # The valid-looking queued frame must never become an answer to a second
+    # request after the first response loses its request/response boundary.
+    with pytest.raises(_TAB_ERROR):
+        adapter.list_tab_urls()
+    assert len(requests.frames) == 1
+    assert requests.flush_count == 1
+
+
+def test_stdio_exact_request_failure_is_redacted_and_stream_remains_reusable() -> None:
+    """A complete fixed failure frame preserves the next request boundary."""
+
+    adapter, requests, _responses = _stdio(
+        {"id": "request-1", "ok": False, "error": "request_failed"},
+        {"id": "request-2", "ok": True, "urls": [LINKEDIN]},
+    )
+
+    with pytest.raises(_TAB_ERROR) as raised:
+        adapter.list_tab_urls()
+
+    assert str(raised.value) == "browser bridge rejected the request"
+    assert adapter.terminal is False
+    assert adapter.list_tab_urls() == (LINKEDIN,)
+    assert len(requests.frames) == 2
+    assert requests.flush_count == 2
+
+
 @pytest.mark.parametrize(
     "response",
     (
