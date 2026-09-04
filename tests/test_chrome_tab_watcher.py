@@ -495,6 +495,19 @@ class _FlakyListChrome(FakeChrome):
         return self.urls
 
 
+class _IntermittentListChrome(FakeChrome):
+    """Produces a planned mix of failed and successful URL snapshots."""
+
+    def __init__(self, snapshots_fail: tuple[bool, ...]):
+        super().__init__(())
+        self._snapshots_fail = iter(snapshots_fail)
+
+    def list_tab_urls(self) -> tuple[str, ...]:
+        if next(self._snapshots_fail):
+            raise ChromeAutomationError("Chrome tab automation is unavailable")
+        return self.urls
+
+
 _STATUS_COUNTS_ZERO = {
     "failed": 0,
     "missing_before_reopen": 1,
@@ -560,14 +573,21 @@ def test_run_watch_unlimited_mode_reraises_after_three_consecutive_failures():
 def test_run_watch_resets_failure_counter_after_a_successful_cycle():
     emitted: list[str] = []
     run_watch(
-        _FlakyListChrome(failing_cycles=2),
+        _IntermittentListChrome((True, True, False, True, True, False)),
         (JobTarget(LINKEDIN),),
         interval_seconds=1,
-        max_cycles=3,
+        max_cycles=6,
         sleep=lambda _seconds: None,
         emit=emitted.append,
     )
-    assert [json.loads(line).get("ok") is False for line in emitted] == [True, True, False]
+    assert [json.loads(line).get("ok") is False for line in emitted] == [
+        True,
+        True,
+        False,
+        True,
+        True,
+        False,
+    ]
     assert json.loads(emitted[-1]) == _STATUS_COUNTS_ZERO
     assert all(LINKEDIN not in line for line in _failure_lines(emitted))
 

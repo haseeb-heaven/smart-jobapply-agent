@@ -15,8 +15,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import pytest
-
 
 PROJECT_ROOT = Path(__file__).parents[1]
 DISCOVER_SCRIPT = PROJECT_ROOT / "jobapply_agent" / "scripts" / "discover.py"
