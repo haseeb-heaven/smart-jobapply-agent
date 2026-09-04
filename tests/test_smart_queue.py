@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
 from jobapply_agent.smart_queue import (
     QueueAction,
     QueueCandidate,
@@ -43,12 +44,41 @@ def _urls(*candidates: QueueCandidate) -> list[str]:
     return [candidate.source_url for candidate in candidates]
 
 
-def test_queue_policy_is_fixed_at_five_review_tabs(tmp_path: Path):
-    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+def _confirm_outcome(queue: SmartJobQueue, job_id: str, outcome: str) -> None:
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    queue.confirm_outcome(
+        job_id,
+        outcome,
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
 
-    assert queue.target_size == 5
-    with pytest.raises(QueuePolicyError, match="five"):
-        SmartJobQueue(tmp_path / "wrong-size.sqlite3", target_size=6)
+
+@pytest.mark.parametrize("target_size", (1, 3, 10))
+def test_queue_policy_accepts_candidate_selected_review_capacity(
+    tmp_path: Path, target_size: int
+):
+    queue = SmartJobQueue(tmp_path / f"queue-{target_size}.sqlite3", target_size=target_size)
+
+    assert queue.target_size == target_size
+
+
+def test_queue_policy_defaults_to_five_review_tabs(tmp_path: Path):
+    assert SmartJobQueue(tmp_path / "queue.sqlite3").target_size == 5
+
+
+@pytest.mark.parametrize(
+    "target_size",
+    (0, -1, 11, True, False, 3.0, "3", None),
+    ids=("zero", "negative", "above-maximum", "true", "false", "float", "string", "null"),
+)
+def test_queue_policy_rejects_invalid_candidate_selected_capacity(tmp_path: Path, target_size: object):
+    with pytest.raises(QueuePolicyError, match="target_size|capacity"):
+        SmartJobQueue(tmp_path / "invalid-size.sqlite3", target_size=target_size)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -84,6 +114,52 @@ def test_queue_candidate_revision_fields_are_required_for_new_values():
             eligible=True,
             decision="recommended",
             evidence=("verified professional evidence",),
+        )
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    (
+        "https://www.linkedin.com/jobs/view/123",
+        "//www.linkedin.com/jobs/view/123",
+        "www.linkedin.com/jobs/view/123",
+        "/jobs/view/123",
+        r"\\private\\candidate-data",
+        "job id",
+        " job-1",
+        "job-1 ",
+        "job\t1",
+        "job\n1",
+        "candidate@example.test",
+        "+15551234567",
+        "job.id",
+    ),
+)
+def test_queue_candidate_job_id_is_a_bounded_opaque_identifier(job_id: str):
+    with pytest.raises(QueuePolicyError, match="opaque"):
+        QueueCandidate(
+            job_id=job_id,
+            source_url="https://www.linkedin.com/jobs/view/10001",
+            fit_score=99,
+            eligible=True,
+            decision="recommended",
+            evidence=("verified professional evidence",),
+            profile_revision="profile-v1",
+            matcher_policy_revision="policy-v1",
+        )
+
+
+def test_queue_candidate_job_id_has_a_strict_bounded_length():
+    with pytest.raises(QueuePolicyError, match="opaque"):
+        QueueCandidate(
+            job_id="a" * 129,
+            source_url="https://www.linkedin.com/jobs/view/10001",
+            fit_score=99,
+            eligible=True,
+            decision="recommended",
+            evidence=("verified professional evidence",),
+            profile_revision="profile-v1",
+            matcher_policy_revision="policy-v1",
         )
 
 
@@ -192,6 +268,7 @@ def test_legacy_queue_schema_migrates_without_rewriting_history_or_losing_unvers
     action = queue.plan_refill(open_urls=[])
 
     assert queue.active_revisions == (None, None)
+    assert queue.target_size == 5
     assert migrated.profile_revision is None
     assert migrated.matcher_policy_revision is None
     assert action.job_ids == ("legacy-job",)
@@ -201,7 +278,23 @@ def test_legacy_queue_schema_migrates_without_rewriting_history_or_losing_unvers
         job_columns = {row[1] for row in connection.execute("PRAGMA table_info(smart_queue_jobs)")}
         metadata_columns = {row[1] for row in connection.execute("PRAGMA table_info(smart_queue_metadata)")}
     assert {"profile_revision", "matcher_policy_revision"}.issubset(job_columns)
-    assert {"active_profile_revision", "active_matcher_policy_revision"}.issubset(metadata_columns)
+    assert {
+        "active_profile_revision",
+        "active_matcher_policy_revision",
+        "target_size",
+    }.issubset(metadata_columns)
+
+
+def test_candidate_selected_capacity_persists_and_conflicting_host_configuration_fails_closed(tmp_path: Path):
+    database = tmp_path / "queue.sqlite3"
+    created = SmartJobQueue(database, target_size=3)
+
+    reopened = SmartJobQueue(database, target_size=3)
+
+    assert created.target_size == 3
+    assert reopened.target_size == 3
+    with pytest.raises(QueuePolicyError, match="target_size|capacity|conflict"):
+        SmartJobQueue(database, target_size=5)
 
 
 def test_versioned_candidate_cannot_rewrite_a_migrated_unversioned_row(tmp_path: Path):
@@ -283,6 +376,88 @@ def test_refill_selects_five_eligible_recommendations_best_first_and_stably(tmp_
     assert len(action.urls_to_open) == 5
 
 
+@pytest.mark.parametrize("target_size", (1, 3, 10))
+def test_refill_selects_exactly_the_candidate_selected_capacity(tmp_path: Path, target_size: int):
+    queue = SmartJobQueue(tmp_path / f"queue-{target_size}.sqlite3", target_size=target_size)
+    candidates = [_candidate(number, 100 - number) for number in range(1, 13)]
+    queue.add_recommendations(candidates)
+
+    action = queue.plan_refill(open_urls=[])
+
+    expected = candidates[:target_size]
+    assert action.job_ids == tuple(candidate.job_id for candidate in expected)
+    assert action.urls_to_open == tuple(candidate.source_url for candidate in expected)
+    assert action.search_needed == 0
+
+
+def test_increasing_candidate_capacity_opens_only_the_new_vacancies(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3", target_size=3)
+    candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
+    queue.add_recommendations(candidates)
+    initial = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(initial.urls_to_open, actor="browser-bridge")
+
+    queue.set_target_size(5, actor="user")
+    increased = queue.plan_refill(open_urls=initial.urls_to_open)
+
+    assert queue.target_size == 5
+    assert increased.job_ids == ("job-4", "job-5")
+    assert increased.urls_to_open == tuple(_urls(candidates[3], candidates[4]))
+    assert queue.confirmed_outcome_events() == ()
+
+
+def test_capacity_changes_have_append_only_user_attributed_history_without_touching_jobs_or_tabs(
+    tmp_path: Path,
+):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3", target_size=3)
+    candidates = [_candidate(number, 100 - number) for number in range(1, 5)]
+    queue.add_recommendations(candidates)
+    initial = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(initial.urls_to_open, actor="browser-bridge")
+    before_jobs = {candidate.job_id: queue.get(candidate.job_id) for candidate in candidates}
+    before_job_history = {
+        candidate.job_id: queue.history_for(candidate.job_id) for candidate in candidates
+    }
+    before_outcomes = queue.confirmed_outcome_events()
+    before_capacity_history = queue.capacity_history()
+
+    assert queue.set_target_size(5, actor="user") == 5
+
+    capacity_history = queue.capacity_history()
+    assert len(capacity_history) == len(before_capacity_history) + 1
+    change = capacity_history[-1]
+    assert change.prior_target_size == 3
+    assert change.target_size == 5
+    assert change.actor == "user"
+    assert change.queue_id == queue.queue_id
+    assert change.occurred_at.endswith("+00:00")
+    assert {candidate.job_id: queue.get(candidate.job_id) for candidate in candidates} == before_jobs
+    assert {
+        candidate.job_id: queue.history_for(candidate.job_id) for candidate in candidates
+    } == before_job_history
+    assert queue.confirmed_outcome_events() == before_outcomes
+
+
+def test_decreasing_candidate_capacity_never_closes_tabs_or_infers_outcomes(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
+    queue.add_recommendations(candidates)
+    initial = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(initial.urls_to_open, actor="browser-bridge")
+    before = {candidate.job_id: queue.history_for(candidate.job_id) for candidate in candidates[:5]}
+
+    queue.set_target_size(3, actor="user")
+    over_capacity = queue.plan_refill(open_urls=initial.urls_to_open)
+
+    assert queue.target_size == 3
+    assert over_capacity.job_ids == ()
+    assert over_capacity.urls_to_open == ()
+    assert over_capacity.search_needed == 0
+    assert {candidate.job_id: queue.history_for(candidate.job_id) for candidate in candidates[:5]} == before
+    assert {queue.get(candidate.job_id).state for candidate in candidates[:5]} == {"open"}
+    assert queue.confirmed_outcome_events() == ()
+
+
 def test_rejected_ineligible_duplicate_and_historic_jobs_are_never_selected(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     submitted = _candidate(1, 99)
@@ -291,9 +466,9 @@ def test_rejected_ineligible_duplicate_and_historic_jobs_are_never_selected(tmp_
     queue.add_recommendations([submitted, rejected, skipped])
     queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(_urls(submitted, rejected, skipped), actor="agent")
-    queue.confirm_outcome(submitted.job_id, "submitted", actor="user")
-    queue.confirm_outcome(rejected.job_id, "rejected", actor="user")
-    queue.confirm_outcome(skipped.job_id, "skipped", actor="user")
+    _confirm_outcome(queue, submitted.job_id, "submitted")
+    _confirm_outcome(queue, rejected.job_id, "rejected")
+    _confirm_outcome(queue, skipped.job_id, "skipped")
 
     fresh = [_candidate(number, 90 - number) for number in range(4, 9)]
     duplicate_url = _candidate(9, 100, url=fresh[0].source_url)
@@ -332,7 +507,7 @@ def test_planned_jobs_wait_without_being_selected_twice(tmp_path: Path):
     assert {queue.get(candidate.job_id).state for candidate in candidates} == {"waiting"}
 
 
-def test_visible_snapshot_marks_missing_active_jobs_awaiting_outcome_and_opens_slots(tmp_path: Path):
+def test_missing_visible_urls_release_jobs_and_immediately_refill_only_from_admitted_recommendations(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     candidates = [_candidate(number, 100 - number) for number in range(1, 8)]
     queue.add_recommendations(candidates)
@@ -343,21 +518,21 @@ def test_visible_snapshot_marks_missing_active_jobs_awaiting_outcome_and_opens_s
     queue.record_visible_snapshot(remaining_urls, actor="agent")
     replacement = queue.plan_refill(open_urls=remaining_urls)
 
-    assert queue.get("job-1").state == "awaiting_outcome"
-    assert queue.get("job-2").state == "awaiting_outcome"
-    assert replacement.job_ids == ()
-    assert replacement.urls_to_open == ()
+    assert queue.get("job-1").state == "released"
+    assert queue.get("job-2").state == "released"
+    assert replacement.job_ids == ("job-6", "job-7")
+    assert replacement.urls_to_open == tuple(candidate.source_url for candidate in candidates[5:])
     assert replacement.search_needed == 0
     assert [event.name for event in queue.history_for("job-1")] == ["recommended", "waiting", "open", "missing"]
 
-    queue.confirm_outcome("job-1", "skipped", actor="user")
-    queue.confirm_outcome("job-2", "skipped", actor="user")
-    replacement = queue.plan_refill(open_urls=remaining_urls)
-    assert replacement.job_ids == ("job-6", "job-7")
-    assert replacement.urls_to_open == tuple(candidate.source_url for candidate in candidates[5:])
+    queue.record_visible_snapshot(remaining_urls, actor="agent")
+    repeated = queue.plan_refill(open_urls=remaining_urls)
+    assert repeated.job_ids == ()
+    assert repeated.urls_to_open == ()
+    assert [event.name for event in queue.history_for("job-1")] == ["recommended", "waiting", "open", "missing"]
 
 
-def test_insufficient_pool_reports_how_many_more_jobs_search_must_supply(tmp_path: Path):
+def test_released_vacancies_without_admitted_inventory_report_search_needed(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     initial = [_candidate(number, 100 - number) for number in range(1, 6)]
     queue.add_recommendations(initial)
@@ -365,11 +540,10 @@ def test_insufficient_pool_reports_how_many_more_jobs_search_must_supply(tmp_pat
     queue.record_visible_snapshot(first.urls_to_open, actor="agent")
     three_still_open = first.urls_to_open[:3]
     queue.record_visible_snapshot(three_still_open, actor="agent")
-    queue.confirm_outcome("job-4", "skipped", actor="user")
-    queue.confirm_outcome("job-5", "skipped", actor="user")
 
     short = queue.plan_refill(open_urls=three_still_open)
 
+    assert {queue.get(job_id).state for job_id in ("job-4", "job-5")} == {"released"}
     assert short.urls_to_open == ()
     assert short.search_needed == 2
 
@@ -383,15 +557,15 @@ def test_insufficient_pool_reports_how_many_more_jobs_search_must_supply(tmp_pat
     assert sum(queue.get(candidate.job_id).state == "open" for candidate in [*initial, *replacements]) == 5
 
 
-def test_queue_rejects_more_than_five_known_visible_listings(tmp_path: Path):
-    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
-    candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
+def test_queue_rejects_more_than_ten_known_visible_listings(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3", target_size=10)
+    candidates = [_candidate(number, 100 - number) for number in range(1, 12)]
     queue.add_recommendations(candidates)
     visible = [candidate.source_url for candidate in candidates]
 
-    with pytest.raises(QueuePolicyError, match="five"):
+    with pytest.raises(QueuePolicyError, match="10|capacity"):
         queue.plan_refill(open_urls=visible)
-    with pytest.raises(QueuePolicyError, match="five"):
+    with pytest.raises(QueuePolicyError, match="10|capacity"):
         queue.record_visible_snapshot(visible, actor="agent")
 
 
@@ -415,10 +589,14 @@ def test_only_user_can_confirm_an_application_outcome(tmp_path: Path, outcome: s
     action = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(action.urls_to_open, actor="agent")
 
-    with pytest.raises(QueuePolicyError, match="user"):
-        queue.confirm_outcome(candidate.job_id, outcome, actor="agent")
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    with pytest.raises(CandidateMemoryPolicyError, match="user"):
+        queue.confirm_outcome(candidate.job_id, outcome, actor="agent", vacated=True, candidate_memory=memory)
 
-    queue.confirm_outcome(candidate.job_id, outcome, actor="user")
+    _confirm_outcome(queue, candidate.job_id, outcome)
     assert queue.get(candidate.job_id).state == outcome
     assert queue.confirmed_submitted_count() == (1 if outcome == "submitted" else 0)
 
@@ -429,7 +607,7 @@ def test_confirmed_job_still_occupies_a_physical_slot_while_its_tab_is_visible(t
     queue.add_recommendations(candidates)
     first = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(first.urls_to_open, actor="agent")
-    queue.confirm_outcome("job-1", "submitted", actor="user")
+    _confirm_outcome(queue, "job-1", "submitted")
 
     while_visible = queue.plan_refill(open_urls=first.urls_to_open)
     assert while_visible.urls_to_open == ()
@@ -449,7 +627,7 @@ def test_restart_preserves_queue_state_history_and_submission_count(tmp_path: Pa
     original.add_recommendations(candidates)
     first = original.plan_refill(open_urls=[])
     original.record_visible_snapshot(first.urls_to_open, actor="agent")
-    original.confirm_outcome("job-1", "submitted", actor="user")
+    _confirm_outcome(original, "job-1", "submitted")
     original.record_visible_snapshot(first.urls_to_open[1:], actor="agent")
 
     restarted = SmartJobQueue(database)
@@ -527,13 +705,46 @@ def test_attributed_open_failure_releases_waiting_slot_without_inferring_an_outc
         queue.record_open_failure(first.job_ids[0], actor="browser-bridge")
 
 
+@pytest.mark.parametrize(("candidate_count", "expected_shortage"), ((6, 0), (5, 1)))
+def test_post_attempt_refill_shortage_is_read_only_for_present_and_absent_reserves(
+    tmp_path: Path,
+    candidate_count: int,
+    expected_shortage: int,
+):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidates = [_candidate(number, 100 - number) for number in range(1, candidate_count + 1)]
+    queue.add_recommendations(candidates)
+    first = queue.plan_refill(open_urls=[])
+    visible_urls = first.urls_to_open[1:]
+    queue.record_visible_snapshot(visible_urls, actor="browser-bridge")
+    queue.record_open_failure(first.job_ids[0], actor="browser-bridge")
+
+    before = {candidate.job_id: queue.get(candidate.job_id).state for candidate in candidates}
+    shortage = queue.refill_search_needed(open_urls=visible_urls)
+
+    assert shortage == expected_shortage
+    assert {candidate.job_id: queue.get(candidate.job_id).state for candidate in candidates} == before
+    assert not any(queue.get(candidate.job_id).state == "waiting" for candidate in candidates)
+
+
 def test_confirmed_outcome_events_are_replayable_user_owned_records(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     candidates = [_candidate(1, 99), _candidate(2, 98)]
     queue.add_recommendations(candidates)
-    queue.plan_refill(open_urls=[])
-    queue.confirm_outcome("job-1", "submitted", actor="user")
-    queue.confirm_outcome("job-2", "skipped", actor="user")
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        queue.confirm_outcome("job-1", "submitted", actor="user", vacated=True, candidate_memory=memory)
+
+    waiting = queue.plan_refill(open_urls=[])
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        queue.confirm_outcome("job-1", "submitted", actor="user", vacated=True, candidate_memory=memory)
+
+    queue.record_visible_snapshot(waiting.urls_to_open, actor="agent")
+    _confirm_outcome(queue, "job-1", "submitted")
+    _confirm_outcome(queue, "job-2", "skipped")
 
     events = queue.confirmed_outcome_events()
 
@@ -550,10 +761,10 @@ def test_confirmed_outcome_cannot_be_replaced_by_a_different_outcome(tmp_path: P
     queue.add_recommendations([candidate])
     action = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(action.urls_to_open, actor="agent")
-    queue.confirm_outcome(candidate.job_id, "submitted", actor="user")
+    _confirm_outcome(queue, candidate.job_id, "submitted")
 
-    with pytest.raises(QueuePolicyError, match="cannot be replaced"):
-        queue.confirm_outcome(candidate.job_id, "rejected", actor="user")
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        _confirm_outcome(queue, candidate.job_id, "rejected")
 
     assert queue.get(candidate.job_id).state == "submitted"
     assert queue.confirmed_submitted_count() == 1
@@ -573,12 +784,29 @@ def test_reconfirming_an_identical_outcome_is_idempotent(tmp_path: Path):
     action = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(action.urls_to_open, actor="agent")
 
-    first = queue.confirm_outcome(candidate.job_id, "submitted", actor="user")
-    repeated = queue.confirm_outcome(candidate.job_id, "submitted", actor="user")
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    first = queue.confirm_outcome(
+        candidate.job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
+    repeated = queue.confirm_outcome(
+        candidate.job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
 
+    events = queue.confirmed_outcome_events()
     assert first.state == repeated.state == "submitted"
+    assert len(events) == 1
     assert queue.confirmed_submitted_count() == 1
-    assert len(queue.confirmed_outcome_events()) == 1
     assert [event.name for event in queue.history_for(candidate.job_id)] == [
         "recommended",
         "waiting",
@@ -598,11 +826,17 @@ def test_confirm_outcome_rejects_every_non_user_actor_without_recording(
     action = queue.plan_refill(open_urls=[])
     queue.record_visible_snapshot(action.urls_to_open, actor="agent")
 
-    with pytest.raises(QueuePolicyError, match="user"):
-        queue.confirm_outcome(candidate.job_id, outcome, actor=actor)
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    with pytest.raises(CandidateMemoryPolicyError, match="user"):
+        queue.confirm_outcome(candidate.job_id, outcome, actor=actor, vacated=True, candidate_memory=memory)
 
     assert queue.get(candidate.job_id).state == "open"
     assert queue.confirmed_submitted_count() == 0
+    assert queue.confirmed_outcome_events() == ()
+    assert memory.is_suppressed(candidate.source_url) is False
     assert [event.name for event in queue.history_for(candidate.job_id)] == [
         "recommended",
         "waiting",
@@ -610,7 +844,7 @@ def test_confirm_outcome_rejects_every_non_user_actor_without_recording(
     ]
 
 
-def test_missing_tab_keeps_its_slot_until_an_outcome_is_confirmed_and_counts_once(tmp_path: Path):
+def test_missing_tab_releases_its_slot_immediately_and_a_later_outcome_still_counts_once(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
     queue.add_recommendations(candidates)
@@ -619,14 +853,16 @@ def test_missing_tab_keeps_its_slot_until_an_outcome_is_confirmed_and_counts_onc
     still_open = first.urls_to_open[1:]
     queue.record_visible_snapshot(still_open, actor="agent")
 
-    assert queue.get("job-1").state == "awaiting_outcome"
-    while_missing = queue.plan_refill(open_urls=still_open)
-    assert while_missing.job_ids == ()
-    assert while_missing.search_needed == 0
+    assert queue.get("job-1").state == "released"
+    released = queue.plan_refill(open_urls=still_open)
+    assert released.job_ids == ("job-6",)
+    assert released.urls_to_open == (candidates[5].source_url,)
+    assert released.search_needed == 0
 
-    confirmed = queue.confirm_outcome("job-1", "submitted", actor="user")
-    assert confirmed.state == "submitted"
+    _confirm_outcome(queue, "job-1", "submitted")
+    assert queue.get("job-1").state == "submitted"
     assert queue.confirmed_submitted_count() == 1
+    assert len(queue.confirmed_outcome_events()) == 1
     assert [event.name for event in queue.history_for("job-1")] == [
         "recommended",
         "waiting",
@@ -636,10 +872,12 @@ def test_missing_tab_keeps_its_slot_until_an_outcome_is_confirmed_and_counts_onc
     ]
 
     after_confirmation = queue.plan_refill(open_urls=still_open)
-    assert after_confirmation.job_ids == ("job-6",)
+    assert after_confirmation.job_ids == ()
+    assert after_confirmation.urls_to_open == ()
+    assert after_confirmation.search_needed == 0
 
 
-def test_open_failed_reservation_still_accepts_a_user_confirmed_outcome(tmp_path: Path):
+def test_open_failed_reservation_is_a_dead_end_that_rejects_a_confirmed_outcome(tmp_path: Path):
     queue = SmartJobQueue(tmp_path / "queue.sqlite3")
     candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
     queue.add_recommendations(candidates)
@@ -649,14 +887,16 @@ def test_open_failed_reservation_still_accepts_a_user_confirmed_outcome(tmp_path
     replacement = queue.plan_refill(open_urls=[])
     assert replacement.job_ids == ("job-6",)
 
-    confirmed = queue.confirm_outcome("job-1", "submitted", actor="user")
-    assert confirmed.state == "submitted"
-    assert queue.confirmed_submitted_count() == 1
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        _confirm_outcome(queue, "job-1", "submitted")
+
+    assert queue.get("job-1").state == "open_failed"
+    assert queue.confirmed_submitted_count() == 0
+    assert queue.confirmed_outcome_events() == ()
     assert [event.name for event in queue.history_for("job-1")] == [
         "recommended",
         "waiting",
         "open_failed",
-        "submitted",
     ]
 
 
