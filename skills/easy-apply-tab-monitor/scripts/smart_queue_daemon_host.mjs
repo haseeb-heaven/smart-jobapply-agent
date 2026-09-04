@@ -10,7 +10,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { startCodexChromeExtensionHost } from "./codex_chrome_extension_host.mjs";
+import { startCodexChromeExtensionHost, canonicalListingUrl } from "./codex_chrome_extension_host.mjs";
 
 const DEFAULT_DAEMON_PATH = fileURLToPath(new URL("./smart_queue_daemon.py", import.meta.url));
 const BRIDGE_CLOSE_EXIT_GRACE_MS = 100;
@@ -115,8 +115,12 @@ function isLegacyBinding(browser) {
  *
  * A binding matching BOTH shapes is ambiguous and fails closed with a
  * redacted TypeError rather than silently resolving as generic.
+ *
+ * Exported for contract tests so the synthetic tab's local
+ * re-canonicalization is directly assertable; production callers use the
+ * starter functions below.
  */
-function toBridgeBinding(browserBinding) {
+export function toBridgeBinding(browserBinding) {
   if (isGenericBinding(browserBinding)) {
     if (isLegacyBinding(browserBinding)) throw new TypeError("browserBinding is ambiguous");
     const generic = browserBinding;
@@ -136,7 +140,19 @@ function toBridgeBinding(browserBinding) {
       tabs: {
         async new() {
           return {
-            async goto(url) { await generic.openListing(url); },
+            async goto(url) {
+              // Defense in depth: the strict bridge already demands an
+              // already-canonical URL, but the synthetic tab re-canonicalizes
+              // locally so a non-listing URL can never reach the generic
+              // binding. The failure is redacted and never echoes the URL.
+              let canonical;
+              try {
+                canonical = canonicalListingUrl(url);
+              } catch {
+                throw new Error("listing URL is invalid");
+              }
+              await generic.openListing(canonical);
+            },
             // Accepted downgrade: handoff-marking is a Codex-session
             // affordance with no generic counterpart, so the synthetic tab's
             // markHandoff is a harmless no-op. Generic opens still go through
@@ -326,9 +342,9 @@ function runtimeKey(configuration) {
   // The supervisor intentionally keys only local process configuration, never
   // browser bindings, URLs, candidate data, or external service identifiers.
   // The creation bindingId is stored alongside the entry, never in the key:
-  // a later request carrying a different non-empty bindingId fails closed so
-  // a second session cannot silently reuse the first session's browser
-  // binding. Same-session restarts pass fresh but equivalent binding objects
+  // a later request carrying any different bindingId — including an absent
+  // one against a named entry — fails closed so a second session cannot
+  // silently reuse the first session's browser binding. Same-session restarts pass fresh but equivalent binding objects
   // under the same bindingId, so object identity is never compared here.
   return JSON.stringify([configuration.executable, configuration.daemonPath, configuration.daemonArgs]);
 }
@@ -474,7 +490,8 @@ export function startSmartQueueDaemonHost(browserBinding, options) {
  * calls cannot create duplicate monitors for the same private queue process.
  * The creation bindingId is retained with the entry but never compared by
  * object identity: a repeat call with the same (or absent) bindingId reuses
- * the live host, while a different non-empty bindingId fails closed with a
+ * the live host, while any bindingId mismatch — including a later unnamed
+ * request against a named live host — fails closed with a
  * redacted TypeError so the caller supplies a distinct daemon configuration
  * for the second session instead of silently routing to the wrong browser.
  */
@@ -483,7 +500,7 @@ export function startOrGetSmartQueueDaemonHost(browserBinding, options) {
   const key = runtimeKey(configuration);
   const existing = supervisedHosts.get(key);
   if (existing !== undefined) {
-    if (configuration.bindingId !== undefined && existing.bindingId !== configuration.bindingId) {
+    if (existing.bindingId !== configuration.bindingId) {
       throw new TypeError("browser binding belongs to a different session; use a distinct daemon configuration");
     }
     return existing.host;

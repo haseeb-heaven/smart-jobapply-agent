@@ -18,6 +18,7 @@ import {
 import {
   startSmartQueueDaemonHost,
   startOrGetSmartQueueDaemonHost,
+  toBridgeBinding,
 } from "../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs";
 
 const LINKEDIN = "https://www.linkedin.com/jobs/view/123456";
@@ -1206,6 +1207,7 @@ test("agent handoff docs route search_needed through the private agent-only admi
     assert.match(source, /jobapply_agent\/private\/smart-queue\.sqlite3/, `${relativePath} must keep the queue database under jobapply_agent/private/`);
     assert.match(source, /jobapply_agent\/private\/candidate-memory\.sqlite3/, `${relativePath} must keep candidate memory under jobapply_agent/private/`);
     assert.match(source, /filter_unsuppressed_candidates/, `${relativePath} must document suppression before admission`);
+    assert.match(source, /mkdir -p jobapply_agent\/private && cp jobapply_agent\/data\/recommended_jobs\.jsonl jobapply_agent\/private\/discovery\.jsonl/, `${relativePath} must create the private runtime directory before staging the discovery export`);
   }
 });
 
@@ -1311,6 +1313,40 @@ test("absent bindingId reuses the live host and empty normalizes to absent", asy
   await unnamed.stop();
 });
 
+test("a named live host rejects a later unnamed request without echo or spawn", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-named-unnamed-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const privateId = `queue-named-private-${"n".repeat(16)}`;
+  const named = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: privateId }));
+  assert.equal(spawnCalls, 1);
+  // The reverse hijack: an unnamed request must not silently reuse the named
+  // session's host. The redacted error echoes neither the stored ID nor the
+  // request shape, and no second child is spawned.
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({})),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.match(error.message, /distinct daemon configuration/);
+      assert.doesNotMatch(error.message, /queue-named-private/);
+      assert.doesNotMatch(error.message, /nnnnnnnn/);
+      return true;
+    },
+  );
+  assert.equal(spawnCalls, 1);
+
+  await named.stop();
+});
+
 test("bindingId is capped at 128 characters with a redacted error", async () => {
   let spawnCalls = 0;
   const { binding } = chromeBinding();
@@ -1379,9 +1415,33 @@ test("canonicalListingUrl matches the Python canonicalizer on parity vectors", (
   assert.equal(canonicalListingUrl("  https://www.linkedin.com/jobs/view/123456  "), LINKEDIN);
   assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob/?jk=abc_123"), INDEED);
   assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob//?jk=abc_123"), INDEED);
+  // Doubly-dotted hosts strip all trailing dots like Python's rstrip(".").
+  assert.equal(canonicalListingUrl("https://www.linkedin.com../jobs/view/123456"), LINKEDIN);
   // Doubly-slashed LinkedIn paths and inner whitespace stay rejected.
   assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/123456//"), /listing URL is invalid/);
   assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/12 3456"), /listing URL is invalid/);
+});
+
+test("the generic synthetic tab re-canonicalizes locally and fails closed without echo", async () => {
+  const opened = [];
+  const privateUrl = "https://mail.example.test/inbox?private=value";
+  const generic = {
+    listTabUrls: async () => [LINKEDIN],
+    openListing: async (url) => { opened.push(url); },
+  };
+  const synthetic = await toBridgeBinding(generic).tabs.new();
+  await assert.rejects(
+    synthetic.goto(privateUrl),
+    (error) => {
+      assert.match(error.message, /listing URL is invalid/);
+      assert.doesNotMatch(error.message, /mail\.example\.test|private=value/);
+      return true;
+    },
+  );
+  assert.deepEqual(opened, []);
+  // An already-canonical URL still opens exactly through the synthetic tab.
+  await synthetic.goto(LINKEDIN);
+  assert.deepEqual(opened, [LINKEDIN]);
 });
 
 test("the generic synthetic tab carries a harmless markHandoff no-op and opens stay exact-URL-only", async () => {

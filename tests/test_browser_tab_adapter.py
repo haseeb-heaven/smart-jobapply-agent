@@ -262,12 +262,72 @@ def test_external_adapter_rejects_oversize_stdout_without_echo():
     assert LINKEDIN not in str(raised.value)
 
 
+def test_default_runner_lists_tabs_through_bounded_capture_without_shell():
+    """The production (default-runner) path streams stdout boundedly and parses it."""
+
+    import sys
+
+    script = (
+        "import json, sys; sys.stdout.write("
+        "json.dumps(['https://www.linkedin.com/jobs/view/123456']))"
+    )
+    adapter = ExternalCommandAdapter((sys.executable, "-c", script), timeout_seconds=30)
+
+    assert adapter.list_tab_urls() == (LINKEDIN,)
+
+
+def test_default_runner_bounds_oversize_stdout_before_parse_without_echo():
+    """The default path kills an over-cap bridge before JSON parsing, redacted."""
+
+    import sys
+
+    script = "import sys; sys.stdout.write('[' + ' ' * 1_048_577 + ']')"
+    adapter = ExternalCommandAdapter((sys.executable, "-c", script), timeout_seconds=30)
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        adapter.list_tab_urls()
+
+    rendered = str(raised.value)
+    assert LINKEDIN not in rendered
+    assert len(rendered) < 1_048_576
+
+
+def test_invoke_enforces_byte_cap_on_injected_stdout_before_parse():
+    """An injected runner's over-cap stdout fails closed inside _invoke."""
+
+    def runner(_argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="x" * (1_048_576 + 1), stderr="")
+
+    with pytest.raises(BrowserAdapterError) as raised:
+        ExternalCommandAdapter(("fake-bridge",), runner=runner)._invoke("list-tabs")
+
+    assert "xxx" not in str(raised.value)
+
+
+def test_default_runner_open_listing_uses_argv_without_shell(tmp_path):
+    """The default path opens an exact listing through argv, never a shell."""
+
+    import sys
+
+    probe = tmp_path / "open_argv.json"
+    script = (
+        "import json, sys; "
+        f"open({str(probe)!r}, 'w').write(json.dumps(sys.argv[1:]))"
+    )
+    adapter = ExternalCommandAdapter((sys.executable, "-c", script), timeout_seconds=30)
+
+    adapter.open_listing(LINKEDIN)
+
+    assert json.loads(probe.read_text(encoding="utf-8")) == ["open-listing", LINKEDIN]
+
+
 @pytest.mark.parametrize(
     ("raw", "canonical"),
     (
         ("  https://www.linkedin.com/jobs/view/123456  ", LINKEDIN),
         ("https://in.indeed.com/viewjob/?jk=abc_123", INDEED),
         ("https://in.indeed.com/viewjob//?jk=abc_123", INDEED),
+        ("https://www.linkedin.com../jobs/view/123456", LINKEDIN),
     ),
 )
 def test_canonicalizer_parity_vectors_match_js_bridge(raw: str, canonical: str):

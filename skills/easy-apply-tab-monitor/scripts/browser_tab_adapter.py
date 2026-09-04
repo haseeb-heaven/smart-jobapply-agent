@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 from typing import Callable, Protocol, Sequence, runtime_checkable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -149,21 +150,99 @@ class ExternalCommandAdapter:
         self._runner = runner
         self._timeout_seconds = timeout_seconds
 
-    def _invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def _invoke_default(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run the bridge with incrementally bounded stdout capture.
+
+        The production path never materializes unbounded bridge output: stdout
+        is read in chunks and the child is killed once the byte cap is
+        exceeded, before any JSON parsing. ``stderr`` is discarded (failures
+        stay redacted) so a voluminous stderr cannot block the child either.
+        ``shell`` stays ``False`` and no command, argument, URL, or output
+        bytes ever enter the raised error.
+        """
+
         try:
-            completed = self._runner(
-                [*self._command, *arguments],
-                check=False,
-                capture_output=True,
+            child = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=self._timeout_seconds,
                 shell=False,
             )
         except (OSError, subprocess.SubprocessError):
             raise BrowserAdapterError("browser adapter command failed") from None
-        if getattr(completed, "returncode", 1) != 0:
-            raise BrowserAdapterError("browser adapter command failed")
-        return completed
+        timer = threading.Timer(self._timeout_seconds, child.kill)
+        try:
+            timer.start()
+            chunks: list[str] = []
+            total_bytes = 0
+            oversize = False
+            assert child.stdout is not None
+            while True:
+                try:
+                    piece = child.stdout.read(65_536)
+                except Exception:
+                    raise BrowserAdapterError("browser adapter command failed") from None
+                if not piece:
+                    break
+                total_bytes += len(piece.encode("utf-8"))
+                if total_bytes > _MAX_STDOUT_BYTES:
+                    oversize = True
+                    break
+                chunks.append(piece)
+            try:
+                child.kill()
+            except Exception:
+                pass
+            try:
+                child.wait(timeout=5)
+            except Exception:
+                pass
+            if oversize:
+                raise BrowserAdapterError("browser adapter returned invalid tab data")
+            try:
+                returncode = child.returncode
+            except Exception:
+                raise BrowserAdapterError("browser adapter command failed") from None
+            if returncode != 0:
+                raise BrowserAdapterError("browser adapter command failed")
+            return subprocess.CompletedProcess(argv, returncode, "".join(chunks), "")
+        except BrowserAdapterError:
+            try:
+                child.kill()
+            except Exception:
+                pass
+            raise
+        except (OSError, subprocess.SubprocessError):
+            try:
+                child.kill()
+            except Exception:
+                pass
+            raise BrowserAdapterError("browser adapter command failed") from None
+        finally:
+            timer.cancel()
+
+    def _invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        argv = [*self._command, *arguments]
+        if self._runner is not subprocess.run:
+            try:
+                completed = self._runner(
+                    argv,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout_seconds,
+                    shell=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                raise BrowserAdapterError("browser adapter command failed") from None
+            if getattr(completed, "returncode", 1) != 0:
+                raise BrowserAdapterError("browser adapter command failed")
+            stdout = getattr(completed, "stdout", None)
+            if isinstance(stdout, str) and len(stdout.encode("utf-8")) > _MAX_STDOUT_BYTES:
+                raise BrowserAdapterError("browser adapter returned invalid tab data")
+            return completed
+        return self._invoke_default(argv)
 
     def list_tab_urls(self) -> tuple[str, ...]:
         """Return canonical supported listing URLs, skipping unmanaged tabs.

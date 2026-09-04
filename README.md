@@ -615,7 +615,7 @@ stages the producer export into the ignored private runtime directory
 agent-only admission command:
 
 ```sh
-cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
+mkdir -p jobapply_agent/private && cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
 python3 jobapply_agent/scripts/discover.py admit-queue \
   --candidate-intake jobapply_agent/private/candidate_intake.json \
   --discovery-export jobapply_agent/private/discovery.jsonl \

@@ -38,7 +38,9 @@ export function canonicalListingUrl(value) {
   // Accepted divergence: host case uses toLowerCase here while Python uses
   // casefold. The allowlist below is ASCII-only and both agree on ASCII, so
   // every non-listing is still rejected identically on both sides.
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  // Match Python's host.rstrip("."): strip ALL trailing dots so a
+  // doubly-dotted host canonicalizes identically on both sides.
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   if (
     parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.hash || !host ||
     [...parsed.searchParams.keys()].some((key) => !key || (key.toLowerCase() !== "jk" && !safeTrackingKey(key)))
