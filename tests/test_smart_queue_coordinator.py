@@ -438,6 +438,171 @@ def test_first_memory_bound_cycle_rolls_back_new_revision_binding_when_suppressi
     assert browser.opened_urls == []
 
 
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
+def test_first_admission_control_flow_failure_is_compensated_and_reraised(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+):
+    """Coordinator admission restores first-bound queue and memory state on interruption."""
+
+    browser = SnapshotBrowser()
+    database = _private_runtime_database(tmp_path, "admission-control-flow")
+    queue = SmartJobQueue(database)
+    memory = _candidate_memory(queue)
+    coordinator = SmartQueueCoordinator(queue, browser, candidate_memory=memory)
+    original_filter = CandidateMemory.filter_unsuppressed_candidates
+
+    def bind_scope_then_interrupt(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        original_filter(self, candidates, queue=queue)
+        raise interruption("synthetic admission interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", bind_scope_then_interrupt)
+
+    with pytest.raises(interruption, match="synthetic admission interruption"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (None, None)
+    assert coordinator._memory_scope_preexists(memory) is False
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_first_admission_unexpected_failure_runs_all_cleanup_without_masking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A cleanup interruption cannot hide the original unexpected admission error."""
+
+    browser = SnapshotBrowser()
+    database = _private_runtime_database(tmp_path, "admission-unexpected")
+    queue = SmartJobQueue(database)
+    memory = _candidate_memory(queue)
+    coordinator = SmartQueueCoordinator(queue, browser, candidate_memory=memory)
+    original_filter = CandidateMemory.filter_unsuppressed_candidates
+
+    def bind_scope_then_fail(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        original_filter(self, candidates, queue=queue)
+        raise RuntimeError("synthetic unexpected admission failure")
+
+    def interrupt_queue_cleanup(self: SmartJobQueue) -> None:
+        del self
+        raise KeyboardInterrupt("synthetic cleanup interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", bind_scope_then_fail)
+    monkeypatch.setattr(SmartJobQueue, "reset_empty_queue_revisions", interrupt_queue_cleanup)
+
+    with pytest.raises(RuntimeError, match="synthetic unexpected admission failure"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (_PROFILE_REVISION, _POLICY_REVISION)
+    assert coordinator._memory_scope_preexists(memory) is False
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_admission_system_exit_restores_prior_revision_pair_with_append_only_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An interrupt after a later-pair advance preserves the original pair.
+
+    The admission service must not leave a durable queue selecting a revision
+    whose batch was interrupted.  Its compensating event is audit evidence,
+    not a rewrite of either the provisional advance or prior history.
+    """
+
+    discover = _load_discover_module()
+    runtime_directory = _private_runtime_database(tmp_path, "admission-interrupt").parent
+    intake_path = _active_admission_intake(runtime_directory)
+    initial_profile = discover.active_candidate_profile(intake_path)
+    initial_revisions = (
+        discover.candidate_profile_revision(initial_profile),
+        discover.matcher_policy_revision(),
+    )
+    export_path = runtime_directory / "discovery.jsonl"
+    export_path.write_text(
+        json.dumps(
+            _admission_row(
+                discover,
+                number=1,
+                profile_revision=initial_revisions[0],
+                policy_revision=initial_revisions[1],
+            ),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    queue_path = runtime_directory / "smart-queue.sqlite3"
+    memory_path = runtime_directory / "candidate-memory.sqlite3"
+    discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    changed_payload = json.loads(intake_path.read_text(encoding="utf-8"))
+    for field in ("state", "activated_by", "confirmed_at", "revision_hash"):
+        changed_payload.pop(field)
+    changed_payload["approved_facts"] = dict(changed_payload["approved_facts"])
+    changed_payload["approved_facts"]["roles"] = dict(changed_payload["approved_facts"]["roles"])
+    changed_payload["approved_facts"]["roles"]["include"] = ["Platform Engineer"]
+    updated_profile = activate_candidate_profile(validate_candidate_intake(changed_payload), actor="user")
+    intake_path.write_text(json.dumps(updated_profile), encoding="utf-8")
+    updated_candidate_profile = discover.active_candidate_profile(intake_path)
+    requested_revisions = (
+        discover.candidate_profile_revision(updated_candidate_profile),
+        discover.matcher_policy_revision(),
+    )
+    assert requested_revisions != initial_revisions
+    export_path.write_text(
+        json.dumps(
+            _admission_row(
+                discover,
+                number=2,
+                profile_revision=requested_revisions[0],
+                policy_revision=requested_revisions[1],
+            ),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def interrupt_suppression(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        del self, candidates, queue
+        raise SystemExit("synthetic admission interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", interrupt_suppression)
+
+    with pytest.raises(SystemExit, match="synthetic admission interruption"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    queue = SmartJobQueue(queue_path)
+    assert queue.active_revisions == initial_revisions
+    assert [event.actor for event in queue.revision_history()] == ["host", "admission-rollback"]
+    assert queue.revision_history()[-1].prior_profile_revision == requested_revisions[0]
+    assert queue.revision_history()[-1].profile_revision == initial_revisions[0]
+    with pytest.raises(KeyError):
+        queue.get("queue-2")
+
+
 def test_cycle_rejects_mismatched_revision_recommendations_without_opening(tmp_path: Path):
     """The coordinator inherits the queue's active-pair admission check.
 

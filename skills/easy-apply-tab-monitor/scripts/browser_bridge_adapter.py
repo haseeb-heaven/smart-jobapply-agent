@@ -37,6 +37,8 @@ _MAX_RESPONSE_BYTES: Final = 1_048_576
 _MAX_TAB_URLS: Final = 512
 _MAX_TAB_URL_LENGTH: Final = 8_192
 _DEFAULT_RESPONSE_TIMEOUT_SECONDS: Final = 15.0
+_UNAVAILABLE_MESSAGE: Final = "browser bridge is unavailable"
+_INVALID_DATA_MESSAGE: Final = "browser bridge returned invalid data"
 
 
 class _RequestStream(Protocol):
@@ -129,7 +131,7 @@ class StdioBridgeAdapter:
             threading.Thread(target=read, daemon=True).start()
         except Exception:
             self._terminal = True
-            raise BrowserAdapterError("browser bridge is unavailable") from None
+            raise BrowserAdapterError(_UNAVAILABLE_MESSAGE) from None
         if not completed.wait(self._response_timeout_seconds):
             # The reader may still consume a late frame. Do not issue or accept
             # another request on a stream whose response boundary is now unknown.
@@ -137,10 +139,10 @@ class StdioBridgeAdapter:
             raise BrowserAdapterError("browser bridge response timed out")
         if result.get("failed") is True:
             self._terminal = True
-            raise BrowserAdapterError("browser bridge is unavailable")
+            raise BrowserAdapterError(_UNAVAILABLE_MESSAGE)
         response = result.get("response")
         if not isinstance(response, str):
-            self._reject_response("browser bridge returned invalid data")
+            self._reject_response(_INVALID_DATA_MESSAGE)
         return response
 
     def _request(
@@ -148,7 +150,7 @@ class StdioBridgeAdapter:
     ) -> tuple[dict[str, object], str]:
         with self._request_lock:
             if self._terminal:
-                raise BrowserAdapterError("browser bridge is unavailable")
+                raise BrowserAdapterError(_UNAVAILABLE_MESSAGE)
             request_id = f"request-{self._next_request_id}"
             self._next_request_id += 1
             request: dict[str, object] = {"id": request_id, "operation": operation}
@@ -161,24 +163,24 @@ class StdioBridgeAdapter:
                 # A failed write or flush may have emitted a partial request.
                 # Do not let its eventual response satisfy a later request.
                 self._terminal = True
-                raise BrowserAdapterError("browser bridge is unavailable") from None
+                raise BrowserAdapterError(_UNAVAILABLE_MESSAGE) from None
             response = self._read_response()
             if (
                 not response.endswith("\n")
                 or response.endswith("\r\n")
                 or len(response.encode("utf-8")) > _MAX_RESPONSE_BYTES
             ):
-                self._reject_response("browser bridge returned invalid data")
+                self._reject_response(_INVALID_DATA_MESSAGE)
             try:
                 payload = json.loads(response[:-1])
             except json.JSONDecodeError:
-                self._reject_response("browser bridge returned invalid data")
+                self._reject_response(_INVALID_DATA_MESSAGE)
             if (
                 not isinstance(payload, dict)
                 or not isinstance(payload.get("ok"), bool)
                 or payload.get("id") != request_id
             ):
-                self._reject_response("browser bridge returned invalid data")
+                self._reject_response(_INVALID_DATA_MESSAGE)
             return payload, request_id
 
     def list_tab_urls(self) -> tuple[str, ...]:
@@ -195,7 +197,7 @@ class StdioBridgeAdapter:
         payload, request_id = self._request("list_tab_urls")
         if payload.get("ok") is False:
             if payload != {"id": request_id, "ok": False, "error": "request_failed"}:
-                self._reject_response("browser bridge returned invalid data")
+                self._reject_response(_INVALID_DATA_MESSAGE)
             raise BrowserAdapterError("browser bridge rejected the request")
         if set(payload) != {"id", "ok", "urls"} or payload.get("ok") is not True:
             self._reject_response("browser bridge returned invalid tab data")

@@ -28,6 +28,10 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIRECTORY.parents[2]
 PACKAGE_SOURCE = PROJECT_ROOT / "jobapply_agent" / "src"
 PRIVATE_RUNTIME_DIRECTORY = PROJECT_ROOT / "jobapply_agent" / "private"
+_DAEMON_VALUE_FLAGS = frozenset({
+    "--candidate-intake", "--database", "--adapter", "--adapter-command",
+    "--interval-seconds", "--max-backoff-seconds", "--max-ticks",
+})
 
 if str(PACKAGE_SOURCE) not in sys.path:
     sys.path.insert(0, str(PACKAGE_SOURCE))
@@ -67,6 +71,10 @@ class DaemonConfigurationError(ValueError):
     """Raised without reflecting sensitive configuration values."""
 
 
+def _invalid_configuration() -> None:
+    raise DaemonConfigurationError("daemon configuration is invalid")
+
+
 class ListingAdapter(Protocol):
     """The two browser operations available to the daemon."""
 
@@ -96,33 +104,13 @@ class DaemonConfig:
         if not isinstance(payload, Mapping) or set(payload) != {
             "database_path", "active_intake_path", "bridge"
         }:
-            raise DaemonConfigurationError("daemon configuration is invalid")
+            _invalid_configuration()
         database = payload.get("database_path")
         intake = payload.get("active_intake_path")
         bridge = payload.get("bridge")
         if not isinstance(database, str) or not isinstance(intake, str):
-            raise DaemonConfigurationError("daemon configuration is invalid")
-        if not isinstance(bridge, Mapping) or "adapter" not in bridge:
-            raise DaemonConfigurationError("daemon configuration is invalid")
-        adapter = bridge.get("adapter")
-        if adapter == "host-provided":
-            if set(bridge) != {"adapter"}:
-                raise DaemonConfigurationError("daemon configuration is invalid")
-        elif adapter == "external":
-            if set(bridge) not in ({"adapter"}, {"adapter", "command"}):
-                raise DaemonConfigurationError("daemon configuration is invalid")
-            if "command" in bridge:
-                command = bridge["command"]
-                if (
-                    isinstance(command, (str, bytes))
-                    or not isinstance(command, (list, tuple))
-                    or not command
-                    or not all(isinstance(part, str) and part for part in command)
-                ):
-                    raise DaemonConfigurationError("daemon configuration is invalid")
-        else:
-            raise DaemonConfigurationError("daemon configuration is invalid")
-        return cls(Path(database), Path(intake), adapter)
+            _invalid_configuration()
+        return cls(Path(database), Path(intake), _bridge_adapter_name(bridge))
 
     @classmethod
     def from_json(cls, raw: str) -> "DaemonConfig":
@@ -131,6 +119,33 @@ class DaemonConfig:
         except (TypeError, json.JSONDecodeError):
             raise DaemonConfigurationError("daemon configuration is invalid") from None
         return cls.from_mapping(parsed)
+
+
+def _bridge_adapter_name(bridge: object) -> str:
+    """Validate the closed bridge configuration without retaining its command."""
+
+    if not isinstance(bridge, Mapping) or "adapter" not in bridge:
+        _invalid_configuration()
+    adapter = bridge.get("adapter")
+    if adapter == "host-provided":
+        if set(bridge) != {"adapter"}:
+            _invalid_configuration()
+        return adapter
+    if adapter != "external" or set(bridge) not in ({"adapter"}, {"adapter", "command"}):
+        _invalid_configuration()
+    if "command" in bridge:
+        _require_external_command(bridge["command"])
+    return adapter
+
+
+def _require_external_command(command: object) -> None:
+    if (
+        isinstance(command, (str, bytes))
+        or not isinstance(command, (list, tuple))
+        or not command
+        or not all(isinstance(part, str) and part for part in command)
+    ):
+        _invalid_configuration()
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,15 +438,32 @@ def _bridge_command_from_extras(
     exactly-one-bridge selection check, never as silent bridge misrouting.
     """
 
-    marker = None
-    for index, token in enumerate(raw_args):
-        if token == "--adapter-command" or token.startswith("--adapter-command="):
-            marker = index
-            break
+    marker = _adapter_command_marker(raw_args)
     if marker is None:
         if extras:
             raise DaemonConfigurationError("daemon configuration is invalid")
         return None
+    merged = _merge_bridge_extras(raw_args, marker, extras)
+    _reject_extras_before_bridge_marker(raw_args, marker, extras)
+    return [*(base_command or []), *merged]
+
+
+def _adapter_command_marker(raw_args: Sequence[str]) -> int | None:
+    """Return the first explicit external-bridge marker, if present."""
+
+    return next(
+        (
+            index
+            for index, token in enumerate(raw_args)
+            if token == "--adapter-command" or token.startswith("--adapter-command=")
+        ),
+        None,
+    )
+
+
+def _merge_bridge_extras(raw_args: Sequence[str], marker: int, extras: Sequence[str]) -> list[str]:
+    """Return unknown argv tokens only when they occur after the bridge marker."""
+
     from collections import Counter
 
     pending = Counter(extras)
@@ -448,73 +480,97 @@ def _bridge_command_from_extras(
         merged.append(token)
     if any(pending.values()):
         raise DaemonConfigurationError("daemon configuration is invalid")
+    return merged
+
+
+def _reject_extras_before_bridge_marker(raw_args: Sequence[str], marker: int, extras: Sequence[str]) -> None:
+    """Fail closed when an unknown token is outside the external bridge argv."""
+
     # Preserve fail-closed rejection of unknown tokens elsewhere: an extras
     # entry occurring before the marker (outside any daemon flag value)
     # means an unknown token was passed outside the bridge command.
-    _DAEMON_VALUE_FLAGS = frozenset({
-        "--candidate-intake", "--database", "--adapter", "--adapter-command",
-        "--interval-seconds", "--max-backoff-seconds", "--max-ticks",
-    })
-    _EXTRAS_STRINGS = set(extras)
+    extra_strings = set(extras)
     index = 0
     while index < marker:
         token = raw_args[index]
         if token in _DAEMON_VALUE_FLAGS and not token.startswith("--adapter-command="):
             index += 2
             continue
-        if token in _EXTRAS_STRINGS:
+        if token in extra_strings:
             raise DaemonConfigurationError("daemon configuration is invalid")
         index += 1
-    return [*(base_command or []), *merged]
+
+
+def _parse_arguments(parser: argparse.ArgumentParser, argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
+    """Parse CLI input while keeping argparse's potentially sensitive stderr private."""
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        return parser.parse_known_args(argv)
+
+
+def _monitor_factory(interval: float, maximum: float) -> Callable[[object], object]:
+    return lambda coordinator: PersistentSmartQueueMonitor(
+        coordinator, interval_seconds=interval, max_backoff_seconds=maximum
+    )
+
+
+def _validate_timing(arguments: argparse.Namespace) -> tuple[float, float]:
+    interval = _positive_duration(arguments.interval_seconds, "interval_seconds")
+    maximum = _positive_duration(arguments.max_backoff_seconds, "max_backoff_seconds")
+    if maximum < interval or arguments.max_ticks is not None and arguments.max_ticks < 0:
+        raise DaemonConfigurationError("daemon configuration is invalid")
+    return interval, maximum
+
+
+def _create_adapter_and_config(
+    arguments: argparse.Namespace,
+    adapter_command: list[str] | None,
+) -> tuple[DaemonConfig, ListingAdapter]:
+    selections = (arguments.bridge_stdio or 0) + (1 if arguments.adapter == "external" else 0)
+    if selections != 1:
+        raise DaemonConfigurationError("daemon configuration is invalid")
+    if arguments.adapter == "external":
+        if not adapter_command or not all(isinstance(part, str) and part for part in adapter_command):
+            raise DaemonConfigurationError("daemon configuration is invalid")
+        config = DaemonConfig.from_mapping({
+            "database_path": str(arguments.database),
+            "active_intake_path": str(arguments.candidate_intake),
+            "bridge": {"adapter": "external"},
+        })
+        return config, _resolve_external_adapter_class()(tuple(adapter_command))
+    if adapter_command:
+        raise DaemonConfigurationError("daemon configuration is invalid")
+    config = DaemonConfig.from_mapping({
+        "database_path": str(arguments.database),
+        "active_intake_path": str(arguments.candidate_intake),
+        "bridge": {"adapter": "host-provided"},
+    })
+    return config, _resolve_stdio_adapter_class()()
+
+
+def _daemon_from_arguments(arguments: argparse.Namespace, extras: Sequence[str], argv: Sequence[str] | None) -> SmartQueueDaemon:
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    adapter_command = _bridge_command_from_extras(raw_args, arguments.adapter_command, extras)
+    interval, maximum = _validate_timing(arguments)
+    config, adapter = _create_adapter_and_config(arguments, adapter_command)
+    return SmartQueueDaemon.from_config(
+        config,
+        adapter=adapter,
+        monitor_factory=_monitor_factory(interval, maximum),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            arguments, extras = parser.parse_known_args(argv)
+        arguments, extras = _parse_arguments(parser, argv)
     except SystemExit as parse_failed:
         # Argument errors echo untrusted argv; stay redacted with a bare exit code.
         if parse_failed.code == 2:
             return 2
         raise
     try:
-        raw_args = list(argv) if argv is not None else sys.argv[1:]
-        adapter_command = _bridge_command_from_extras(raw_args, arguments.adapter_command, extras)
-        interval = _positive_duration(arguments.interval_seconds, "interval_seconds")
-        maximum = _positive_duration(arguments.max_backoff_seconds, "max_backoff_seconds")
-        if maximum < interval or arguments.max_ticks is not None and arguments.max_ticks < 0:
-            raise DaemonConfigurationError("daemon configuration is invalid")
-        stdio_count = arguments.bridge_stdio or 0
-        adapter_name = arguments.adapter
-        selections = stdio_count + (1 if adapter_name == "external" else 0)
-        if selections != 1:
-            raise DaemonConfigurationError("daemon configuration is invalid")
-        if adapter_name == "external":
-            if not adapter_command or not all(isinstance(part, str) and part for part in adapter_command):
-                raise DaemonConfigurationError("daemon configuration is invalid")
-            config = DaemonConfig.from_mapping({
-                "database_path": str(arguments.database),
-                "active_intake_path": str(arguments.candidate_intake),
-                "bridge": {"adapter": "external"},
-            })
-            adapter = _resolve_external_adapter_class()(tuple(adapter_command))
-        else:
-            if adapter_command:
-                raise DaemonConfigurationError("daemon configuration is invalid")
-            config = DaemonConfig.from_mapping({
-                "database_path": str(arguments.database),
-                "active_intake_path": str(arguments.candidate_intake),
-                "bridge": {"adapter": "host-provided"},
-            })
-            adapter = _resolve_stdio_adapter_class()()
-        daemon = SmartQueueDaemon.from_config(
-            config,
-            adapter=adapter,
-            monitor_factory=lambda coordinator: PersistentSmartQueueMonitor(
-                coordinator, interval_seconds=interval, max_backoff_seconds=maximum
-            ),
-        )
+        daemon = _daemon_from_arguments(arguments, extras, argv)
     except (DaemonConfigurationError, BrowserAdapterError, OSError, RuntimeError, TypeError, ValueError):
         return 2
     if arguments.max_ticks is not None:

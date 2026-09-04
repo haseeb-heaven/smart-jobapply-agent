@@ -2242,6 +2242,36 @@ def test_admit_queue_rolls_back_newly_bound_revisions_when_suppression_fails(
     assert _memory_scope_queue_ids(memory_path) == [SmartJobQueue(queue_path).queue_id]
 
 
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
+def test_admit_queue_restores_newly_bound_state_then_reraises_control_flow_interruption(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+):
+    """Cleanup preserves user/system interruption while discarding new queue state."""
+
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.candidate_memory import CandidateMemory
+    from jobapply_agent.smart_queue import SmartJobQueue
+
+    def interrupt_suppression(self, candidates, *, queue):
+        raise interruption()
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", interrupt_suppression)
+
+    with pytest.raises(interruption):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert SmartJobQueue(queue_path).active_revisions == (None, None)
+    assert admission_database_counts(queue_path) == (0, 0)
+    if memory_path.exists():
+        assert _memory_scope_queue_ids(memory_path) == []
+
+
 def test_admit_queue_rolls_back_newly_bound_state_when_queue_insertion_fails(
     private_test_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

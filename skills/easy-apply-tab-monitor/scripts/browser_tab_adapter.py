@@ -29,6 +29,8 @@ _MAX_TAB_URL_LENGTH = 8_192
 _MAX_STDOUT_BYTES = 1_048_576
 _LINKEDIN_LISTING_PATH = re.compile(r"^/jobs/view/[A-Za-z0-9_-]+/?$")
 _INDEED_JOB_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_COMMAND_FAILED_MESSAGE = "browser adapter command failed"
+_INVALID_TAB_DATA_MESSAGE = "browser adapter returned invalid tab data"
 _SAFE_TRACKING_QUERY_KEYS = frozenset(
     {"campaign", "from", "mcid", "ref", "source", "trackingid", "trk"}
 )
@@ -153,6 +155,25 @@ def _kill_bridge_process_tree(
         pass
 
 
+def _read_bounded_bridge_stdout(child: subprocess.Popen[str]) -> tuple[str, bool]:
+    """Read bridge stdout without materializing more than the configured cap."""
+
+    chunks: list[str] = []
+    total_bytes = 0
+    assert child.stdout is not None
+    while True:
+        try:
+            piece = child.stdout.read(65_536)
+        except Exception:
+            raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE) from None
+        if not piece:
+            return "".join(chunks), False
+        total_bytes += len(piece.encode("utf-8"))
+        if total_bytes > _MAX_STDOUT_BYTES:
+            return "", True
+        chunks.append(piece)
+
+
 class ExternalCommandAdapter:
     """Delegate the two permitted actions to an explicit argv-based bridge.
 
@@ -219,7 +240,7 @@ class ExternalCommandAdapter:
                 start_new_session=True,
             )
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
-            raise BrowserAdapterError("browser adapter command failed") from None
+            raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE) from None
         # With start_new_session=True the child is the deterministic leader
         # of a new process group, so its pgid equals its pid. Capture it
         # directly instead of resolving it via getpgid(): the leader may
@@ -239,42 +260,27 @@ class ExternalCommandAdapter:
         )
         try:
             timer.start()
-            chunks: list[str] = []
-            total_bytes = 0
-            oversize = False
-            assert child.stdout is not None
-            while True:
-                try:
-                    piece = child.stdout.read(65_536)
-                except Exception:
-                    raise BrowserAdapterError("browser adapter command failed") from None
-                if not piece:
-                    break
-                total_bytes += len(piece.encode("utf-8"))
-                if total_bytes > _MAX_STDOUT_BYTES:
-                    oversize = True
-                    break
-                chunks.append(piece)
+            stdout, oversize = _read_bounded_bridge_stdout(child)
             _kill_bridge_process_tree(child, pgid=spawn_pgid)
             try:
                 child.wait(timeout=5)
             except Exception:
                 pass
             if oversize:
-                raise BrowserAdapterError("browser adapter returned invalid tab data")
+                raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
             try:
                 returncode = child.returncode
             except Exception:
-                raise BrowserAdapterError("browser adapter command failed") from None
+                raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE) from None
             if returncode != 0:
-                raise BrowserAdapterError("browser adapter command failed")
-            return subprocess.CompletedProcess(argv, returncode, "".join(chunks), "")
+                raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE)
+            return subprocess.CompletedProcess(argv, returncode, stdout, "")
         except BrowserAdapterError:
             _kill_bridge_process_tree(child, pgid=spawn_pgid)
             raise
         except (OSError, subprocess.SubprocessError):
             _kill_bridge_process_tree(child, pgid=spawn_pgid)
-            raise BrowserAdapterError("browser adapter command failed") from None
+            raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE) from None
         finally:
             timer.cancel()
 
@@ -291,12 +297,12 @@ class ExternalCommandAdapter:
                     shell=False,
                 )
             except (OSError, subprocess.SubprocessError):
-                raise BrowserAdapterError("browser adapter command failed") from None
+                raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE) from None
             if getattr(completed, "returncode", 1) != 0:
-                raise BrowserAdapterError("browser adapter command failed")
+                raise BrowserAdapterError(_COMMAND_FAILED_MESSAGE)
             stdout = getattr(completed, "stdout", None)
             if isinstance(stdout, str) and len(stdout.encode("utf-8")) > _MAX_STDOUT_BYTES:
-                raise BrowserAdapterError("browser adapter returned invalid tab data")
+                raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
             return completed
         return self._invoke_default(argv)
 
@@ -312,19 +318,19 @@ class ExternalCommandAdapter:
         completed = self._invoke("list-tabs")
         stdout = completed.stdout
         if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > _MAX_STDOUT_BYTES:
-            raise BrowserAdapterError("browser adapter returned invalid tab data")
+            raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
         try:
             payload = json.loads(stdout)
         except (AttributeError, TypeError, json.JSONDecodeError):
-            raise BrowserAdapterError("browser adapter returned invalid tab data") from None
+            raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE) from None
         if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
-            raise BrowserAdapterError("browser adapter returned invalid tab data")
+            raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
         if len(payload) > _MAX_TAB_URLS:
-            raise BrowserAdapterError("browser adapter returned invalid tab data")
+            raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
         canonical: list[str] = []
         for item in payload:
             if not 0 < len(item) <= _MAX_TAB_URL_LENGTH:
-                raise BrowserAdapterError("browser adapter returned invalid tab data")
+                raise BrowserAdapterError(_INVALID_TAB_DATA_MESSAGE)
             try:
                 canonical.append(canonical_listing_url(item))
             except ValueError:

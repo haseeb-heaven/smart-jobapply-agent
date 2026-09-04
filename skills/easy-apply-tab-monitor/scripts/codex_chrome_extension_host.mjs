@@ -129,59 +129,63 @@ class OversizedRequestIdScanner {
     if (this.value !== null) return;
     for (const byte of bytes) {
       if (this.inString) {
-        if (this.escaped) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          this.escaped = false;
-          continue;
-        }
-        if (byte === 0x5c) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          this.escaped = true;
-          continue;
-        }
-        if (byte !== 0x22) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          continue;
-        }
-        this.inString = false;
-        if (this.captureId) {
-          this.#finishId();
-          this.captureId = false;
-        } else if (this.depth === 1) {
-          this.lastRootString = this.current;
-        }
-        this.current = "";
-        continue;
+        this.#consumeStringByte(byte);
+      } else {
+        this.#consumeStructuralByte(byte);
       }
-      if (byte === 0x22) {
-        this.inString = true;
-        this.current = "";
-        this.captureId = this.depth === 1 && this.pendingRootKey === "id";
-        continue;
-      }
-      if (byte === 0x7b || byte === 0x5b) {
-        this.depth += 1;
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x7d || byte === 0x5d) {
-        this.depth = Math.max(0, this.depth - 1);
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x3a && this.depth === 1 && this.lastRootString !== null) {
-        this.pendingRootKey = this.lastRootString;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x2c) {
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-      } else if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d && byte !== 0x0a) {
-        this.lastRootString = null;
-      }
+    }
+  }
+
+  #consumeStringByte(byte) {
+    if (this.escaped) {
+      this.#appendStringByte(byte);
+      this.escaped = false;
+    } else if (byte === 0x5c) {
+      this.#appendStringByte(byte);
+      this.escaped = true;
+    } else if (byte !== 0x22) {
+      this.#appendStringByte(byte);
+    } else {
+      this.#finishString();
+    }
+  }
+
+  #appendStringByte(byte) {
+    if (this.captureId || this.depth === 1) this.#append(byte);
+  }
+
+  #finishString() {
+    this.inString = false;
+    if (this.captureId) {
+      this.#finishId();
+      this.captureId = false;
+    } else if (this.depth === 1) {
+      this.lastRootString = this.current;
+    }
+    this.current = "";
+  }
+
+  #consumeStructuralByte(byte) {
+    if (byte === 0x22) {
+      this.inString = true;
+      this.current = "";
+      this.captureId = this.depth === 1 && this.pendingRootKey === "id";
+    } else if (byte === 0x7b || byte === 0x5b) {
+      this.depth += 1;
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte === 0x7d || byte === 0x5d) {
+      this.depth = Math.max(0, this.depth - 1);
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte === 0x3a && this.depth === 1 && this.lastRootString !== null) {
+      this.pendingRootKey = this.lastRootString;
+      this.lastRootString = null;
+    } else if (byte === 0x2c) {
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d && byte !== 0x0a) {
+      this.lastRootString = null;
     }
   }
 

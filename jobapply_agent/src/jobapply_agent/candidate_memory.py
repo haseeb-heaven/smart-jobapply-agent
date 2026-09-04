@@ -20,6 +20,8 @@ from .sources import canonical_listing_url
 
 _SCHEMA_VERSION = 2
 _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
+_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+_OUTCOME_EXISTS_QUERY = "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
 
 
 class CandidateMemoryPolicyError(ValueError):
@@ -108,7 +110,7 @@ class CandidateMemory:
     def _initialize(self) -> None:
         connection = self._connect(self.database_path)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_BEGIN_IMMEDIATE)
             self._preflight_unscoped_legacy_outcomes(connection)
             statements = (
                 """
@@ -232,7 +234,7 @@ class CandidateMemory:
         if "candidate_memory_outcomes" not in tables:
             return
         if connection.execute(
-            "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+            _OUTCOME_EXISTS_QUERY
         ).fetchone() is None:
             return
         if "candidate_memory_queue_scope" not in tables:
@@ -453,7 +455,7 @@ class CandidateMemory:
             )
         connection = self._connect(self.database_path)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_BEGIN_IMMEDIATE)
             self._bind_or_validate_queue_scope(connection, queue_id)
             unsuppressed = tuple(
                 candidate
@@ -485,7 +487,7 @@ class CandidateMemory:
 
         connection = self._connect(self.database_path)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_BEGIN_IMMEDIATE)
             scope_row = connection.execute(
                 "SELECT queue_id FROM candidate_memory_queue_scope WHERE scope_id = 1"
             ).fetchone()
@@ -493,7 +495,7 @@ class CandidateMemory:
                 connection.commit()
                 return
             has_outcome = connection.execute(
-                "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+                _OUTCOME_EXISTS_QUERY
             ).fetchone()
             if has_outcome is not None:
                 raise CandidateMemoryPolicyError(

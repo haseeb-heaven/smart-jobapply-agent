@@ -198,9 +198,62 @@ function countOnlyStatus(line) {
   return Object.freeze(Object.fromEntries(entries));
 }
 
+function statusChunkFrame(bytes, start) {
+  const newline = bytes.indexOf(0x0a, start);
+  const end = newline === -1 ? bytes.length : newline;
+  return Object.freeze({
+    newline,
+    segment: bytes.subarray(start, end),
+    nextStart: newline === -1 ? bytes.length : newline + 1,
+  });
+}
+
+function appendStatusSegment(framing, frame, recordInvalid) {
+  const hasNewline = frame.newline !== -1;
+  if (framing.remainder.length + frame.segment.length > MAX_STATUS_LINE_BYTES) {
+    recordInvalid();
+    framing.remainder = Buffer.alloc(0);
+    framing.discardingOversizedFrame = !hasNewline;
+    return hasNewline ? "discarded" : "incomplete";
+  }
+  if (frame.segment.length > 0) {
+    framing.remainder = framing.remainder.length === 0
+      ? Buffer.from(frame.segment)
+      : Buffer.concat([framing.remainder, frame.segment]);
+  }
+  return hasNewline ? "complete" : "incomplete";
+}
+
+function statusLine(remainder) {
+  return remainder.length > 0 && remainder[remainder.length - 1] === 0x0d
+    ? remainder.subarray(0, -1)
+    : remainder;
+}
+
+function consumeStatusChunk(chunk, framing, recordInvalid, record) {
+  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  let start = 0;
+  while (start < bytes.length) {
+    const frame = statusChunkFrame(bytes, start);
+    start = frame.nextStart;
+    if (framing.discardingOversizedFrame) {
+      if (frame.newline === -1) return;
+      framing.discardingOversizedFrame = false;
+      continue;
+    }
+    const frameStatus = appendStatusSegment(framing, frame, recordInvalid);
+    if (frameStatus === "incomplete") return;
+    if (frameStatus === "discarded") continue;
+    record(statusLine(framing.remainder));
+    framing.remainder = Buffer.alloc(0);
+  }
+}
+
 function observeStatus(stdout) {
-  let remainder = Buffer.alloc(0);
-  let discardingOversizedFrame = false;
+  const framing = {
+    remainder: Buffer.alloc(0),
+    discardingOversizedFrame: false,
+  };
   let latestStatus = null;
   let invalidStatusCount = 0;
   let statusStreamErrored = false;
@@ -235,40 +288,7 @@ function observeStatus(stdout) {
     }
   };
   stdout.on("data", (chunk) => {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    let start = 0;
-    while (start < bytes.length) {
-      const newline = bytes.indexOf(0x0a, start);
-      const end = newline === -1 ? bytes.length : newline;
-      if (discardingOversizedFrame) {
-        if (newline === -1) return;
-        discardingOversizedFrame = false;
-        start = newline + 1;
-        continue;
-      }
-
-      const segment = bytes.subarray(start, end);
-      if (remainder.length + segment.length > MAX_STATUS_LINE_BYTES) {
-        recordInvalid();
-        remainder = Buffer.alloc(0);
-        if (newline === -1) {
-          discardingOversizedFrame = true;
-          return;
-        }
-        start = newline + 1;
-        continue;
-      }
-      if (segment.length > 0) {
-        remainder = remainder.length === 0 ? Buffer.from(segment) : Buffer.concat([remainder, segment]);
-      }
-      if (newline === -1) return;
-
-      let line = remainder;
-      if (line.length > 0 && line[line.length - 1] === 0x0d) line = line.subarray(0, -1);
-      record(line);
-      remainder = Buffer.alloc(0);
-      start = newline + 1;
-    }
+    consumeStatusChunk(chunk, framing, recordInvalid, record);
   });
   const finish = () => {
     if (exposedStatusEnded || !stdoutClosed || terminal === null) return;
@@ -284,8 +304,8 @@ function observeStatus(stdout) {
   };
   const closeStdout = () => {
     if (stdoutClosed) return;
-    if (remainder.length > 0) record(remainder);
-    remainder = Buffer.alloc(0);
+    if (framing.remainder.length > 0) record(framing.remainder);
+    framing.remainder = Buffer.alloc(0);
     stdoutClosed = true;
     statusStreamEnded = true;
     finish();

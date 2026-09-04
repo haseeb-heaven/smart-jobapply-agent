@@ -161,6 +161,33 @@ test("oversized ID-bearing frames echo their bounded opaque ID", async () => {
   assert.deepEqual(events, []);
 });
 
+test("an oversized split frame recovers only its root opaque ID", async () => {
+  const { binding, events } = chromeBinding();
+  const frame = JSON.stringify({
+    nested: { id: "nested-id" },
+    id: "root-id",
+    ignored: "x".repeat(16 * 1024),
+  });
+  const rootIdOffset = frame.indexOf('"root-id"') + '"root-id"'.length;
+  assert.ok(rootIdOffset > 0);
+
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const received = [];
+  output.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+  input.write(frame.slice(0, rootIdOffset));
+  await new Promise((resolve) => setImmediate(resolve));
+  input.end(`${frame.slice(rootIdOffset)}\n`);
+  await service.finished;
+
+  assert.deepEqual(
+    Buffer.concat(received).toString("utf8").trim().split("\n").map((line) => JSON.parse(line)),
+    [{ id: "root-id", ok: false, error: "request_failed" }],
+  );
+  assert.deepEqual(events, []);
+});
+
 test("an over-1MiB valid tab snapshot returns one fixed failure and the next frame remains usable", async () => {
   // Each URL is individually permitted (and already canonical), but the
   // aggregate response exceeds Python's one-frame 1MiB response boundary.
@@ -533,7 +560,7 @@ test("the real Node parent runs one actual daemon tick through a strict private 
     const rawFrames = Buffer.concat(rawChildStdout).toString("utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
     assert.ok(rawFrames.length > 0);
     for (const frame of rawFrames) {
-      const keys = Object.keys(frame).sort();
+      const keys = Object.keys(frame).sort((left, right) => left.localeCompare(right));
       const finiteKeys = ["degraded_tick_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed", "ticks_completed"];
       const unboundedKeys = ["degraded_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed"];
       assert.ok(

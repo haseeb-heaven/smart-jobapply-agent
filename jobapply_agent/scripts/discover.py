@@ -77,6 +77,7 @@ _MONITOR_SCRIPT = (
     / "persistent_smart_queue_monitor.py"
 )
 _INTERACTIVE_PATH_ERROR = "Interactive onboarding intake path is not permitted."
+_ADMISSION_FAILURE_MESSAGE = "queue admission failed"
 INTERACTIVE_CONFIRMATION_TOKEN = "yes"
 _UNSET_QUEUE_CAPACITY = object()
 _JSON_STRING_LIST_FIELDS = frozenset(
@@ -1321,7 +1322,7 @@ def _persist_active_candidate_intake(
             _private_root=_private_root,
         )
         _sync_parent_directory(validated_path.parent)
-    except BaseException:
+    except (Exception, KeyboardInterrupt, SystemExit):
         if temporary_path is not None:
             try:
                 temporary_path.unlink(missing_ok=True)
@@ -1502,7 +1503,7 @@ def export_current_profile_recommendation_queue(
 
 
 def _admission_path_error() -> None:
-    raise AdmissionError("queue admission failed")
+    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
 
 
 def _admission_absolute_path(value: Path | str) -> Path:
@@ -1648,22 +1649,22 @@ def _revalidate_admission_file(path: Path) -> None:
 
 def _admission_text(value: object, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
-        raise AdmissionError("queue admission failed")
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
     cleaned = value.strip()
     if (not allow_empty and not cleaned) or len(cleaned) > _ADMISSION_MAX_TEXT:
-        raise AdmissionError("queue admission failed")
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
     return cleaned
 
 
 def _admission_text_list(value: object, *, require_items: bool) -> tuple[str, ...]:
     if not isinstance(value, list) or (require_items and not value):
-        raise AdmissionError("queue admission failed")
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
     try:
         values = tuple(_admission_text(item) for item in value)
     except AdmissionError:
         raise
     if len(values) != len(set(values)):
-        raise AdmissionError("queue admission failed")
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
     return values
 
 
@@ -1682,7 +1683,7 @@ def _validated_admission_candidates(
     try:
         lines = export_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
     for line in lines:
         if not line.strip():
             # Skip blank lines exactly like the scheduler read path
@@ -1692,9 +1693,9 @@ def _validated_admission_candidates(
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            raise AdmissionError("queue admission failed") from None
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
         if not isinstance(row, Mapping) or set(row) != _ADMISSION_EXPORT_FIELDS:
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         if (
             row["schema_version"] != 2
             or row["record_type"] != "recommended_job_for_human_review"
@@ -1712,10 +1713,10 @@ def _validated_admission_candidates(
             or row["score"] < MINIMUM_RECOMMENDED_SCORE
             or row["score"] > 100
         ):
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         fingerprint = row["fingerprint"]
         if not isinstance(fingerprint, str) or _ADMISSION_FINGERPRINT.fullmatch(fingerprint) is None:
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         try:
             # Re-canonicalize with the strict listing canonicalizer and store
             # only its output. Discovery exports may carry harmless tracking
@@ -1725,9 +1726,9 @@ def _validated_admission_candidates(
             # row whose URL cannot be strict-canonicalized still fails closed.
             canonical_url = canonical_listing_url(row["url"], row["platform"])
         except ValueError:
-            raise AdmissionError("queue admission failed") from None
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
         if fingerprint in fingerprints or canonical_url in source_urls:
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         try:
             _admission_text(row["run_id"])
             _admission_text(row["discovered_at"])
@@ -1754,7 +1755,7 @@ def _validated_admission_candidates(
                 matcher_policy_revision=matcher_revision,
             )
         except (AdmissionError, QueuePolicyError):
-            raise AdmissionError("queue admission failed") from None
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
         fingerprints.add(fingerprint)
         source_urls.add(canonical_url)
         candidates.append(candidate)
@@ -1769,18 +1770,18 @@ def _monitor_database_lease(queue_path: Path) -> Any:
     if module is None:
         spec = importlib.util.spec_from_file_location(module_name, _MONITOR_SCRIPT)
         if spec is None or spec.loader is None:
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         try:
             spec.loader.exec_module(module)
         except Exception:
             sys.modules.pop(module_name, None)
-            raise AdmissionError("queue admission failed") from None
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
     try:
         return module.DatabaseLease(queue_path)
     except Exception:
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
 
 
 def _preflight_memory_scope(memory: CandidateMemory, queue: SmartJobQueue) -> bool:
@@ -1796,12 +1797,12 @@ def _preflight_memory_scope(memory: CandidateMemory, queue: SmartJobQueue) -> bo
             "SELECT queue_id FROM candidate_memory_queue_scope ORDER BY scope_id"
         ).fetchall()
         if len(rows) > 1 or (rows and rows[0]["queue_id"] != queue.queue_id):
-            raise AdmissionError("queue admission failed")
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         return len(rows) == 1
     except AdmissionError:
         raise
     except Exception:
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
     finally:
         if "connection" in locals():
             connection.close()
@@ -1826,24 +1827,57 @@ def _preflight_queue_candidates(
             ).fetchone()
             if existing_by_id is not None:
                 if not queue._candidate_matches_row(candidate, existing_by_id):
-                    raise AdmissionError("queue admission failed")
+                    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
                 existing_ids.add(candidate.job_id)
             existing_by_url = connection.execute(
                 "SELECT job_id FROM smart_queue_jobs WHERE source_url = ?",
                 (candidate.source_url,),
             ).fetchone()
             if existing_by_url is not None and existing_by_url["job_id"] != candidate.job_id:
-                raise AdmissionError("queue admission failed")
+                raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         connection.rollback()
     except AdmissionError:
         connection.rollback()
         raise
     except Exception:
         connection.rollback()
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
     finally:
         queue._close(connection)
     return frozenset(existing_ids)
+
+
+def _restore_failed_admission_state(
+    queue: SmartJobQueue,
+    memory: CandidateMemory,
+    *,
+    requested_revisions: tuple[str, str],
+    revisions_newly_bound: bool,
+    prior_active_revisions: tuple[str, str] | None,
+    scope_preexisted: bool,
+) -> None:
+    """Append compensation and discard only a newly-created empty scope.
+
+    Restoration is deliberately best-effort: the caller re-raises the original
+    failure, while the queue retains every attempted revision transition as
+    immutable audit history.
+    """
+
+    try:
+        if revisions_newly_bound:
+            queue.reset_empty_queue_revisions()
+        elif prior_active_revisions is not None:
+            queue._rollback_active_revision_advance(
+                prior_revisions=prior_active_revisions,
+                attempted_revisions=requested_revisions,
+            )
+    except (Exception, KeyboardInterrupt, SystemExit):
+        pass  # Rollback failures never mask the original admission failure.
+    try:
+        if not scope_preexisted:
+            memory.discard_outcome_empty_queue_scope()
+    except (Exception, KeyboardInterrupt, SystemExit):
+        pass  # Rollback failures never mask the original admission failure.
 
 
 def admit_current_recommendations_for_active_queue(
@@ -1915,14 +1949,14 @@ def admit_current_recommendations_for_active_queue(
             try:
                 unsuppressed = memory.filter_unsuppressed_candidates(candidates, queue=queue)
                 if queue.active_revisions != requested_revisions:
-                    raise AdmissionError("queue admission failed")
+                    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
                 queue.add_recommendations(unsuppressed)
                 return AdmissionStatus(
                     validated_count=len(candidates),
                     suppressed_count=len(candidates) - len(unsuppressed),
                     admitted_count=sum(candidate.job_id not in existing_ids for candidate in unsuppressed),
                 )
-            except BaseException:
+            except (Exception, KeyboardInterrupt, SystemExit):
                 # A later-pair filter needs the queue's active pair to be
                 # visible. If admission fails, append a compensating revision
                 # transition and restore the prior pair in one internal queue
@@ -1930,21 +1964,14 @@ def admit_current_recommendations_for_active_queue(
                 # compensation is ever removed from audit history. A first
                 # binding instead returns to its genuinely unbound empty
                 # state.
-                try:
-                    if revisions_newly_bound:
-                        queue.reset_empty_queue_revisions()
-                    elif prior_active_revisions is not None:
-                        queue._rollback_active_revision_advance(
-                            prior_revisions=prior_active_revisions,
-                            attempted_revisions=requested_revisions,
-                        )
-                except BaseException:
-                    pass  # Rollback failures never mask the original failure.
-                try:
-                    if not scope_preexisted:
-                        memory.discard_outcome_empty_queue_scope()
-                except BaseException:
-                    pass  # Rollback failures never mask the original failure.
+                _restore_failed_admission_state(
+                    queue,
+                    memory,
+                    requested_revisions=requested_revisions,
+                    revisions_newly_bound=revisions_newly_bound,
+                    prior_active_revisions=prior_active_revisions,
+                    scope_preexisted=scope_preexisted,
+                )
                 raise
     except AdmissionError:
         raise
@@ -1956,9 +1983,9 @@ def admit_current_recommendations_for_active_queue(
         QueueStorageError,
         ValueError,
     ):
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
     except Exception:
-        raise AdmissionError("queue admission failed") from None
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
 
 
 def _run_admit_queue_command(arguments: argparse.Namespace) -> int:

@@ -56,6 +56,7 @@ _MAX_URL_LENGTH = 4096
 _MAX_EVIDENCE_ITEMS = 100
 _MAX_EVIDENCE_LENGTH = 4096
 _OPAQUE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+_AFTER_EVENT_ID_MESSAGE = "after_event_id must be a non-negative integer"
 
 
 class QueuePolicyError(ValueError):
@@ -1173,7 +1174,7 @@ class SmartJobQueue:
             or not isinstance(after_event_id, int)
             or after_event_id < 0
         ):
-            raise QueuePolicyError("after_event_id must be a non-negative integer")
+            raise QueuePolicyError(_AFTER_EVENT_ID_MESSAGE)
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -1223,7 +1224,7 @@ class SmartJobQueue:
             or not isinstance(after_event_id, int)
             or after_event_id < 0
         ):
-            raise QueuePolicyError("after_event_id must be a non-negative integer")
+            raise QueuePolicyError(_AFTER_EVENT_ID_MESSAGE)
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -1988,7 +1989,7 @@ class SmartJobQueue:
             or not isinstance(after_event_id, int)
             or after_event_id < 0
         ):
-            raise QueuePolicyError("after_event_id must be a non-negative integer")
+            raise QueuePolicyError(_AFTER_EVENT_ID_MESSAGE)
         connection = self._connect()
         try:
             rows = connection.execute(

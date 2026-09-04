@@ -19,6 +19,7 @@ from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJo
 
 _PRIVATE_RUNTIME_DIRECTORY = Path(__file__).resolve().parents[3] / "jobapply_agent" / "private"
 _DEFAULT_TARGET_SIZE = 5
+_ADMISSION_FAILURES = (Exception, KeyboardInterrupt, SystemExit)
 
 
 @runtime_checkable
@@ -137,6 +138,73 @@ class SmartQueueCoordinator:
         except sqlite3.Error:
             raise QueueCoordinatorError("candidate-memory scope is unavailable") from None
 
+    def _rollback_first_admission(
+        self,
+        *,
+        revisions_newly_bound: bool,
+        scope_preexisted: bool,
+    ) -> None:
+        """Best-effort compensation for the two-store first-admission boundary.
+
+        Each independent compensation remains best-effort for ordinary errors
+        and control-flow interruptions. The original admission failure stays
+        authoritative, and a failed queue reset never prevents attempted
+        cleanup of a newly-created memory scope.
+        """
+
+        try:
+            if revisions_newly_bound:
+                self._queue.reset_empty_queue_revisions()
+        except _ADMISSION_FAILURES:
+            pass
+        try:
+            if not scope_preexisted:
+                self._candidate_memory.discard_outcome_empty_queue_scope()
+        except _ADMISSION_FAILURES:
+            pass
+
+    def _admit_recommendations(self, supplied_recommendations: tuple[QueueCandidate, ...]) -> None:
+        """Suppress and persist a candidate-validated batch before any tab work."""
+
+        if not supplied_recommendations:
+            return
+        if any(not isinstance(candidate, QueueCandidate) for candidate in supplied_recommendations):
+            raise QueuePolicyError("recommendations must contain only QueueCandidate values")
+        if self._candidate_memory is None:
+            raise QueueCoordinatorError("coordinator admission requires candidate-memory suppression")
+
+        candidate_pairs = {
+            (candidate.profile_revision, candidate.matcher_policy_revision)
+            for candidate in supplied_recommendations
+        }
+        active_pair = self._queue.active_revisions
+        revisions_newly_bound = False
+        scope_preexisted = self._memory_scope_preexists(self._candidate_memory)
+        if active_pair == (None, None):
+            if len(candidate_pairs) != 1:
+                raise QueuePolicyError("recommendation batch revisions conflict with the active queue pair")
+            profile_revision, matcher_policy_revision = next(iter(candidate_pairs))
+            # CandidateMemory needs an active queue pair to validate the batch.
+            # This first binding is compensated if the cross-store admission
+            # fails before a recommendation is persisted.
+            self._queue.bind_empty_queue_revisions(profile_revision, matcher_policy_revision)
+            revisions_newly_bound = True
+        elif candidate_pairs != {active_pair}:
+            raise QueuePolicyError("recommendation batch revisions conflict with the active queue pair")
+
+        try:
+            unsuppressed = self._candidate_memory.filter_unsuppressed_candidates(
+                supplied_recommendations,
+                queue=self._queue,
+            )
+            self._queue.add_recommendations(unsuppressed)
+        except _ADMISSION_FAILURES:
+            self._rollback_first_admission(
+                revisions_newly_bound=revisions_newly_bound,
+                scope_preexisted=scope_preexisted,
+            )
+            raise
+
     def cycle(self, recommendations: Iterable[QueueCandidate] = ()) -> QueueCycle:
         """Run snapshot → plan → optional recommendations → open → snapshot.
 
@@ -153,59 +221,7 @@ class SmartQueueCoordinator:
             supplied_recommendations = tuple(recommendations)
         except TypeError:
             raise QueuePolicyError("recommendations must be an iterable of QueueCandidate values") from None
-        if supplied_recommendations:
-            if any(not isinstance(candidate, QueueCandidate) for candidate in supplied_recommendations):
-                raise QueuePolicyError("recommendations must contain only QueueCandidate values")
-            if self._candidate_memory is None:
-                raise QueueCoordinatorError(
-                    "coordinator admission requires candidate-memory suppression"
-                )
-            candidate_pairs = {
-                (candidate.profile_revision, candidate.matcher_policy_revision)
-                for candidate in supplied_recommendations
-            }
-            active_pair = self._queue.active_revisions
-            revisions_newly_bound = False
-            scope_preexisted = self._memory_scope_preexists(self._candidate_memory)
-            if active_pair == (None, None):
-                if len(candidate_pairs) != 1:
-                    raise QueuePolicyError(
-                        "recommendation batch revisions conflict with the active queue pair"
-                    )
-                profile_revision, matcher_policy_revision = next(iter(candidate_pairs))
-                # CandidateMemory requires an active queue pair to validate
-                # the prevalidated batch. This changes only queue metadata;
-                # it creates no recommendation row before suppression. Only
-                # an empty queue may receive this first binding, allowing a
-                # failure below to restore its prior unbound state exactly.
-                self._queue.bind_empty_queue_revisions(profile_revision, matcher_policy_revision)
-                revisions_newly_bound = True
-            elif candidate_pairs != {active_pair}:
-                raise QueuePolicyError(
-                    "recommendation batch revisions conflict with the active queue pair"
-                )
-            # CandidateMemory authenticates this exact durable queue, checks
-            # the active revision pair, and suppresses only exact canonical
-            # URLs before any queue mutation. The coordinator never accepts
-            # unfiltered host/provider recommendations.
-            try:
-                unsuppressed = self._candidate_memory.filter_unsuppressed_candidates(
-                    supplied_recommendations,
-                    queue=self._queue,
-                )
-                self._queue.add_recommendations(unsuppressed)
-            except BaseException:
-                # The first-batch operations span two private SQLite files.
-                # Each has a purpose-built empty-state rollback that preserves
-                # durable history and an already-bound memory scope.
-                try:
-                    if revisions_newly_bound:
-                        self._queue.reset_empty_queue_revisions()
-                    if not scope_preexisted:
-                        self._candidate_memory.discard_outcome_empty_queue_scope()
-                except BaseException:
-                    pass
-                raise
+        self._admit_recommendations(supplied_recommendations)
 
         initial_snapshot = self._snapshot()
         recovered_open_failed_job_ids = self._queue.record_visible_snapshot(
