@@ -1937,6 +1937,16 @@ def test_active_intake_queue_factory_requires_integrity_checked_candidate_capaci
     assert not (tmp_path / "tampered.sqlite3").exists()
 
 
+def test_discover_help_documents_current_recommendation_queue_default(capsys):
+    discover = load_discover_module()
+    with pytest.raises(SystemExit) as exc:
+        discover.main(["--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "output/Current_Profile_Recommended_Queue.csv" in out
+    assert "without a value" in out
+
+
 def admission_fixture(
     private_test_dir: Path,
     *,

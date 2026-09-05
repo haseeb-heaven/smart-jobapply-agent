@@ -5,6 +5,10 @@ The default compatibility adapter uses macOS Chrome Apple Events.  An explicit
 external-command adapter permits any browser and operating system while keeping
 the same listing-only authority.  The watcher never clicks a page, fills a
 field, uploads a file, or submits an application.
+
+In ``--watch`` mode, transient per-cycle adapter failures emit a redacted JSON
+failure line and monitoring continues, exiting with an error status after three
+consecutive failed cycles.
 """
 
 from __future__ import annotations
@@ -343,8 +347,18 @@ def run_watch(
         raise ValueError("max_cycles must be positive when set")
     targets = _validated_targets(targets)
     cycle = 0
+    consecutive_failures = 0
     while max_cycles is None or cycle < max_cycles:
-        emit(json.dumps(status_counts(reconcile(browser, targets)), sort_keys=True))
+        try:
+            cycle_result = reconcile(browser, targets)
+        except (BrowserAdapterError, OSError) as error:
+            consecutive_failures += 1
+            emit(json.dumps({"ok": False, "error": type(error).__name__}, sort_keys=True))
+            if consecutive_failures >= 3:
+                raise
+        else:
+            consecutive_failures = 0
+            emit(json.dumps(status_counts(cycle_result), sort_keys=True))
         cycle += 1
         if max_cycles is None or cycle < max_cycles:
             sleep(interval_seconds)
@@ -354,12 +368,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Reopen only missing LinkedIn/Indeed listing tabs from a local manifest."
     )
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Path to the local five-job monitor manifest.",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--once", action="store_true")
-    mode.add_argument("--watch", action="store_true")
-    parser.add_argument("--interval-seconds", type=float, default=60.0)
-    parser.add_argument("--max-cycles", type=int)
+    mode.add_argument("--once", action="store_true", help="Reconcile one cycle and exit.")
+    mode.add_argument(
+        "--watch",
+        action="store_true",
+        help="Keep monitoring and reopening missing tabs on an interval.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=60.0,
+        help="Seconds between watch cycles (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        help="Stop after this many watch cycles; unlimited when omitted.",
+    )
     parser.add_argument(
         "--adapter",
         choices=("chrome-applescript", "external"),
@@ -374,7 +406,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "including option-prefixed bridge arguments, is passed as argv without a shell."
         ),
     )
-    parser.add_argument("--adapter-timeout-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--adapter-timeout-seconds",
+        type=float,
+        default=15.0,
+        help="Adapter command timeout in seconds (default: %(default)s).",
+    )
     args = parser.parse_args(argv)
     try:
         targets = load_targets(args.manifest)

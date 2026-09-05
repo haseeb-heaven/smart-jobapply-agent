@@ -2060,7 +2060,11 @@ def main(
         type=Path,
         nargs="?",
         const=PROJECT_ROOT / "output" / "Current_Profile_Recommended_Queue.csv",
-        help="Write a read-only CSV queue for the current profile revision; defaults to the local output directory.",
+        help=(
+            "Write a read-only CSV queue for the current profile revision to "
+            "output/Current_Profile_Recommended_Queue.csv when the flag is passed without "
+            "a value; an omitted flag writes nothing."
+        ),
     )
     commands = parser.add_subparsers(dest="command")
     admit_parser = commands.add_parser(

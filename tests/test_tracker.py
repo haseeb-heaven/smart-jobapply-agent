@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -185,3 +186,46 @@ def test_csv_export_apostrophe_prefixes_visible_text_that_could_be_a_spreadsheet
         rows = list(csv.DictReader(stream))
     assert rows[0]["title"] == f"'{prefix}SUM(A1)"
     assert rows[0]["company"] == f"'{prefix}3+3"
+
+
+def load_export_tracker_module():
+    script_path = Path(__file__).parents[1] / "jobapply_agent" / "scripts" / "export_tracker.py"
+    spec = importlib.util.spec_from_file_location("export_tracker_for_test", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_export_tracker_cli_defaults_to_csv_output_below_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    export = load_export_tracker_module()
+    monkeypatch.setattr(export, "PROJECT_ROOT", tmp_path)
+    database = tmp_path / "data" / "jobs.sqlite3"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    Tracker(database).record_listing(_listing(), _match())
+    monkeypatch.setattr(sys, "argv", ["export_tracker"])
+
+    assert export.main() == 0
+    output = tmp_path / "output" / "Job_Application_Tracker.csv"
+    assert output.is_file()
+    header = output.read_text(encoding="utf-8").splitlines(keepends=False)[0]
+    assert header.startswith("job_id,")
+    assert "platform" in header.split(",")
+    assert "Exported tracker CSV" in capsys.readouterr().out
+
+
+def test_export_tracker_cli_blocks_explicit_xlsx_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    export = load_export_tracker_module()
+    monkeypatch.setattr(export, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["export_tracker", "--output", str(tmp_path / "x.xlsx")])
+
+    assert export.main() == 2
+    assert "Export blocked" in capsys.readouterr().err
