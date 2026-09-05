@@ -229,4 +229,4 @@ class StdioBridgeAdapter:
             self._reject_response("browser bridge returned invalid open result")
 
 
-__all__ = ["StdioBridgeAdapter"]
+__all__ = ["BrowserAdapterError", "StdioBridgeAdapter"]

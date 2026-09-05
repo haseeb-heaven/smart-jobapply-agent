@@ -298,7 +298,7 @@ function observeStatus(stdout) {
       // This deliberately carries no daemon stderr, command, arguments,
       // URL, or browser details. It lets status consumers distinguish an
       // orderly daemon end from a failed spawn without retaining a dead host.
-      status.push(Buffer.from(`${JSON.stringify({ terminal: terminal.terminalError ?? "exited" })}\n`, "utf8"));
+      status.push(Buffer.from(`${JSON.stringify({ terminal: terminal?.terminalError ?? "exited" })}\n`, "utf8"));
       status.push(null);
     }
     resolveDrained();

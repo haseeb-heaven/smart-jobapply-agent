@@ -38,6 +38,7 @@ export function canonicalListingUrl(value) {
     parsed = new URL(trimmed);
   } catch {
     fail("listing URL is invalid");
+    throw new Error("listing URL is invalid");
   }
   // Accepted divergence: host case uses toLowerCase here while Python uses
   // casefold. The allowlist below is ASCII-only and both agree on ASCII, so
@@ -57,7 +58,7 @@ export function canonicalListingUrl(value) {
     const jobIds = parsed.searchParams.getAll("jk");
     // Strip all trailing slashes like Python's path.rstrip("/"), so
     // "/viewjob//" canonicalizes identically on both sides.
-    if (parsed.pathname.replace(/\/+$/, "") !== "/viewjob" || jobIds.length !== 1 || !INDEED_JOB_ID.test(jobIds[0])) {
+    if (parsed.pathname.replace(/\/+$/, "") !== "/viewjob" || jobIds.length !== 1 || jobIds[0] === undefined || !INDEED_JOB_ID.test(jobIds[0])) {
       fail("listing URL is invalid");
     }
     return `https://${host}/viewjob?jk=${encodeURIComponent(jobIds[0])}`;

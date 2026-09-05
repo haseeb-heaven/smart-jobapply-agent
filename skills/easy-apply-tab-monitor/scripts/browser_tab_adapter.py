@@ -137,7 +137,12 @@ def _kill_bridge_process_tree(
         killpg = getattr(os, "killpg", None)
         getpgid = getattr(os, "getpgid", None)
         resolved_pgid = pgid
-        if resolved_pgid is None and os.name != "nt" and callable(getpgid):
+        if (
+            resolved_pgid is None
+            and os.name != "nt"
+            and callable(getpgid)
+            and getattr(child, "pid", None) is not None
+        ):
             try:
                 resolved_pgid = getpgid(child.pid)
             except (OSError, ProcessLookupError):
