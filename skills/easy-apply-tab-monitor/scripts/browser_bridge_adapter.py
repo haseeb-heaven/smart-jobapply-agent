@@ -201,7 +201,7 @@ class StdioBridgeAdapter:
             raise BrowserAdapterError("browser bridge rejected the request")
         if set(payload) != {"id", "ok", "urls"} or payload.get("ok") is not True:
             self._reject_response("browser bridge returned invalid tab data")
-        urls = payload["urls"]
+        urls = payload.get("urls")
         if (
             not isinstance(urls, list)
             or len(urls) > _MAX_TAB_URLS

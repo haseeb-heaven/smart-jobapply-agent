@@ -967,11 +967,14 @@ class SmartJobQueue:
                 LIMIT 1
                 """
             ).fetchone()
-            if event is None or (
-                event["prior_profile_revision"],
-                event["prior_matcher_policy_revision"],
-                event["profile_revision"],
-                event["matcher_policy_revision"],
+            if event is None:
+                raise QueueStorageError("smart queue revision rollback event is unavailable")
+            record = dict(zip(event.keys(), tuple(event)))
+            if (
+                record.get("prior_profile_revision"),
+                record.get("prior_matcher_policy_revision"),
+                record.get("profile_revision"),
+                record.get("matcher_policy_revision"),
             ) != (*prior_pair, *attempted_pair):
                 raise QueueStorageError("smart queue revision rollback event is unavailable")
 
@@ -1239,30 +1242,31 @@ class SmartJobQueue:
             ).fetchall()
             events: list[RevisionPolicyEvent] = []
             for row in rows:
+                record = dict(zip(row.keys(), tuple(row)))
                 try:
                     prior_pair = _require_revision_pair(
-                        row["prior_profile_revision"],
-                        row["prior_matcher_policy_revision"],
+                        record.get("prior_profile_revision"),
+                        record.get("prior_matcher_policy_revision"),
                         allow_unversioned=True,
                     )
                     pair = _require_revision_pair(
-                        row["profile_revision"],
-                        row["matcher_policy_revision"],
+                        record.get("profile_revision"),
+                        record.get("matcher_policy_revision"),
                         allow_unversioned=False,
                     )
                     assert pair[0] is not None and pair[1] is not None
-                    actor = _require_actor(row["actor"])
+                    actor = _require_actor(record.get("actor"))
                 except QueuePolicyError:
                     raise QueueStorageError("smart queue revision history is invalid") from None
                 events.append(
                     RevisionPolicyEvent(
-                        event_id=int(row["event_id"]),
+                        event_id=int(record.get("event_id")),
                         prior_profile_revision=prior_pair[0],
                         prior_matcher_policy_revision=prior_pair[1],
                         profile_revision=pair[0],
                         matcher_policy_revision=pair[1],
                         actor=actor,
-                        occurred_at=str(row["occurred_at"]),
+                        occurred_at=str(record.get("occurred_at")),
                         queue_id=self.queue_id,
                     )
                 )

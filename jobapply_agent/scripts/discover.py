@@ -1697,24 +1697,24 @@ def _validated_admission_candidates(
         if not isinstance(row, Mapping) or set(row) != _ADMISSION_EXPORT_FIELDS:
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         if (
-            row["schema_version"] != 2
-            or row["record_type"] != "recommended_job_for_human_review"
-            or row["discovery_mode"] != "export_only"
-            or row["application_actions"] != 0
-            or type(row["application_actions"]) is not int
-            or row["decision"] != "recommended"
-            or row["minimum_profile_fit_score"] != MINIMUM_RECOMMENDED_SCORE
-            or type(row["minimum_profile_fit_score"]) is not int
-            or row["threshold_met"] is not True
-            or row["profile_revision"] != profile_revision
-            or row["matcher_policy_revision"] != matcher_revision
-            or row["platform"] not in {"linkedin", "indeed"}
-            or type(row["score"]) is not int
-            or row["score"] < MINIMUM_RECOMMENDED_SCORE
-            or row["score"] > 100
+            row.get("schema_version") != 2
+            or row.get("record_type") != "recommended_job_for_human_review"
+            or row.get("discovery_mode") != "export_only"
+            or row.get("application_actions") != 0
+            or type(row.get("application_actions")) is not int
+            or row.get("decision") != "recommended"
+            or row.get("minimum_profile_fit_score") != MINIMUM_RECOMMENDED_SCORE
+            or type(row.get("minimum_profile_fit_score")) is not int
+            or row.get("threshold_met") is not True
+            or row.get("profile_revision") != profile_revision
+            or row.get("matcher_policy_revision") != matcher_revision
+            or row.get("platform") not in {"linkedin", "indeed"}
+            or type(row.get("score")) is not int
+            or row.get("score") < MINIMUM_RECOMMENDED_SCORE
+            or row.get("score") > 100
         ):
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
-        fingerprint = row["fingerprint"]
+        fingerprint = row.get("fingerprint")
         if not isinstance(fingerprint, str) or _ADMISSION_FINGERPRINT.fullmatch(fingerprint) is None:
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         try:
@@ -1724,30 +1724,30 @@ def _validated_admission_candidates(
             # strict form strips; comparing canonical-to-canonical keeps those
             # rows admissible while suppression keys stay in strict form. A
             # row whose URL cannot be strict-canonicalized still fails closed.
-            canonical_url = canonical_listing_url(row["url"], row["platform"])
+            canonical_url = canonical_listing_url(row.get("url"), row.get("platform"))
         except ValueError:
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
         if fingerprint in fingerprints or canonical_url in source_urls:
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         try:
-            _admission_text(row["run_id"])
-            _admission_text(row["discovered_at"])
-            _admission_text(row["search_url"])
-            _admission_text(row["title"])
-            _admission_text(row["company"])
-            _admission_text(row["location"], allow_empty=True)
-            _admission_text(row["work_mode"], allow_empty=True)
-            if row["posted_at"] is not None:
-                _admission_text(row["posted_at"], allow_empty=True)
-            _admission_text(row["score_explanation"])
-            _admission_text(row["human_action_required"])
-            _admission_text_list(row["reasons"], require_items=True)
-            _admission_text_list(row["gaps"], require_items=False)
-            evidence = _admission_text_list(row["evidence_explanations"], require_items=True)
+            _admission_text(row.get("run_id"))
+            _admission_text(row.get("discovered_at"))
+            _admission_text(row.get("search_url"))
+            _admission_text(row.get("title"))
+            _admission_text(row.get("company"))
+            _admission_text(row.get("location"), allow_empty=True)
+            _admission_text(row.get("work_mode"), allow_empty=True)
+            if row.get("posted_at") is not None:
+                _admission_text(row.get("posted_at"), allow_empty=True)
+            _admission_text(row.get("score_explanation"))
+            _admission_text(row.get("human_action_required"))
+            _admission_text_list(row.get("reasons"), require_items=True)
+            _admission_text_list(row.get("gaps"), require_items=False)
+            evidence = _admission_text_list(row.get("evidence_explanations"), require_items=True)
             candidate = QueueCandidate(
                 job_id=fingerprint,
                 source_url=canonical_url,
-                fit_score=row["score"],
+                fit_score=row.get("score"),
                 eligible=True,
                 decision="recommended",
                 evidence=evidence,
