@@ -342,7 +342,7 @@ class ExternalCommandAdapter:
         try:
             canonical = canonical_listing_url(url)
         except ValueError:
-            raise ValueError("refusing to open a non-listing LinkedIn/Indeed URL")
+            raise ValueError("refusing to open a non-listing LinkedIn/Indeed URL") from None
         self._invoke("open-listing", canonical)
 
 

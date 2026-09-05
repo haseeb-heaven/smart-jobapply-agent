@@ -96,15 +96,16 @@ function requireBrowserBinding(browser) {
 
 function isGenericBinding(browser) {
   return (
-    browser != null && typeof browser === "object" &&
+    browser !== null && browser !== undefined && typeof browser === "object" &&
     typeof browser.listTabUrls === "function" && typeof browser.openListing === "function"
   );
 }
 
 function isLegacyBinding(browser) {
   return (
-    browser != null && typeof browser === "object" &&
-    browser.user != null && browser.tabs != null &&
+    browser !== null && browser !== undefined && typeof browser === "object" &&
+    browser.user !== null && browser.user !== undefined &&
+    browser.tabs !== null && browser.tabs !== undefined &&
     typeof browser.user.openTabs === "function" && typeof browser.tabs.new === "function"
   );
 }
