@@ -1046,3 +1046,167 @@ def test_confirmed_outcome_events_are_replayable_user_owned_records(tmp_path: Pa
         ("job-2", "skipped", "user"),
     ]
     assert queue.confirmed_outcome_events(after_event_id=events[0].event_id) == (events[1],)
+
+
+def test_confirmed_outcome_cannot_be_replaced_by_a_different_outcome(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidate = _candidate(1, 99)
+    queue.add_recommendations([candidate])
+    action = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(action.urls_to_open, actor="agent")
+    _confirm_outcome(queue, candidate.job_id, "submitted")
+
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        _confirm_outcome(queue, candidate.job_id, "rejected")
+
+    assert queue.get(candidate.job_id).state == "submitted"
+    assert queue.confirmed_submitted_count() == 1
+    assert len(queue.confirmed_outcome_events()) == 1
+    assert [event.name for event in queue.history_for(candidate.job_id)] == [
+        "recommended",
+        "waiting",
+        "open",
+        "submitted",
+    ]
+
+
+def test_reconfirming_an_identical_outcome_is_idempotent(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidate = _candidate(1, 99)
+    queue.add_recommendations([candidate])
+    action = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(action.urls_to_open, actor="agent")
+
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    first = queue.confirm_outcome(
+        candidate.job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
+    repeated = queue.confirm_outcome(
+        candidate.job_id,
+        "submitted",
+        actor="user",
+        vacated=True,
+        candidate_memory=memory,
+    )
+
+    events = queue.confirmed_outcome_events()
+    assert first.state == repeated.state == "submitted"
+    assert len(events) == 1
+    assert queue.confirmed_submitted_count() == 1
+    assert [event.name for event in queue.history_for(candidate.job_id)] == [
+        "recommended",
+        "waiting",
+        "open",
+        "submitted",
+    ]
+
+
+@pytest.mark.parametrize("actor", ["agent", "host", "browser-bridge"])
+@pytest.mark.parametrize("outcome", ["submitted", "rejected", "skipped"])
+def test_confirm_outcome_rejects_every_non_user_actor_without_recording(
+    tmp_path: Path, actor: str, outcome: str
+):
+    queue = SmartJobQueue(tmp_path / f"{actor}-{outcome}.sqlite3")
+    candidate = _candidate(1, 99)
+    queue.add_recommendations([candidate])
+    action = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(action.urls_to_open, actor="agent")
+
+    memory = CandidateMemory(
+        queue.database_path.with_name("candidate-memory.sqlite3"),
+        private_root=queue.database_path.parent,
+    )
+    with pytest.raises(CandidateMemoryPolicyError, match="user"):
+        queue.confirm_outcome(candidate.job_id, outcome, actor=actor, vacated=True, candidate_memory=memory)
+
+    assert queue.get(candidate.job_id).state == "open"
+    assert queue.confirmed_submitted_count() == 0
+    assert queue.confirmed_outcome_events() == ()
+    assert memory.is_suppressed(candidate.source_url) is False
+    assert [event.name for event in queue.history_for(candidate.job_id)] == [
+        "recommended",
+        "waiting",
+        "open",
+    ]
+
+
+def test_missing_tab_releases_its_slot_immediately_and_a_later_outcome_still_counts_once(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
+    queue.add_recommendations(candidates)
+    first = queue.plan_refill(open_urls=[])
+    queue.record_visible_snapshot(first.urls_to_open, actor="agent")
+    still_open = first.urls_to_open[1:]
+    queue.record_visible_snapshot(still_open, actor="agent")
+
+    assert queue.get("job-1").state == "released"
+    released = queue.plan_refill(open_urls=still_open)
+    assert released.job_ids == ("job-6",)
+    assert released.urls_to_open == (candidates[5].source_url,)
+    assert released.search_needed == 0
+
+    _confirm_outcome(queue, "job-1", "submitted")
+    assert queue.get("job-1").state == "submitted"
+    assert queue.confirmed_submitted_count() == 1
+    assert len(queue.confirmed_outcome_events()) == 1
+    assert [event.name for event in queue.history_for("job-1")] == [
+        "recommended",
+        "waiting",
+        "open",
+        "missing",
+        "submitted",
+    ]
+
+    after_confirmation = queue.plan_refill(open_urls=still_open)
+    assert after_confirmation.job_ids == ()
+    assert after_confirmation.urls_to_open == ()
+    assert after_confirmation.search_needed == 0
+
+
+def test_open_failed_reservation_is_a_dead_end_that_rejects_a_confirmed_outcome(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidates = [_candidate(number, 100 - number) for number in range(1, 7)]
+    queue.add_recommendations(candidates)
+    first = queue.plan_refill(open_urls=[])
+    queue.record_open_failure(first.job_ids[0], actor="browser-bridge")
+
+    replacement = queue.plan_refill(open_urls=[])
+    assert replacement.job_ids == ("job-6",)
+
+    with pytest.raises(QueuePolicyError, match="open or released"):
+        _confirm_outcome(queue, "job-1", "submitted")
+
+    assert queue.get("job-1").state == "open_failed"
+    assert queue.confirmed_submitted_count() == 0
+    assert queue.confirmed_outcome_events() == ()
+    assert [event.name for event in queue.history_for("job-1")] == [
+        "recommended",
+        "waiting",
+        "open_failed",
+    ]
+
+
+def test_repeated_open_failure_is_rejected_and_leaves_no_extra_events(tmp_path: Path):
+    queue = SmartJobQueue(tmp_path / "queue.sqlite3")
+    candidate = _candidate(1, 99)
+    queue.add_recommendations([candidate])
+    queue.plan_refill(open_urls=[])
+    queue.record_open_failure(candidate.job_id, actor="browser-bridge")
+
+    with pytest.raises(QueuePolicyError, match="waiting"):
+        queue.record_open_failure(candidate.job_id, actor="browser-bridge")
+
+    assert queue.get(candidate.job_id).state == "open_failed"
+    assert queue.confirmed_submitted_count() == 0
+    assert [event.name for event in queue.history_for(candidate.job_id)] == [
+        "recommended",
+        "waiting",
+        "open_failed",
+    ]

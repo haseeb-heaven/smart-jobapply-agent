@@ -7,6 +7,7 @@ candidate-private file is used.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 from pathlib import Path
@@ -168,3 +169,82 @@ print(json.dumps({"actions": result.application_actions, "locks": lock_files}))
     result = json.loads(completed.stdout)
     assert result["actions"] == 0
     assert result["locks"]
+
+
+_FORBIDDEN_TOP_LEVEL_IMPORTS = frozenset({"socket", "requests", "webbrowser", "subprocess"})
+_FORBIDDEN_DOTTED_IMPORTS = frozenset({"http.client", "urllib.request"})
+
+
+def _forbidden_network_import_violations(root: Path) -> list[str]:
+    """AST-level scan; the package source is inspected, never executed."""
+    violations: list[str] = []
+    for python_file in root.rglob("*.py"):
+        tree = ast.parse(python_file.read_text(encoding="utf-8"), filename=str(python_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".", 1)[0]
+                    if alias.name in _FORBIDDEN_DOTTED_IMPORTS or top in _FORBIDDEN_TOP_LEVEL_IMPORTS:
+                        violations.append(f"{python_file.name}:{node.lineno}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                imported = {alias.name for alias in node.names}
+                if (
+                    module in _FORBIDDEN_TOP_LEVEL_IMPORTS
+                    or module in _FORBIDDEN_DOTTED_IMPORTS
+                    or (module == "http" and "client" in imported)
+                    or (module == "urllib" and "request" in imported)
+                ):
+                    violations.append(f"{python_file.name}:{node.lineno}: from {module} import ...")
+            elif isinstance(node, ast.Attribute):
+                # Catches attribute access such as socket.socket(),
+                # requests.get(), and the urllib.request / http.client chains.
+                if node.attr in _FORBIDDEN_TOP_LEVEL_IMPORTS:
+                    violations.append(f"{python_file.name}:{node.lineno}: .{node.attr}")
+                elif (
+                    node.attr in {"client", "request"}
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in {"http", "urllib"}
+                ):
+                    violations.append(f"{python_file.name}:{node.lineno}: .{node.attr}")
+    return violations
+
+
+def test_core_package_source_has_no_forbidden_network_or_subprocess_imports():
+    violations = _forbidden_network_import_violations(PACKAGE_ROOT)
+
+    assert violations == [], f"forbidden imports found: {violations}"
+
+
+_FORBIDDEN_IMPORT_SNIPPETS = (
+    "import urllib.request\n",
+    "import urllib.request as u\n",
+    "from urllib import request\n",
+    "from urllib.request import urlopen\n",
+    "import http.client as hc\n",
+    "from http import client\n",
+    "import socket\n",
+    "import requests\n",
+    "import webbrowser\n",
+    "import subprocess\n",
+)
+
+
+@pytest.mark.parametrize("snippet", _FORBIDDEN_IMPORT_SNIPPETS)
+def test_ast_scan_flags_every_forbidden_network_or_subprocess_import_form(
+    tmp_path: Path, snippet: str
+):
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text(snippet, encoding="utf-8")
+
+    assert _forbidden_network_import_violations(tmp_path) != []
+
+
+def test_ast_scan_allows_urllib_parse_helpers_used_by_normalize(tmp_path: Path):
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text(
+        "from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit\n",
+        encoding="utf-8",
+    )
+
+    assert _forbidden_network_import_violations(tmp_path) == []

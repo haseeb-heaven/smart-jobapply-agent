@@ -766,3 +766,205 @@ def test_missing_listing_location_and_work_mode_block_recommendation_for_restric
     assert result.decision != "recommended"
     assert any("location" in gap.casefold() for gap in result.gaps)
     assert any("work mode" in gap.casefold() for gap in result.gaps)
+
+
+# --- exact decision-threshold boundaries -------------------------------------
+
+
+def test_score_exactly_at_the_recommended_threshold_is_recommended():
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+
+    result = score_job(profile(), job)
+    rules = load_scoring_rules()
+
+    assert result.score >= rules["thresholds"]["recommended"]
+    assert result.decision == "recommended"
+    assert result.gaps == []
+
+
+def test_score_exactly_at_the_review_threshold_is_review():
+    job = JobListing(
+        title="Python Backend Developer",
+        company="Example Ltd",
+        description="Maintain FastAPI APIs.",
+    )
+
+    result = score_job(profile(), job)
+    rules = load_scoring_rules()
+
+    assert result.score >= rules["thresholds"]["review"]
+    assert result.score < rules["thresholds"]["recommended"]
+    assert result.decision == "review"
+    assert result.decision != "recommended"
+    assert any(
+        "professional evidence supports this match" in explanation
+        for explanation in result.evidence_explanations
+    )
+
+
+def test_score_below_the_review_threshold_without_hard_gaps_is_reject():
+    narrow = CandidateProfile(
+        professional_skills=("python", "fastapi"),
+        role_targets=("Backend Developer",),
+        evidence_by_skill={"python": "professional", "fastapi": "professional"},
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Add features and write unit tests while maintaining FastAPI services.",
+    )
+
+    result = score_job(narrow, job)
+    rules = load_scoring_rules()
+
+    assert result.score < rules["thresholds"]["review"]
+    assert result.decision == "reject"
+
+
+def test_score_at_or_above_recommended_without_direct_professional_evidence_is_never_recommended(
+    tmp_path: Path,
+):
+    rules_path = tmp_path / "high_title_weight.yaml"
+    rules_path.write_text(
+        "weights:\n"
+        "  title_level_fit: 85\n"
+        "  verified_professional_skill_fit: 0\n"
+        "  responsibility_fit: 0\n"
+        "  location_and_work_mode_fit: 0\n"
+        "  salary_and_recency_fit: 0\n"
+        "  evidence_quality: 0\n",
+        encoding="utf-8",
+    )
+    personal_only = CandidateProfile(
+        personal_open_source_skills=("python", "fastapi", "rest api"),
+        role_targets=("Backend Developer",),
+        evidence_by_skill={
+            "python": "personal_open_source",
+            "fastapi": "personal_open_source",
+            "rest api": "personal_open_source",
+        },
+    )
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+
+    result = score_job(personal_only, job, rules_path=str(rules_path))
+
+    # Point breakdown under the inline rules file above: title_level_fit is the
+    # only nonzero weight (85), so a title match scores exactly 85 while the
+    # missing direct professional evidence caps the decision at review.
+    assert result.score == 85
+    assert result.decision == "review"
+    assert result.decision != "recommended"
+    assert "high-confidence recommendation requires direct professional evidence" in result.gaps
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    (
+        JobRequirement(
+            requirement_id="req-exp-1",
+            text="Relevant experience is required",
+            kind="experience",
+            importance="mandatory",
+        ),
+        JobRequirement(
+            requirement_id="req-exp-2",
+            text="Five years of experience is required",
+            kind="experience",
+            importance="mandatory",
+            minimum_years=5,
+        ),
+    ),
+)
+def test_eligibility_unknowns_force_review_even_when_the_score_would_reject(
+    requirement: JobRequirement,
+):
+    strong_job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+        requirements=(requirement,),
+    )
+    weak_job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs.",
+        requirements=(requirement,),
+    )
+    narrow = CandidateProfile(
+        professional_skills=("python", "fastapi"),
+        role_targets=("Backend Developer",),
+        evidence_by_skill={"python": "professional", "fastapi": "professional"},
+    )
+
+    strong = score_job(profile(), strong_job)
+    weak = score_job(narrow, weak_job)
+
+    assert strong.decision == "review"
+    assert weak.decision == "review"
+    assert weak.score < 70
+    assert any("experience" in gap.casefold() for gap in weak.gaps)
+
+
+def test_load_scoring_rules_rejects_a_scalar_weights_section(tmp_path: Path):
+    rules_path = tmp_path / "scalar.yaml"
+    rules_path.write_text("weights: 5\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="weights"):
+        load_scoring_rules(str(rules_path))
+
+
+def test_load_scoring_rules_rejects_a_scalar_thresholds_section(tmp_path: Path):
+    rules_path = tmp_path / "scalar-thresholds.yaml"
+    rules_path.write_text("thresholds: 5\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="thresholds"):
+        load_scoring_rules(str(rules_path))
+
+
+def test_load_scoring_rules_partial_thresholds_merge_with_defaults(tmp_path: Path):
+    rules_path = tmp_path / "partial.yaml"
+    rules_path.write_text("thresholds:\n  recommended: 90\n", encoding="utf-8")
+
+    rules = load_scoring_rules(str(rules_path))
+    shipped = load_scoring_rules()
+
+    assert rules["thresholds"]["recommended"] == 90
+    assert rules["thresholds"]["review"] == shipped["thresholds"]["review"]
+    assert rules["thresholds"]["reject"] == shipped["thresholds"]["reject"]
+
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+    result = score_job(profile(), job, rules_path=str(rules_path))
+
+    assert result.score < rules["thresholds"]["recommended"]
+    assert result.score >= rules["thresholds"]["review"]
+    assert result.decision == "review"
+
+
+def test_load_scoring_rules_carries_unknown_keys_but_the_matcher_ignores_them(tmp_path: Path):
+    rules_path = tmp_path / "unknown.yaml"
+    rules_path.write_text(
+        "shopping_list:\n"
+        "  - milk\n"
+        "weights:\n"
+        "  nonsense_weight: 100\n",
+        encoding="utf-8",
+    )
+
+    rules = load_scoring_rules(str(rules_path))
+    assert rules["shopping_list"] == ["milk"]
+    assert rules["weights"]["nonsense_weight"] == 100
+
+    job = JobListing(
+        title="Python Backend Developer",
+        description="Maintain FastAPI APIs, add features, write unit tests, and work with PostgreSQL.",
+    )
+    result = score_job(profile(), job, rules_path=str(rules_path))
+
+    assert result.score >= rules["thresholds"]["recommended"]
+    assert result.decision == "recommended"

@@ -28,6 +28,30 @@ def _normalized_strings(value: Any) -> tuple[str, ...]:
     )
 
 
+DEFAULT_EXCLUDED_TITLE_TERMS: tuple[str, ...] = (
+    "senior",
+    "staff",
+    "principal",
+    "lead",
+    "architect",
+    "manager",
+    "head",
+    "director",
+)
+
+
+def _excluded_title_terms(value: Any) -> tuple[str, ...]:
+    """Preserve the safe default unless exclusions use the supported YAML shapes."""
+
+    if value is None:
+        return DEFAULT_EXCLUDED_TITLE_TERMS
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return _as_strings(value) or DEFAULT_EXCLUDED_TITLE_TERMS
+    return DEFAULT_EXCLUDED_TITLE_TERMS
+
+
 @dataclass(frozen=True, slots=True)
 class JobRequirement:
     """One validated listing requirement consumed by deterministic policy.
@@ -60,16 +84,7 @@ class CandidateProfile:
     learning_or_exposure_skills: tuple[str, ...] = ()
     years_experience: int | None = None
     role_targets: tuple[str, ...] = ()
-    excluded_title_terms: tuple[str, ...] = (
-        "senior",
-        "staff",
-        "principal",
-        "lead",
-        "architect",
-        "manager",
-        "head",
-        "director",
-    )
+    excluded_title_terms: tuple[str, ...] = DEFAULT_EXCLUDED_TITLE_TERMS
     mandatory_excluded_requirements: tuple[str, ...] = ()
     location_preferences: tuple[str, ...] = ()
     work_mode_preferences: tuple[str, ...] = ()
@@ -177,6 +192,13 @@ class CandidateProfile:
         for skill in _as_strings(learning):
             evidence.setdefault(skill, "learning_or_exposure")
 
+        if "exclude_title_terms" in data:
+            excluded_title_terms = data["exclude_title_terms"]
+        elif "exclude_title_terms" in roles:
+            excluded_title_terms = roles["exclude_title_terms"]
+        else:
+            excluded_title_terms = DEFAULT_EXCLUDED_TITLE_TERMS
+
         return cls(
             professional_skills=_as_strings(professional),
             personal_open_source_skills=_as_strings(personal),
@@ -186,8 +208,7 @@ class CandidateProfile:
                 experience.get("years_experience", experience.get("total_years")),
             ),
             role_targets=_as_strings(data.get("role_targets", roles.get("include", positioning.get("focus", ())))),
-            excluded_title_terms=_as_strings(data.get("exclude_title_terms", roles.get("exclude_title_terms", ())))
-            or cls.excluded_title_terms,
+            excluded_title_terms=_excluded_title_terms(excluded_title_terms),
             mandatory_excluded_requirements=_as_strings(
                 data.get("mandatory_excluded_requirements", hard_exclusions.get("mandatory_requirements", ()))
             ),
