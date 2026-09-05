@@ -82,6 +82,9 @@ def _discover_module_for_runtime() -> Any:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load discovery runtime helpers from {discover_path}")
     module = importlib.util.module_from_spec(spec)
+    # dataclass processing resolves the defining module via sys.modules;
+    # without registration the module is None during class decoration.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

@@ -29,14 +29,18 @@ Use this skill when the candidate wants job listings opened for manual applicati
   observed missing URL never supplies an outcome or candidate-memory
   confirmation. The legacy fixed-round watcher reopens the same URL only when
   the candidate explicitly requests that behavior.
-- The live Smart Queue host supplies already-validated `QueueCandidate` values
-  directly to `scripts/smart_queue_coordinator.py`; there is intentionally no
-  recommendation-file CLI. It accepts any host-supplied adapter that implements
-  exactly the two bounded tab operations. The optional Codex Chrome extension
-  bridge is a reference integration for an already-connected session, not a
-  claim that the core can prove a host browser identity. Its local queue
-  database must resolve under `jobapply_agent/private/`, which is ignored,
-  never at repository root.
+- The daemon and coordinator have no recommendation-file CLI or JSON
+  recommendation input. The host admits prevalidated candidates separately
+  through the agent-only `discover.py admit-queue` path, then runs the
+  coordinator with no candidates to reconcile the durable queue. It accepts
+  any host-supplied adapter that implements exactly the two bounded tab
+  operations. Generic bindings open exact approved URLs through the host's own
+  `openListing`; handoff-marking is a Codex-session affordance with no generic
+  counterpart, so the synthetic tab's `markHandoff` is a harmless no-op and
+  opens remain exact-URL-only. The optional Codex Chrome extension bridge is a
+  reference integration for an already-connected session, not a claim that the
+  core can prove a host browser identity. Its local queue database must resolve
+  under `jobapply_agent/private/`, which is ignored, never at repository root.
 
 ## Workflow
 
@@ -50,10 +54,16 @@ Use this skill when the candidate wants job listings opened for manual applicati
    `CandidateMemory.filter_unsuppressed_candidates(candidates, queue=queue)`
    with the authenticated `SmartJobQueue` and the prevalidated `QueueCandidate`
    values, then admit only the returned values. On its first non-empty valid
-   batch, an outcome-empty memory binds once to that queue's durable opaque
-   `queue_id`, and every candidate's profile/policy revision pair must match the
-   queue's active pair. The same queue may advance revisions while exact-URL
-   suppression persists; pairing the memory with another queue fails closed.
+   batch, admission binds the empty queue to that batch's revision pair and an
+   outcome-empty memory binds once to that queue's durable opaque `queue_id`.
+   A later valid batch may advance the same durable queue's active pair while
+   its older recommendation rows and outcomes remain immutable and exact-URL
+   suppression persists. If a later-pair admission fails after that temporary
+   advance, admission atomically restores the prior pair while retaining the
+   provisional-advance audit event and appending an `admission-rollback`
+   compensating audit event; revision history is never rewritten.
+   Every candidate must match the active pair; pairing memory with another
+   queue fails closed.
    A populated legacy memory without durable queue scope fails before migration
    mutation. This filter is suppression only; it never converts uncertain
    evidence into verified fit.
@@ -64,17 +74,18 @@ Use this skill when the candidate wants job listings opened for manual applicati
    content or opens a form.
 4. Read prior-application state from the local tracker. Anything not explicitly
    candidate-confirmed remains `unknown`.
-5. In Smart Queue mode, the host gives `SmartQueueCoordinator(queue, browser)`
-   up to the candidate-selected capacity of prevalidated candidates directly.
-   It compares visible managed listing URLs and records missing jobs as
+5. In Smart Queue mode, the host first uses the `admit-queue` handoff below
+   for candidate-bearing work. It then runs
+   `SmartQueueCoordinator(queue, browser).cycle()` with no recommendations.
+   That cycle compares visible managed listing URLs and records missing jobs as
    `released` and frees each missing/closed managed slot immediately. It may
    then open only returned exact listing URLs for distinct, already-admitted
    candidates. If the pool is short, report `search_needed` to the host agent,
    which must separately obtain candidate-approved, deterministically
-   validated, unsuppressed candidates before admission. Do not treat a missing
-   URL as an outcome or candidate-memory confirmation. A capacity reduction
-   never grants close authority: the agent opens no replacements while the
-   queue is already at or above the reduced capacity.
+   validated, unsuppressed candidates before a later `admit-queue` pass. Do
+   not treat a missing URL as an outcome or candidate-memory confirmation. A
+   capacity reduction never grants close authority: the agent opens no
+   replacements while the queue is already at or above the reduced capacity.
 6. The coordinator result contains counts and opaque queue IDs only; URLs and
    snapshots remain inside the skill. Stop after the requested monitoring cycle
    unless the candidate asks for another cycle.
@@ -94,18 +105,21 @@ and validation pass. The agent never fills, uploads, applies, or submits.
 ## Persistent monitoring
 
 For persistent Smart Queue monitoring after the current interaction, start
-`scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Give
+`scripts/smart_queue_daemon.py`; it is the live Smart Queue entry point. Use
+one of exactly two startup paths:
+
+(a) stdio mode through the Node parent, never as a raw Python process. Give
 it an active private candidate intake, a durable private database, and the
-exact `--bridge-stdio` argument through the Node parent, never as a raw Python
-process. The Node parent owns the already-connected Codex Chrome session. Use
+exact `--bridge-stdio` argument through the Node parent. The Node parent owns
+the already-connected browser session. Use
 the supervised helper, which retains one active host singleton until it
 finishes so repeated startup calls cannot create a duplicate daemon for the
 same runtime configuration:
 
 ```js
-import { startOrGetCodexSmartQueueDaemonHost } from "./scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetSmartQueueDaemonHost } from "./scripts/smart_queue_daemon_host.mjs";
 
-const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -114,8 +128,24 @@ const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, 
 });
 ```
 
-The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
-test-only primitive and is not the persistent agent startup path.
+(b) standalone external mode with NO Node parent, via exactly:
+
+```sh
+python3 skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --database jobapply_agent/private/smart-queue.sqlite3 \
+  --adapter external \
+  --adapter-command <bridge> [--max-ticks N]
+```
+
+The external bridge argv must implement `<cmd> list-tabs` (JSON URL array on
+stdout) and `<cmd> open-listing <url>` (open the exact approved listing URL).
+Direct Python launch stays forbidden for stdio mode (path (a)).
+
+The unsupervised `startSmartQueueDaemonHost` function is a low-level,
+test-only primitive and is not the persistent agent startup path. The Codex
+Chrome extension bridge is one tested reference integration for an
+already-connected session.
 
 It receives strict URL-bearing NDJSON request frames from the daemon's stderr
 and writes one matching opaque-ID generic response frame to stdin. The daemon
@@ -134,9 +164,10 @@ watcher is fixed-round tooling and may reopen the same URL; it cannot maintain
 the persistent candidate-controlled Smart Queue.
 
 The persistent monitor is existing-session-only. It accepts only a
-listing-only Codex Chrome extension adapter for an already-connected browser session;
+listing-only browser-bridge adapter for an already-connected browser session;
 it never launches a browser, creates a session or window, closes a tab, or
-inspects page content. Its browser authority remains limited to listing current
+inspects page content. The Codex Chrome extension bridge is one tested
+reference integration for an already-connected session. Its browser authority remains limited to listing current
 tab URLs and opening an exact, already-approved LinkedIn or Indeed listing URL.
 It never applies, fills, uploads, or submits.
 
@@ -144,6 +175,39 @@ The daemon never accepts a JSON recommendation file and does not search for or
 invent candidates. It reconciles only the durable queue. When its redacted
 status reports `search_needed`, the host must separately obtain and validate
 candidate-approved `QueueCandidate` values before they enter the queue.
+### Agent admission handoff after `search_needed`
+
+When the daemon reports `search_needed`, the host agent — never the daemon,
+bridge, or CLI — gathers already-visible listing facts with its own tools,
+runs the existing evidence-first discovery, stages the producer export into
+the ignored private runtime directory (discovery's default `--output-dir`
+writes `recommended_jobs.jsonl` under `jobapply_agent/data/`, while the
+admission sample below reads the staged
+`jobapply_agent/private/discovery.jsonl`), then invokes the deterministic,
+agent-only admission command:
+
+```sh
+mkdir -p jobapply_agent/private && cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
+python3 jobapply_agent/scripts/discover.py admit-queue \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --discovery-export jobapply_agent/private/discovery.jsonl \
+  --queue-db jobapply_agent/private/smart-queue.sqlite3 \
+  --memory-db jobapply_agent/private/candidate-memory.sqlite3
+```
+
+The next existing-session-only monitor tick opens exactly the admitted
+canonical URLs. The command validates the discovery export all-or-nothing:
+its first non-empty batch binds an empty queue to the active revision pair,
+while a later valid batch advances that same durable queue pair without
+rewriting historical recommendation or outcome rows. It runs
+`CandidateMemory.filter_unsuppressed_candidates` before `add_recommendations`
+(suppression is the only non-error exclusion), and prints count-only
+validated/suppressed/admitted results — never URLs or candidate facts. The
+intake, queue, and memory paths stay under the ignored
+`jobapply_agent/private/`; the discovery export is an ignored local runtime
+file. The daemon, bridge, and CLI never search, launch a browser, inspect page
+content, fill forms, upload, or submit; the candidate owns every application
+action.
 
 Each persistent cycle starts with a reliable URL-only snapshot against the
 durable Smart Queue database under `jobapply_agent/private/`. On that initial

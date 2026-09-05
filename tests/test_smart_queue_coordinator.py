@@ -8,6 +8,7 @@ browser-session authority.  All values below are synthetic listing URLs.
 from __future__ import annotations
 
 from dataclasses import asdict, fields
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ import sys
 
 import pytest
 
-from jobapply_agent.candidate_memory import CandidateMemory
+from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
 from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
 from jobapply_agent.smart_queue import QueueAction, QueueCandidate, QueuePolicyError, SmartJobQueue
 
@@ -101,7 +102,12 @@ class FollowUpUnavailableBrowser(SnapshotBrowser):
 
 
 def _coordinator(
-    tmp_path: Path, browser: SnapshotBrowser, *, target_size: int = 5
+    tmp_path: Path,
+    browser: SnapshotBrowser,
+    *,
+    target_size: int = 5,
+    candidate_memory: CandidateMemory | None = None,
+    bind_active_revisions: bool = True,
 ) -> tuple[SmartJobQueue, SmartQueueCoordinator]:
     runtime_name = f"{tmp_path.parent.name}-{tmp_path.name}"
     runtime_directory = (
@@ -119,7 +125,10 @@ def _coordinator(
             _active_intake_with_capacity(tmp_path, target_size),
             database,
         )
-    return queue, SmartQueueCoordinator(queue, browser)
+    if bind_active_revisions and queue.active_revisions == (None, None):
+        queue.bind_empty_queue_revisions(_PROFILE_REVISION, _POLICY_REVISION)
+    memory = candidate_memory or _candidate_memory(queue)
+    return queue, SmartQueueCoordinator(queue, browser, candidate_memory=memory)
 
 
 def _private_runtime_database(tmp_path: Path, name: str) -> Path:
@@ -150,6 +159,7 @@ def _load_discover_module():
     spec = importlib.util.spec_from_file_location("discover_for_live_queue_provenance", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -187,6 +197,118 @@ def _assert_redacted_public_cycle(result: object, *, search_needed: int) -> None
     assert "http://" not in repr(payload)
 
 
+def _active_admission_intake(runtime_directory: Path) -> Path:
+    """Write an active synthetic intake in the admission service's private root."""
+
+    professional = ["Python", "FastAPI", "REST APIs", "PostgreSQL", "unit testing"]
+    payload = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {
+            "experience": {"total_years": 3},
+            "roles": {
+                "include": ["Python Backend Developer"],
+                "exclude_title_terms": ["senior"],
+            },
+            "skills": {
+                "professional": professional,
+                "personal_open_source": ["OpenAI"],
+                "learning_or_exposure": ["Docker"],
+                "evidence_by_skill": {skill: "professional" for skill in professional},
+            },
+        },
+        "unknown_fields": [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+    runtime_directory.mkdir(parents=True, exist_ok=True)
+    intake_path = runtime_directory / "candidate-intake.json"
+    intake_path.write_text(
+        json.dumps(activate_candidate_profile(validate_candidate_intake(payload), actor="user")),
+        encoding="utf-8",
+    )
+    return intake_path
+
+
+def _admission_row(discover: object, *, number: int, profile_revision: str, policy_revision: str) -> dict[str, object]:
+    """Return one strict, synthetic current-revision discovery export row."""
+
+    return {
+        "schema_version": 2,
+        "record_type": "recommended_job_for_human_review",
+        "discovery_mode": "export_only",
+        "application_actions": 0,
+        "fingerprint": hashlib.sha256(f"synthetic-admission-{number}".encode()).hexdigest(),
+        "profile_revision": profile_revision,
+        "matcher_policy_revision": policy_revision,
+        "run_id": "synthetic-admission-run",
+        "discovered_at": "2026-09-03T00:00:00+00:00",
+        "search_url": "https://www.linkedin.com/jobs/search/?keywords=python",
+        "platform": "linkedin",
+        "title": "Python Backend Developer",
+        "company": "Synthetic Queue Systems",
+        "url": f"https://www.linkedin.com/jobs/view/{990000 + number}",
+        "location": "",
+        "work_mode": "",
+        "posted_at": None,
+        "score": 95,
+        "decision": "recommended",
+        "minimum_profile_fit_score": discover.MINIMUM_RECOMMENDED_SCORE,
+        "threshold_met": True,
+        "reasons": ["synthetic eligible evidence"],
+        "gaps": [],
+        "evidence_explanations": ["synthetic candidate-approved evidence"],
+        "score_explanation": "synthetic deterministic score explanation",
+        "human_action_required": "candidate reviews the listing manually",
+    }
+
+
+def test_five_admitted_current_rows_refill_five_url_only_slots(tmp_path: Path) -> None:
+    """Admission is the only source of the five canonical URL-only opens."""
+
+    discover = _load_discover_module()
+    runtime_directory = _private_runtime_database(tmp_path, "admission-refill").parent
+    intake_path = _active_admission_intake(runtime_directory)
+    profile = discover.active_candidate_profile(intake_path)
+    profile_revision = discover.candidate_profile_revision(profile)
+    policy_revision = discover.matcher_policy_revision()
+    rows = [
+        _admission_row(
+            discover,
+            number=number,
+            profile_revision=profile_revision,
+            policy_revision=policy_revision,
+        )
+        for number in range(1, 6)
+    ]
+    export_path = runtime_directory / "discovery.jsonl"
+    export_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    queue_path = runtime_directory / "smart-queue.sqlite3"
+    memory_path = runtime_directory / "candidate-memory.sqlite3"
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path,
+        export_path,
+        queue_path,
+        memory_path,
+    )
+    browser = SnapshotBrowser()
+    queue = discover.smart_queue_for_active_intake(intake_path, queue_path)
+    coordinator = SmartQueueCoordinator(queue, browser)
+    result = coordinator.cycle()
+
+    expected_urls = [row["url"] for row in rows]
+    assert status.validated_count == 5
+    assert status.suppressed_count == 0
+    assert status.admitted_count == 5
+    assert len(result.opened_job_ids) == 5
+    assert browser.opened_urls == expected_urls
+    assert len(browser.visible_urls) == 5
+
+
 def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recommendations(tmp_path: Path):
     browser = SnapshotBrowser()
     queue, coordinator = _coordinator(tmp_path, browser)
@@ -200,6 +322,315 @@ def test_cycle_opens_at_most_five_exact_canonical_listing_urls_from_caller_recom
     assert browser.list_calls >= 2  # A post-open snapshot verifies every claimed open.
     assert [queue.get(candidate.job_id).state for candidate in candidates[:5]] == ["open"] * 5
     assert [queue.get(candidate.job_id).state for candidate in candidates[5:]] == ["recommended"] * 2
+
+
+def test_cycle_rejects_nonempty_admission_without_candidate_memory_before_snapshot_or_queue_mutation(
+    tmp_path: Path,
+):
+    """Raw caller recommendations never bypass candidate-memory suppression."""
+
+    browser = SnapshotBrowser()
+    queue, _memory_bound_coordinator = _coordinator(tmp_path, browser)
+    coordinator = SmartQueueCoordinator(queue, browser)
+
+    with pytest.raises(QueueCoordinatorError, match="candidate.memory|admission"):
+        coordinator.cycle([_candidate(1)])
+
+    with pytest.raises(KeyError):
+        queue.get("coordinator-job-1")
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_cycle_uses_candidate_memory_filter_before_adding_a_suppressed_canonical_url(
+    tmp_path: Path,
+):
+    """A memory-suppressed exact URL cannot be re-admitted through the coordinator."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser, target_size=1)
+    memory = _candidate_memory(queue)
+    original = _candidate(1)
+    queue.add_recommendations([original])
+    action = queue.plan_refill(open_urls=())
+    queue.record_visible_snapshot(action.urls_to_open, actor="synthetic-browser-bridge")
+    memory.finalize_queue_outcome(
+        queue=queue,
+        job_id=original.job_id,
+        outcome="skipped",
+        actor="user",
+        vacated=True,
+    )
+    replay = QueueCandidate(
+        job_id="coordinator-suppressed-replay",
+        source_url=original.source_url,
+        fit_score=99,
+        eligible=True,
+        decision="recommended",
+        evidence=("synthetic verified evidence replay",),
+        profile_revision=_PROFILE_REVISION,
+        matcher_policy_revision=_POLICY_REVISION,
+    )
+
+    result = coordinator.cycle([replay])
+
+    with pytest.raises(KeyError):
+        queue.get(replay.job_id)
+    assert result.search_needed == 1
+    assert browser.opened_urls == []
+
+
+def test_first_memory_bound_cycle_binds_the_candidate_revision_pair_before_suppression(
+    tmp_path: Path,
+):
+    """First admission is usable without bypassing CandidateMemory on a fresh queue."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(
+        tmp_path,
+        browser,
+        bind_active_revisions=False,
+    )
+    candidate = _candidate(1)
+
+    result = coordinator.cycle([candidate])
+
+    assert queue.active_revisions == (
+        candidate.profile_revision,
+        candidate.matcher_policy_revision,
+    )
+    assert queue.get(candidate.job_id).state == "open"
+    assert result.opened_job_ids == (candidate.job_id,)
+    assert browser.opened_urls == [candidate.source_url]
+
+
+def test_first_memory_bound_cycle_rolls_back_new_revision_binding_when_suppression_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed first suppression check cannot leave an active revision behind."""
+
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(
+        tmp_path,
+        browser,
+        bind_active_revisions=False,
+    )
+
+    def fail_suppression(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        del self, candidates, queue
+        raise CandidateMemoryPolicyError("synthetic suppression failure")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", fail_suppression)
+
+    with pytest.raises(CandidateMemoryPolicyError, match="synthetic suppression failure"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (None, None)
+    with pytest.raises(KeyError):
+        queue.get("coordinator-job-1")
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
+def test_first_admission_control_flow_failure_is_compensated_and_reraised(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+):
+    """Coordinator admission restores first-bound queue and memory state on interruption."""
+
+    browser = SnapshotBrowser()
+    database = _private_runtime_database(tmp_path, "admission-control-flow")
+    queue = SmartJobQueue(database)
+    memory = _candidate_memory(queue)
+    coordinator = SmartQueueCoordinator(queue, browser, candidate_memory=memory)
+    original_filter = CandidateMemory.filter_unsuppressed_candidates
+
+    def bind_scope_then_interrupt(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        original_filter(self, candidates, queue=queue)
+        raise interruption("synthetic admission interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", bind_scope_then_interrupt)
+
+    with pytest.raises(interruption, match="synthetic admission interruption"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (None, None)
+    assert coordinator._memory_scope_preexists(memory) is False
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_first_admission_unexpected_failure_runs_all_cleanup_without_masking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A cleanup interruption cannot hide the original unexpected admission error."""
+
+    browser = SnapshotBrowser()
+    database = _private_runtime_database(tmp_path, "admission-unexpected")
+    queue = SmartJobQueue(database)
+    memory = _candidate_memory(queue)
+    coordinator = SmartQueueCoordinator(queue, browser, candidate_memory=memory)
+    original_filter = CandidateMemory.filter_unsuppressed_candidates
+
+    def bind_scope_then_fail(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        original_filter(self, candidates, queue=queue)
+        raise RuntimeError("synthetic unexpected admission failure")
+
+    def interrupt_queue_cleanup(self: SmartJobQueue) -> None:
+        del self
+        raise KeyboardInterrupt("synthetic cleanup interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", bind_scope_then_fail)
+    monkeypatch.setattr(SmartJobQueue, "reset_empty_queue_revisions", interrupt_queue_cleanup)
+
+    with pytest.raises(RuntimeError, match="synthetic unexpected admission failure"):
+        coordinator.cycle([_candidate(1)])
+
+    assert queue.active_revisions == (_PROFILE_REVISION, _POLICY_REVISION)
+    assert coordinator._memory_scope_preexists(memory) is False
+    assert browser.list_calls == 0
+    assert browser.opened_urls == []
+
+
+def test_admission_system_exit_restores_prior_revision_pair_with_append_only_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An interrupt after a later-pair advance preserves the original pair.
+
+    The admission service must not leave a durable queue selecting a revision
+    whose batch was interrupted.  Its compensating event is audit evidence,
+    not a rewrite of either the provisional advance or prior history.
+    """
+
+    discover = _load_discover_module()
+    runtime_directory = _private_runtime_database(tmp_path, "admission-interrupt").parent
+    intake_path = _active_admission_intake(runtime_directory)
+    initial_profile = discover.active_candidate_profile(intake_path)
+    initial_revisions = (
+        discover.candidate_profile_revision(initial_profile),
+        discover.matcher_policy_revision(),
+    )
+    export_path = runtime_directory / "discovery.jsonl"
+    export_path.write_text(
+        json.dumps(
+            _admission_row(
+                discover,
+                number=1,
+                profile_revision=initial_revisions[0],
+                policy_revision=initial_revisions[1],
+            ),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    queue_path = runtime_directory / "smart-queue.sqlite3"
+    memory_path = runtime_directory / "candidate-memory.sqlite3"
+    discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    changed_payload = json.loads(intake_path.read_text(encoding="utf-8"))
+    for field in ("state", "activated_by", "confirmed_at", "revision_hash"):
+        changed_payload.pop(field)
+    changed_payload["approved_facts"] = dict(changed_payload["approved_facts"])
+    changed_payload["approved_facts"]["roles"] = dict(changed_payload["approved_facts"]["roles"])
+    changed_payload["approved_facts"]["roles"]["include"] = ["Platform Engineer"]
+    updated_profile = activate_candidate_profile(validate_candidate_intake(changed_payload), actor="user")
+    intake_path.write_text(json.dumps(updated_profile), encoding="utf-8")
+    updated_candidate_profile = discover.active_candidate_profile(intake_path)
+    requested_revisions = (
+        discover.candidate_profile_revision(updated_candidate_profile),
+        discover.matcher_policy_revision(),
+    )
+    assert requested_revisions != initial_revisions
+    export_path.write_text(
+        json.dumps(
+            _admission_row(
+                discover,
+                number=2,
+                profile_revision=requested_revisions[0],
+                policy_revision=requested_revisions[1],
+            ),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def interrupt_suppression(
+        self: CandidateMemory,
+        candidates: object,
+        *,
+        queue: SmartJobQueue,
+    ) -> tuple[QueueCandidate, ...]:
+        del self, candidates, queue
+        raise SystemExit("synthetic admission interruption")
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", interrupt_suppression)
+
+    with pytest.raises(SystemExit, match="synthetic admission interruption"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    queue = SmartJobQueue(queue_path)
+    assert queue.active_revisions == initial_revisions
+    assert [event.actor for event in queue.revision_history()] == ["host", "admission-rollback"]
+    assert queue.revision_history()[-1].prior_profile_revision == requested_revisions[0]
+    assert queue.revision_history()[-1].profile_revision == initial_revisions[0]
+    with pytest.raises(KeyError):
+        queue.get("queue-2")
+
+
+def test_cycle_rejects_mismatched_revision_recommendations_without_opening(tmp_path: Path):
+    """The coordinator inherits the queue's active-pair admission check.
+
+    A bound queue admits only its active pair, so caller-supplied
+    recommendations from another revision fail closed atomically: no rows
+    are stored, no tabs open, and no snapshot is consumed for them.
+    """
+    browser = SnapshotBrowser()
+    queue, coordinator = _coordinator(tmp_path, browser)
+    coordinator.cycle([_candidate(1)])
+
+    mismatched = QueueCandidate(
+        job_id="coordinator-job-stale",
+        source_url="https://www.linkedin.com/jobs/view/70999",
+        fit_score=99,
+        eligible=True,
+        decision="recommended",
+        evidence=("synthetic verified evidence stale",),
+        profile_revision="coordinator-profile-stale",
+        matcher_policy_revision=_POLICY_REVISION,
+    )
+    with pytest.raises(QueuePolicyError, match="conflict"):
+        coordinator.cycle([mismatched])
+
+    assert queue.active_revisions == (_PROFILE_REVISION, _POLICY_REVISION)
+    with pytest.raises(KeyError):
+        queue.get(mismatched.job_id)
+    assert browser.opened_urls == [queue.get("coordinator-job-1").source_url]
 
 
 @pytest.mark.parametrize("target_size", (1, 3, 10))
@@ -525,7 +956,12 @@ def test_live_coordinator_accepts_verified_active_intake_capacity_and_opens_exac
         _active_intake_with_capacity(tmp_path, 3),
         _private_runtime_database(tmp_path, "verified-three"),
     )
-    coordinator = SmartQueueCoordinator(queue, browser)
+    queue.bind_empty_queue_revisions(_PROFILE_REVISION, _POLICY_REVISION)
+    coordinator = SmartQueueCoordinator(
+        queue,
+        browser,
+        candidate_memory=_candidate_memory(queue),
+    )
     candidates = [_candidate(number) for number in range(1, 5)]
 
     cycle = coordinator.cycle(candidates)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
 from pathlib import Path
 import sys
 
@@ -63,13 +65,29 @@ class RequestStream:
         self.flush_count += 1
 
 
+class StalledResponseStream:
+    """A bridge response that remains blocked until test cleanup releases it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.read_limits: list[int] = []
+
+    def readline(self, size: int = -1) -> str:
+        self.read_limits.append(size)
+        self.started.set()
+        self.release.wait(timeout=5)
+        return _frame({"id": "request-1", "ok": True, "urls": []})
+
+
 def _frame(payload: object) -> str:
     return json.dumps(payload, separators=(",", ":")) + "\n"
 
 
 def _adapter(*responses: object) -> tuple[CodexChromeExtensionAdapter, RequestStream, ResponseStream]:
     request_stream = RequestStream()
-    response_stream = ResponseStream([response if isinstance(response, str) else _frame(response) for response in responses])
+    frames = [response if isinstance(response, str) else _frame(response) for response in responses]
+    response_stream = ResponseStream(frames)
     return (
         CodexChromeExtensionAdapter(response_stream=response_stream, request_stream=request_stream),
         request_stream,
@@ -85,7 +103,7 @@ def _assert_redacted(exception: BaseException, *private_values: str) -> None:
 def test_adapter_is_a_bounded_listing_protocol_for_live_smart_queue() -> None:
     adapter, _requests, _responses = _adapter({"id": "request-1", "ok": True, "urls": []})
 
-    assert adapter.smart_queue_adapter == "codex-chrome-extension-stdio"
+    assert adapter.smart_queue_adapter == "browser-bridge-stdio"
     assert isinstance(adapter, BrowserTabAdapter)
     for prohibited_name in ("click", "fill", "upload", "submit", "close_tab", "inspect_page"):
         assert not hasattr(adapter, prohibited_name)
@@ -106,6 +124,38 @@ def test_list_and_open_use_sequence_matched_ndjson_stderr_requests() -> None:
     ]
     assert requests.flush_count == 2
     assert responses.read_limits == [1_048_577, 1_048_577]
+
+
+def test_stalled_response_times_out_redacted_and_terminals_the_adapter() -> None:
+    requests = RequestStream()
+    responses = StalledResponseStream()
+    adapter = CodexChromeExtensionAdapter(
+        response_stream=responses,
+        request_stream=requests,
+        response_timeout_seconds=0.025,
+    )
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(BrowserAdapterError) as raised:
+            adapter.list_tab_urls()
+        elapsed = time.monotonic() - started
+
+        assert responses.started.is_set()
+        assert elapsed < 0.5
+        assert adapter.terminal is True
+        _assert_redacted(raised.value, "request-1", "private browser state")
+
+        with pytest.raises(BrowserAdapterError) as later:
+            adapter.list_tab_urls()
+        assert time.monotonic() - started < 0.6
+        _assert_redacted(later.value, "request-1", "private browser state")
+        assert requests.frames == [
+            '{"id":"request-1","operation":"list_tab_urls"}\n'
+        ]
+        assert requests.flush_count == 1
+    finally:
+        responses.release.set()
 
 
 def test_list_tab_urls_canonicalizes_the_bounded_url_response() -> None:

@@ -93,7 +93,7 @@ separately in candidate memory.
 ```text
 Resume/Profile
       ↓
-GPT-5.6 Sol
+Your LLM runtime
       ↓
 Find + rank jobs
       ↓
@@ -198,11 +198,12 @@ managed tab becomes `released` and frees its slot immediately; it never records
 an application. In the same reconciliation cycle, `plan_refill` may return a
 data-only exact URL only for a distinct, already-admitted candidate. If the
 admitted pool is short, it returns `search_needed`; the host LLM then separately
-searches, deterministically validates, and suppresses candidates before
-admission. The host creates the live queue
-with `discover.smart_queue_for_active_intake(intake_path, database_path)`, and
-then passes that integrity-bound queue to the skill-level
-`SmartQueueCoordinator(queue, browser)`. A non-default live capacity is rejected
+searches, deterministically validates, and admits candidates with the
+agent-only `discover.py admit-queue` command before monitoring. The host then
+creates the live queue with
+`discover.smart_queue_for_active_intake(intake_path, database_path)`, passes
+that integrity-bound queue to `SmartQueueCoordinator(queue, browser)`, and
+runs a no-candidate reconciliation cycle. A non-default live capacity is rejected
 unless its durable metadata is bound to the active candidate intake revision;
 the default of five remains compatible. That coordinator accepts a host-provided
 listing-only adapter; the optional Codex
@@ -604,18 +605,62 @@ none remain, `search_needed` requires the agent to repeat the
 candidate-approved search, deterministic validation, and suppression check
 before admission. A later dual confirmation records the outcome independently
 of that refill.
+When that refill reports `search_needed`, the host agent — never the daemon,
+bridge, or CLI — closes the loop. The agent gathers already-visible listing
+facts with its own tools, runs the existing evidence-first discovery against
+the current active intake (deterministic eligibility decided before ranking),
+stages the producer export into the ignored private runtime directory
+(discovery's default `--output-dir` writes `recommended_jobs.jsonl` under
+`jobapply_agent/data/`, while the admission sample below reads the staged
+`jobapply_agent/private/discovery.jsonl`), then invokes the deterministic,
+agent-only admission command:
+
+```sh
+mkdir -p jobapply_agent/private && cp jobapply_agent/data/recommended_jobs.jsonl jobapply_agent/private/discovery.jsonl
+python3 jobapply_agent/scripts/discover.py admit-queue \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --discovery-export jobapply_agent/private/discovery.jsonl \
+  --queue-db jobapply_agent/private/smart-queue.sqlite3 \
+  --memory-db jobapply_agent/private/candidate-memory.sqlite3
+```
+
+The next existing-session-only monitor tick then opens exactly the admitted
+canonical listing URLs.
+
+The command never fetches pages or touches a browser. It validates the
+complete discovery export as one atomic batch — any malformed, stale,
+unsupported, duplicate, below-threshold, non-recommended, or conflicting row
+rejects the entire batch — then first binds an empty queue or advances the same
+durable queue's active pair, suppresses through
+`CandidateMemory.filter_unsuppressed_candidates` before `add_recommendations`
+(suppression is the only non-error exclusion), and admits the surviving
+candidates. A failed later-pair admission atomically restores the prior pair
+with a retained append-only provisional-advance event and an
+`admission-rollback` compensating audit event; revision history is never
+rewritten. Success output is count-only JSON with validated,
+suppressed, and admitted counts; failure emits a single redacted error object.
+Neither ever includes URLs, candidate facts, or discovery rows. The intake,
+queue, and memory databases must resolve under the
+ignored `jobapply_agent/private/` directory; the discovery export is an ignored
+local runtime file, never committed data.
+
+The daemon, bridge, and admission CLI never search for listings, launch or
+control a browser, inspect page content, fill forms, upload documents, or
+submit applications. The candidate owns every application action.
 
 For persistent Smart Queue monitoring, start the dedicated live entry point;
-do not use the legacy watcher. The host starts it through the Node parent that
-owns the already-connected Codex Chrome binding, never by invoking Python
+do not use the legacy watcher. Use one of exactly two startup paths:
+
+(a) stdio mode: the host starts it through the Node parent that
+owns the already-connected browser binding, never by invoking Python
 directly. Use the supervised helper, which retains one active host singleton
 until it finishes so repeated startup calls cannot create a duplicate daemon
 for the same runtime configuration:
 
 ```js
-import { startOrGetCodexSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
+import { startOrGetSmartQueueDaemonHost } from "./skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs";
 
-const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, {
+const daemon = startOrGetSmartQueueDaemonHost(alreadyConnectedBrowser, {
   daemonArgs: [
     "--candidate-intake", "jobapply_agent/private/candidate_intake.json",
     "--database", "jobapply_agent/private/smart-queue.sqlite3",
@@ -624,9 +669,24 @@ const daemon = startOrGetCodexSmartQueueDaemonHost(alreadyConnectedCodexChrome, 
 });
 ```
 
-The unsupervised `startCodexSmartQueueDaemonHost` function is a low-level,
+(b) standalone external mode with NO Node parent, via exactly:
+
+```sh
+python3 skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py \
+  --candidate-intake jobapply_agent/private/candidate_intake.json \
+  --database jobapply_agent/private/smart-queue.sqlite3 \
+  --adapter external \
+  --adapter-command <bridge> [--max-ticks N]
+```
+
+The external bridge argv must implement `<cmd> list-tabs` (JSON URL array on
+stdout) and `<cmd> open-listing <url>` (open the exact approved listing URL).
+Direct Python launch stays forbidden for stdio mode (path (a)).
+
+The unsupervised `startSmartQueueDaemonHost` function is a low-level,
 test-only primitive; persistent agent operation must use the supervised helper
-above.
+above. The Codex Chrome extension bridge is one tested reference integration
+for an already-connected session.
 
 The host reports `running`, `ready`, and `healthy` separately. `running` means
 the child and bridge are live; it is not a readiness claim. `ready` becomes true
@@ -637,8 +697,10 @@ stream, terminal frame, or exited process cannot make the host ready or healthy.
 
 `smart_queue_daemon.py` builds the queue only from the active,
 integrity-checked candidate intake, uses a durable database under the ignored
-private runtime directory, and attaches only through a Node-parented strict
-NDJSON stdio bridge to an already-connected Codex Chrome session. The daemon
+private runtime directory, and in stdio mode attaches only through a Node-parented strict
+NDJSON stdio bridge to an already-connected browser session (in standalone
+external mode it instead spawns the explicit argv bridge itself per call). The Codex Chrome
+extension bridge is one tested reference integration for such a session. The daemon
 writes bridge requests to stderr and reads one matching response from stdin;
 its stdout consists only of redacted count-only JSON status lines. The parent
 must reserve stderr for either `{"id":"opaque","operation":"list_tab_urls"}`

@@ -9,7 +9,9 @@ is involved in these tests.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -252,6 +254,83 @@ def _monitor(
         interval_seconds=interval_seconds,
         max_backoff_seconds=max_backoff_seconds,
     )
+
+
+def _load_discover_module() -> object:
+    """Load the admission seam without invoking its CLI."""
+
+    script_path = Path(__file__).parents[1] / "jobapply_agent" / "scripts" / "discover.py"
+    spec = importlib.util.spec_from_file_location("discover_for_monitor_lease_test", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _active_admission_intake(runtime_directory: Path) -> Path:
+    """Create a complete synthetic active intake for lease-only admission coverage."""
+
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+
+    professional = ["Python", "FastAPI", "REST APIs", "PostgreSQL", "unit testing"]
+    payload = {
+        "schema_version": 1,
+        "documents": [],
+        "approved_facts": {
+            "experience": {"total_years": 3},
+            "roles": {"include": ["Python Backend Developer"], "exclude_title_terms": ["senior"]},
+            "skills": {
+                "professional": professional,
+                "personal_open_source": ["OpenAI"],
+                "learning_or_exposure": ["Docker"],
+                "evidence_by_skill": {skill: "professional" for skill in professional},
+            },
+        },
+        "unknown_fields": [],
+        "contradictions": [],
+        "pending_facts": [],
+    }
+    runtime_directory.mkdir(parents=True, exist_ok=True)
+    intake_path = runtime_directory / "candidate-intake.json"
+    intake_path.write_text(
+        json.dumps(activate_candidate_profile(validate_candidate_intake(payload), actor="user")),
+        encoding="utf-8",
+    )
+    return intake_path
+
+
+def _admission_export(discover: object, intake_path: Path, export_path: Path) -> None:
+    profile = discover.active_candidate_profile(intake_path)
+    row = {
+        "schema_version": 2,
+        "record_type": "recommended_job_for_human_review",
+        "discovery_mode": "export_only",
+        "application_actions": 0,
+        "fingerprint": hashlib.sha256(b"synthetic-monitor-lease-admission").hexdigest(),
+        "profile_revision": discover.candidate_profile_revision(profile),
+        "matcher_policy_revision": discover.matcher_policy_revision(),
+        "run_id": "synthetic-monitor-lease-run",
+        "discovered_at": "2026-09-03T00:00:00+00:00",
+        "search_url": "https://www.linkedin.com/jobs/search/?keywords=python",
+        "platform": "linkedin",
+        "title": "Python Backend Developer",
+        "company": "Synthetic Queue Systems",
+        "url": "https://www.linkedin.com/jobs/view/991001",
+        "location": "",
+        "work_mode": "",
+        "posted_at": None,
+        "score": 95,
+        "decision": "recommended",
+        "minimum_profile_fit_score": discover.MINIMUM_RECOMMENDED_SCORE,
+        "threshold_met": True,
+        "reasons": ["synthetic eligible evidence"],
+        "gaps": [],
+        "evidence_explanations": ["synthetic candidate-approved evidence"],
+        "score_explanation": "synthetic deterministic score explanation",
+        "human_action_required": "candidate reviews the listing manually",
+    }
+    export_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def test_initial_tick_opens_the_candidate_selected_capacity_once() -> None:
@@ -573,6 +652,36 @@ def test_lease_contention_fails_closed_without_a_coordinator_cycle_or_open() -> 
     assert lease.release_calls == 0
     assert coordinator.calls == []
     assert browser.opened_urls == []
+
+
+def test_monitor_lease_blocks_admission_without_queue_or_memory_mutation(tmp_path: Path) -> None:
+    """Admission shares the monitor's durable sibling-file lease."""
+
+    discover = _load_discover_module()
+    runtime_directory = (
+        Path(__file__).parents[1]
+        / "jobapply_agent"
+        / "private"
+        / "test-persistent-smart-queue-monitor"
+        / f"{tmp_path.parent.name}-{tmp_path.name}"
+    )
+    intake_path = _active_admission_intake(runtime_directory)
+    export_path = runtime_directory / "discovery.jsonl"
+    _admission_export(discover, intake_path, export_path)
+    queue_path = runtime_directory / "smart-queue.sqlite3"
+    memory_path = runtime_directory / "candidate-memory.sqlite3"
+
+    with DatabaseLease(queue_path):
+        with pytest.raises(discover.AdmissionError, match="queue admission failed"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path,
+                export_path,
+                queue_path,
+                memory_path,
+            )
+
+    assert queue_path.exists() is False
+    assert memory_path.exists() is False
 
 
 def test_database_lease_rejects_symlink_without_modifying_its_external_target(

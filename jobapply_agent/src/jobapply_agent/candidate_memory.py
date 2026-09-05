@@ -20,6 +20,8 @@ from .sources import canonical_listing_url
 
 _SCHEMA_VERSION = 2
 _OUTCOMES = frozenset({"submitted", "rejected", "skipped"})
+_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+_OUTCOME_EXISTS_QUERY = "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
 
 
 class CandidateMemoryPolicyError(ValueError):
@@ -108,7 +110,7 @@ class CandidateMemory:
     def _initialize(self) -> None:
         connection = self._connect(self.database_path)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_BEGIN_IMMEDIATE)
             self._preflight_unscoped_legacy_outcomes(connection)
             statements = (
                 """
@@ -210,7 +212,18 @@ class CandidateMemory:
         cls,
         connection: sqlite3.Connection,
     ) -> None:
-        """Reject populated legacy memory before migration mutates its schema."""
+        """Reject populated legacy memory before migration mutates its schema.
+
+        Private-API coupling note: this preflight reads the outcomes and
+        queue-scope tables directly instead of going through the public
+        outcome surface (``is_suppressed`` /
+        ``filter_unsuppressed_candidates``) or the scope binder
+        (``_bind_or_validate_queue_scope``), because it must run inside
+        ``_initialize`` before the schema it inspects is guaranteed to
+        exist. A future refactor could replace the direct reads with a
+        public scope-introspection method plus ``_require_queue_id``; no
+        such refactor is attempted here.
+        """
 
         tables = {
             str(row["name"])
@@ -221,7 +234,7 @@ class CandidateMemory:
         if "candidate_memory_outcomes" not in tables:
             return
         if connection.execute(
-            "SELECT 1 FROM candidate_memory_outcomes LIMIT 1"
+            _OUTCOME_EXISTS_QUERY
         ).fetchone() is None:
             return
         if "candidate_memory_queue_scope" not in tables:
@@ -442,7 +455,7 @@ class CandidateMemory:
             )
         connection = self._connect(self.database_path)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_BEGIN_IMMEDIATE)
             self._bind_or_validate_queue_scope(connection, queue_id)
             unsuppressed = tuple(
                 candidate
@@ -456,6 +469,56 @@ class CandidateMemory:
             connection.commit()
             return unsuppressed
         except (CandidateMemoryPolicyError, CandidateMemoryStorageError):
+            connection.rollback()
+            raise
+        except sqlite3.Error:
+            connection.rollback()
+            raise CandidateMemoryStorageError("candidate memory storage operation failed") from None
+        finally:
+            connection.close()
+
+    def discard_outcome_empty_queue_scope(self) -> None:
+        """Roll back a newly bound queue scope while outcomes stay empty.
+
+        This is the rollback half of scope binding during admission.  It is a
+        no-op when no scope row exists and fails closed without mutating
+        anything once any outcome has been recorded.
+        """
+
+        connection = self._connect(self.database_path)
+        try:
+            connection.execute(_BEGIN_IMMEDIATE)
+            scope_row = connection.execute(
+                "SELECT queue_id FROM candidate_memory_queue_scope WHERE scope_id = 1"
+            ).fetchone()
+            if scope_row is None:
+                connection.commit()
+                return
+            has_outcome = connection.execute(
+                _OUTCOME_EXISTS_QUERY
+            ).fetchone()
+            if has_outcome is not None:
+                raise CandidateMemoryPolicyError(
+                    "candidate memory queue scope is discarded only while outcomes are empty"
+                )
+            # The no-delete trigger keeps the scope immutable for normal
+            # traffic, so this rollback path drops and recreates it inside
+            # the same transaction as the single scope-row deletion.
+            connection.execute(
+                "DROP TRIGGER IF EXISTS candidate_memory_queue_scope_no_delete"
+            )
+            connection.execute("DELETE FROM candidate_memory_queue_scope WHERE scope_id = 1")
+            connection.execute(
+                """
+                CREATE TRIGGER candidate_memory_queue_scope_no_delete
+                BEFORE DELETE ON candidate_memory_queue_scope
+                BEGIN
+                    SELECT RAISE(ABORT, 'candidate memory queue scope is immutable');
+                END
+                """
+            )
+            connection.commit()
+        except CandidateMemoryPolicyError:
             connection.rollback()
             raise
         except sqlite3.Error:

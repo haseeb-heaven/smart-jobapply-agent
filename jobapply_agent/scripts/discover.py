@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
+import importlib.util
 import json
 import math
 import os
@@ -29,23 +31,53 @@ else:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from jobapply_agent.candidate_memory import (  # noqa: E402
+    CandidateMemory,
+    CandidateMemoryPolicyError,
+    CandidateMemoryStorageError,
+)
+from jobapply_agent.matcher import matcher_policy_revision  # noqa: E402
 from jobapply_agent.models import CandidateProfile  # noqa: E402
-from jobapply_agent.smart_queue import QueuePolicyError, SmartJobQueue  # noqa: E402
+from jobapply_agent.scheduler import (  # noqa: E402
+    MINIMUM_RECOMMENDED_SCORE,
+    candidate_profile_revision,
+    current_profile_recommendations,
+    run_discovery,
+)
+from jobapply_agent.smart_queue import (  # noqa: E402
+    QueueCandidate,
+    QueuePolicyError,
+    QueueStorageError,
+    SmartJobQueue,
+)
+from jobapply_agent.sources import (  # noqa: E402
+    MappingVisiblePageAdapter,
+    canonical_listing_url,
+    load_search_profiles,
+)
 from jobapply_agent.intake import activate_candidate_profile, validate_active_candidate_profile  # noqa: E402
 from jobapply_agent.intake import (  # noqa: E402
     completion_questions,
     pending_verification_batch,
     validate_candidate_intake,
 )
-from jobapply_agent.scheduler import current_profile_recommendations, run_discovery  # noqa: E402
-from jobapply_agent.sources import MappingVisiblePageAdapter, load_search_profiles  # noqa: E402
 
 
 DEFAULT_CANDIDATE_PROFILE_PATH = PROJECT_ROOT / "private" / "candidate_profile.yaml"
 DEFAULT_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private" / "candidate_intake.json"
 REDACTED_CANDIDATE_INTAKE_PATH = PROJECT_ROOT / "private.example" / "candidate_intake.json"
 _INTERACTIVE_PRIVATE_ROOT = PROJECT_ROOT / "private"
+_ADMISSION_PRIVATE_ROOT = PROJECT_ROOT / "private"
+_ADMISSION_RUNTIME_ROOTS = (_ADMISSION_PRIVATE_ROOT, PROJECT_ROOT / "data", PROJECT_ROOT / "output")
+_MONITOR_SCRIPT = (
+    PROJECT_ROOT.parent
+    / "skills"
+    / "easy-apply-tab-monitor"
+    / "scripts"
+    / "persistent_smart_queue_monitor.py"
+)
 _INTERACTIVE_PATH_ERROR = "Interactive onboarding intake path is not permitted."
+_ADMISSION_FAILURE_MESSAGE = "queue admission failed"
 INTERACTIVE_CONFIRMATION_TOKEN = "yes"
 _UNSET_QUEUE_CAPACITY = object()
 _JSON_STRING_LIST_FIELDS = frozenset(
@@ -320,6 +352,56 @@ _CURRENT_RECOMMENDATION_QUEUE_COLUMNS = (
     "human_action_required",
     "application_actions",
 )
+_ADMISSION_EXPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "record_type",
+        "discovery_mode",
+        "application_actions",
+        "fingerprint",
+        "profile_revision",
+        "matcher_policy_revision",
+        "run_id",
+        "discovered_at",
+        "search_url",
+        "platform",
+        "title",
+        "company",
+        "url",
+        "location",
+        "work_mode",
+        "posted_at",
+        "score",
+        "decision",
+        "minimum_profile_fit_score",
+        "threshold_met",
+        "reasons",
+        "gaps",
+        "evidence_explanations",
+        "score_explanation",
+        "human_action_required",
+    }
+)
+_ADMISSION_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_ADMISSION_MAX_TEXT = 4096
+
+
+class AdmissionError(RuntimeError):
+    """Raised for a redacted fail-closed queue-admission failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionStatus:
+    """Count-only result of one deterministic queue-admission attempt."""
+
+    validated_count: int
+    suppressed_count: int
+    admitted_count: int
+
+    def __post_init__(self) -> None:
+        values = (self.validated_count, self.suppressed_count, self.admitted_count)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("admission status counts must be non-negative integers")
 
 
 def _parse_inline_list(value: str, *, path: Path, line_number: int) -> list[str]:
@@ -1240,7 +1322,7 @@ def _persist_active_candidate_intake(
             _private_root=_private_root,
         )
         _sync_parent_directory(validated_path.parent)
-    except BaseException:
+    except (Exception, KeyboardInterrupt, SystemExit):
         if temporary_path is not None:
             try:
                 temporary_path.unlink(missing_ok=True)
@@ -1420,6 +1502,518 @@ def export_current_profile_recommendation_queue(
     return len(rows)
 
 
+def _admission_path_error() -> None:
+    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+
+
+def _admission_absolute_path(value: Path | str) -> Path:
+    if not isinstance(value, (Path, str)) or not str(value).strip():
+        _admission_path_error()
+    path = Path(value)
+    if ".." in path.parts:
+        _admission_path_error()
+    return path.absolute()
+
+
+def _validate_admission_path(
+    value: Path | str,
+    *,
+    root: Path,
+    require_regular_file: bool,
+) -> Path:
+    """Validate one lexical path without resolving through a link."""
+
+    candidate = _admission_absolute_path(value)
+    trusted_root = _admission_absolute_path(root)
+    try:
+        relative = candidate.relative_to(trusted_root)
+    except ValueError:
+        _admission_path_error()
+    if not relative.parts:
+        _admission_path_error()
+
+    current = trusted_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            status = os.lstat(current)
+        except FileNotFoundError:
+            if index != len(relative.parts) - 1 or require_regular_file:
+                _admission_path_error()
+            return candidate
+        except OSError:
+            _admission_path_error()
+        if _is_link_like(current, status):
+            _admission_path_error()
+        if index == len(relative.parts) - 1:
+            if not stat.S_ISREG(status.st_mode):
+                _admission_path_error()
+        elif not stat.S_ISDIR(status.st_mode):
+            _admission_path_error()
+    return candidate
+
+
+def _validate_admission_private_root() -> Path:
+    root = _admission_absolute_path(_ADMISSION_PRIVATE_ROOT)
+    try:
+        status = os.lstat(root)
+    except OSError:
+        _admission_path_error()
+    if _is_link_like(root, status) or not stat.S_ISDIR(status.st_mode):
+        _admission_path_error()
+    return root
+
+
+def _validate_admission_export_root(root: Path) -> Path | None:
+    """lstat one discovery-export root without following links.
+
+    Missing roots are skipped so an absent ``data/`` or ``output/``
+    directory cannot fail admission for exports staged elsewhere. A root
+    that is a link (or not a directory) fails closed.
+    """
+
+    candidate = _admission_absolute_path(root)
+    try:
+        status = os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _admission_path_error()
+    if _is_link_like(candidate, status) or not stat.S_ISDIR(status.st_mode):
+        _admission_path_error()
+    return candidate
+
+
+def _validate_admission_paths(
+    candidate_intake: Path | str,
+    discovery_export: Path | str,
+    queue_db: Path | str,
+    memory_db: Path | str,
+) -> tuple[Path, Path, Path, Path, Path]:
+    """Require private database paths and an ignored local discovery export."""
+
+    private_root = _validate_admission_private_root()
+    intake_path = _validate_admission_path(
+        candidate_intake, root=private_root, require_regular_file=True
+    )
+    queue_path = _validate_admission_path(queue_db, root=private_root, require_regular_file=False)
+    memory_path = _validate_admission_path(memory_db, root=private_root, require_regular_file=False)
+    if queue_path == memory_path or queue_path == intake_path or memory_path == intake_path:
+        _admission_path_error()
+    if queue_path.exists() and memory_path.exists():
+        try:
+            if os.path.samestat(os.stat(queue_path), os.stat(memory_path)):
+                _admission_path_error()
+        except OSError:
+            _admission_path_error()
+
+    export_path = _admission_absolute_path(discovery_export)
+    export_roots = [private_root]
+    for runtime_root in _ADMISSION_RUNTIME_ROOTS[1:]:
+        validated_root = _validate_admission_export_root(runtime_root)
+        if validated_root is not None:
+            export_roots.append(validated_root)
+    for root in export_roots:
+        try:
+            export_path = _validate_admission_path(
+                export_path, root=root, require_regular_file=True
+            )
+            break
+        except AdmissionError:
+            continue
+    else:
+        _admission_path_error()
+    return intake_path, export_path, queue_path, memory_path, private_root
+
+
+def _revalidate_admission_file(path: Path) -> None:
+    """Re-check one admission input immediately before reading it.
+
+    The admission paths are validated with ``lstat`` without following
+    links, but a local writer could replace a file between that validation
+    and the read. Re-checking that the path is still a non-link regular
+    file narrows that window and fails closed on any violation. This keeps
+    a local-attacker-only assumption explicit: admission inputs must live
+    in OS-permission-confined private runtime directories, and the monitor
+    lease serializes concurrent admitters rather than defending against a
+    privileged local writer.
+    """
+
+    try:
+        status = os.lstat(path)
+    except OSError:
+        _admission_path_error()
+    if _is_link_like(path, status) or not stat.S_ISREG(status.st_mode):
+        _admission_path_error()
+
+
+def _admission_text(value: object, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+    cleaned = value.strip()
+    if (not allow_empty and not cleaned) or len(cleaned) > _ADMISSION_MAX_TEXT:
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+    return cleaned
+
+
+def _admission_text_list(value: object, *, require_items: bool) -> tuple[str, ...]:
+    if not isinstance(value, list) or (require_items and not value):
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+    try:
+        values = tuple(_admission_text(item) for item in value)
+    except AdmissionError:
+        raise
+    if len(values) != len(set(values)):
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+    return values
+
+
+def _validated_admission_candidates(
+    export_path: Path,
+    *,
+    profile_revision: str,
+    matcher_revision: str,
+) -> tuple[QueueCandidate, ...]:
+    """Parse the native discovery export as one strict, all-or-nothing batch."""
+
+    candidates: list[QueueCandidate] = []
+    fingerprints: set[str] = set()
+    source_urls: set[str] = set()
+    _revalidate_admission_file(export_path)
+    try:
+        lines = export_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+    for line in lines:
+        if not line.strip():
+            # Skip blank lines exactly like the scheduler read path
+            # (jobapply_agent.scheduler), which treats them as separators
+            # rather than malformed rows.
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+        if not isinstance(row, Mapping) or set(row) != _ADMISSION_EXPORT_FIELDS:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        if (
+            row.get("schema_version") != 2
+            or row.get("record_type") != "recommended_job_for_human_review"
+            or row.get("discovery_mode") != "export_only"
+            or row.get("application_actions") != 0
+            or type(row.get("application_actions")) is not int
+            or row.get("decision") != "recommended"
+            or row.get("minimum_profile_fit_score") != MINIMUM_RECOMMENDED_SCORE
+            or type(row.get("minimum_profile_fit_score")) is not int
+            or row.get("threshold_met") is not True
+            or row.get("profile_revision") != profile_revision
+            or row.get("matcher_policy_revision") != matcher_revision
+            or row.get("platform") not in {"linkedin", "indeed"}
+            or type(row.get("score")) is not int
+            or row.get("score") < MINIMUM_RECOMMENDED_SCORE
+            or row.get("score") > 100
+        ):
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        fingerprint = row.get("fingerprint")
+        if not isinstance(fingerprint, str) or _ADMISSION_FINGERPRINT.fullmatch(fingerprint) is None:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        try:
+            # Re-canonicalize with the strict listing canonicalizer and store
+            # only its output. Discovery exports may carry harmless tracking
+            # query data (for example an Indeed ``from=search`` tag) that the
+            # strict form strips; comparing canonical-to-canonical keeps those
+            # rows admissible while suppression keys stay in strict form. A
+            # row whose URL cannot be strict-canonicalized still fails closed.
+            canonical_url = canonical_listing_url(row.get("url"), row.get("platform"))
+        except ValueError:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+        if fingerprint in fingerprints or canonical_url in source_urls:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        try:
+            _admission_text(row.get("run_id"))
+            _admission_text(row.get("discovered_at"))
+            _admission_text(row.get("search_url"))
+            _admission_text(row.get("title"))
+            _admission_text(row.get("company"))
+            _admission_text(row.get("location"), allow_empty=True)
+            _admission_text(row.get("work_mode"), allow_empty=True)
+            if row.get("posted_at") is not None:
+                _admission_text(row.get("posted_at"), allow_empty=True)
+            _admission_text(row.get("score_explanation"))
+            _admission_text(row.get("human_action_required"))
+            _admission_text_list(row.get("reasons"), require_items=True)
+            _admission_text_list(row.get("gaps"), require_items=False)
+            evidence = _admission_text_list(row.get("evidence_explanations"), require_items=True)
+            candidate = QueueCandidate(
+                job_id=fingerprint,
+                source_url=canonical_url,
+                fit_score=row.get("score"),
+                eligible=True,
+                decision="recommended",
+                evidence=evidence,
+                profile_revision=profile_revision,
+                matcher_policy_revision=matcher_revision,
+            )
+        except (AdmissionError, QueuePolicyError):
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+        fingerprints.add(fingerprint)
+        source_urls.add(canonical_url)
+        candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _monitor_database_lease(queue_path: Path) -> Any:
+    """Create the monitor's exact sibling-file lease without browser authority."""
+
+    module_name = "smart_jobapply_admission_monitor_lease"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, _MONITOR_SCRIPT)
+        if spec is None or spec.loader is None:
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+    try:
+        return module.DatabaseLease(queue_path)
+    except Exception:
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+
+
+def _preflight_memory_scope(memory: CandidateMemory, queue: SmartJobQueue) -> bool:
+    """Reject a differently scoped memory before either admission binding occurs.
+
+    Returns ``True`` when a matching durable scope row already existed, so the
+    caller knows a rollback must never discard it.
+    """
+
+    try:
+        connection = memory._connect(memory.database_path)
+        rows = connection.execute(
+            "SELECT queue_id FROM candidate_memory_queue_scope ORDER BY scope_id"
+        ).fetchall()
+        if len(rows) > 1 or (rows and rows[0]["queue_id"] != queue.queue_id):
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        return len(rows) == 1
+    except AdmissionError:
+        raise
+    except Exception:
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+    finally:
+        if "connection" in locals():
+            connection.close()
+
+
+def _preflight_queue_candidates(
+    queue: SmartJobQueue, candidates: tuple[QueueCandidate, ...]
+) -> frozenset[str]:
+    """Check replay and conflict safety before durable candidate-memory binding."""
+
+    connection = queue._transaction()
+    existing_ids: set[str] = set()
+    try:
+        for candidate in candidates:
+            existing_by_id = connection.execute(
+                """
+                SELECT job_id, source_url, fit_score, eligible, decision, evidence_json,
+                       profile_revision, matcher_policy_revision
+                FROM smart_queue_jobs WHERE job_id = ?
+                """,
+                (candidate.job_id,),
+            ).fetchone()
+            if existing_by_id is not None:
+                if not queue._candidate_matches_row(candidate, existing_by_id):
+                    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+                existing_ids.add(candidate.job_id)
+            existing_by_url = connection.execute(
+                "SELECT job_id FROM smart_queue_jobs WHERE source_url = ?",
+                (candidate.source_url,),
+            ).fetchone()
+            if existing_by_url is not None and existing_by_url["job_id"] != candidate.job_id:
+                raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        connection.rollback()
+    except AdmissionError:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+    finally:
+        queue._close(connection)
+    return frozenset(existing_ids)
+
+
+def _restore_failed_admission_state(
+    queue: SmartJobQueue,
+    memory: CandidateMemory,
+    *,
+    requested_revisions: tuple[str, str],
+    revisions_newly_bound: bool,
+    prior_active_revisions: tuple[str, str] | None,
+    scope_preexisted: bool,
+) -> None:
+    """Append compensation and discard only a newly-created empty scope.
+
+    Restoration is deliberately best-effort: the caller re-raises the original
+    failure, while the queue retains every attempted revision transition as
+    immutable audit history.
+    """
+
+    try:
+        if revisions_newly_bound:
+            queue.reset_empty_queue_revisions()
+        elif prior_active_revisions is not None:
+            queue._rollback_active_revision_advance(
+                prior_revisions=prior_active_revisions,
+                attempted_revisions=requested_revisions,
+            )
+    except (Exception, KeyboardInterrupt, SystemExit):
+        pass  # Rollback failures never mask the original admission failure.
+    try:
+        if not scope_preexisted:
+            memory.discard_outcome_empty_queue_scope()
+    except (Exception, KeyboardInterrupt, SystemExit):
+        pass  # Rollback failures never mask the original admission failure.
+
+
+def admit_current_recommendations_for_active_queue(
+    candidate_intake: Path | str,
+    discovery_export: Path | str,
+    queue_db: Path | str,
+    memory_db: Path | str,
+) -> AdmissionStatus:
+    """Atomically admit one strict current-revision discovery batch.
+
+    The only non-error exclusion is durable exact-URL suppression.  This
+    service neither reads browser state nor accepts application actions.
+
+    Admission is single-admitter via the monitor's exact sibling-file
+    ``DatabaseLease``: the lease is held across intake/export reads,
+    revision binding, memory suppression, and durable insertion, so a
+    concurrent admitter for the same queue database fails closed without
+    mutating queue or memory state. SQLite transactions alone do not span
+    the whole operation; the lease is the serialization boundary.
+
+    Re-exports that reference an already-known listing URL must repeat
+    that row byte-identically (same fingerprint, score, evidence, and
+    revisions); any conflicting re-export of a known URL fails the whole
+    batch closed rather than rewriting immutable recommendation history.
+
+    Admission inputs are re-validated as non-link regular files immediately
+    before reading. This assumes a local-attacker-only model: inputs must
+    live in OS-permission-confined private runtime directories.
+    """
+
+    try:
+        intake_path, export_path, queue_path, memory_path, private_root = _validate_admission_paths(
+            candidate_intake, discovery_export, queue_db, memory_db
+        )
+        lease = _monitor_database_lease(queue_path)
+        with lease:
+            _revalidate_admission_file(intake_path)
+            _revalidate_admission_file(export_path)
+            profile = active_candidate_profile(intake_path)
+            profile_revision = candidate_profile_revision(profile)
+            policy_revision = matcher_policy_revision()
+            candidates = _validated_admission_candidates(
+                export_path,
+                profile_revision=profile_revision,
+                matcher_revision=policy_revision,
+            )
+            if not candidates:
+                return AdmissionStatus(0, 0, 0)
+
+            queue = smart_queue_for_active_intake(intake_path, queue_path)
+            memory = CandidateMemory(memory_path, private_root=private_root)
+            scope_preexisted = _preflight_memory_scope(memory, queue)
+            existing_ids = _preflight_queue_candidates(queue, candidates)
+            active_revisions = queue.active_revisions
+            requested_revisions = (profile_revision, policy_revision)
+            revisions_newly_bound = False
+            prior_active_revisions: tuple[str, str] | None = None
+            if active_revisions == (None, None):
+                queue.bind_empty_queue_revisions(*requested_revisions)
+                revisions_newly_bound = True
+            elif active_revisions != requested_revisions:
+                # Revision selection controls only future refill candidates.
+                # Historical recommendation and outcome rows stay immutable,
+                # while CandidateMemory remains durably scoped to queue_id.
+                queue.set_active_revisions(*requested_revisions)
+                assert active_revisions[0] is not None and active_revisions[1] is not None
+                prior_active_revisions = (active_revisions[0], active_revisions[1])
+
+            try:
+                unsuppressed = memory.filter_unsuppressed_candidates(candidates, queue=queue)
+                if queue.active_revisions != requested_revisions:
+                    raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+                queue.add_recommendations(unsuppressed)
+                return AdmissionStatus(
+                    validated_count=len(candidates),
+                    suppressed_count=len(candidates) - len(unsuppressed),
+                    admitted_count=sum(candidate.job_id not in existing_ids for candidate in unsuppressed),
+                )
+            except (Exception, KeyboardInterrupt, SystemExit):
+                # A later-pair filter needs the queue's active pair to be
+                # visible. If admission fails, append a compensating revision
+                # transition and restore the prior pair in one internal queue
+                # transaction; neither the provisional advance nor its
+                # compensation is ever removed from audit history. A first
+                # binding instead returns to its genuinely unbound empty
+                # state.
+                _restore_failed_admission_state(
+                    queue,
+                    memory,
+                    requested_revisions=requested_revisions,
+                    revisions_newly_bound=revisions_newly_bound,
+                    prior_active_revisions=prior_active_revisions,
+                    scope_preexisted=scope_preexisted,
+                )
+                raise
+    except AdmissionError:
+        raise
+    except (
+        CandidateMemoryPolicyError,
+        CandidateMemoryStorageError,
+        OSError,
+        QueuePolicyError,
+        QueueStorageError,
+        ValueError,
+    ):
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+    except Exception:
+        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
+
+
+def _run_admit_queue_command(arguments: argparse.Namespace) -> int:
+    """Run the count-only admission CLI without exposing runtime details."""
+
+    try:
+        status = admit_current_recommendations_for_active_queue(
+            arguments.candidate_intake,
+            arguments.discovery_export,
+            arguments.queue_db,
+            arguments.memory_db,
+        )
+    except AdmissionError:
+        print(json.dumps({"error": "admission_failed"}, sort_keys=True), file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            {
+                "admitted_count": status.admitted_count,
+                "suppressed_count": status.suppressed_count,
+                "validated_count": status.validated_count,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1468,7 +2062,18 @@ def main(
         const=PROJECT_ROOT / "output" / "Current_Profile_Recommended_Queue.csv",
         help="Write a read-only CSV queue for the current profile revision; defaults to the local output directory.",
     )
+    commands = parser.add_subparsers(dest="command")
+    admit_parser = commands.add_parser(
+        "admit-queue",
+        help="Admit one private, current-revision discovery export into the Smart Queue.",
+    )
+    admit_parser.add_argument("--candidate-intake", type=Path, required=True)
+    admit_parser.add_argument("--discovery-export", type=Path, required=True)
+    admit_parser.add_argument("--queue-db", type=Path, required=True)
+    admit_parser.add_argument("--memory-db", type=Path, required=True)
     arguments = parser.parse_args(argv)
+    if arguments.command == "admit-queue":
+        return _run_admit_queue_command(arguments)
     try:
         if arguments.candidate_intake is None:
             raise ValueError("--candidate-intake is required and must reference an active user-confirmed intake")

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -49,6 +50,7 @@ def load_discover_module():
     spec = importlib.util.spec_from_file_location("discover_for_test", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -1933,3 +1935,675 @@ def test_active_intake_queue_factory_requires_integrity_checked_candidate_capaci
     with pytest.raises(ValueError, match="revision|integrity|active"):
         discover.smart_queue_for_active_intake(tampered_path, tmp_path / "tampered.sqlite3")
     assert not (tmp_path / "tampered.sqlite3").exists()
+
+
+def admission_fixture(
+    private_test_dir: Path,
+    *,
+    row_count: int = 5,
+) -> tuple[object, Path, Path, Path, Path, list[dict[str, object]]]:
+    """Create a complete, current-revision export using synthetic listing facts."""
+
+    discover = load_discover_module()
+    from jobapply_agent.matcher import matcher_policy_revision
+    from jobapply_agent.scheduler import candidate_profile_revision
+
+    intake_path = private_test_dir / "candidate_intake.json"
+    write_active_candidate_intake(intake_path)
+    profile_revision = candidate_profile_revision(discover.active_candidate_profile(intake_path))
+    policy_revision = matcher_policy_revision()
+    rows = [
+        {
+            "schema_version": 2,
+            "record_type": "recommended_job_for_human_review",
+            "discovery_mode": "export_only",
+            "application_actions": 0,
+            "fingerprint": f"{index + 1:064x}",
+            "profile_revision": profile_revision,
+            "matcher_policy_revision": policy_revision,
+            "run_id": "synthetic-admission-run",
+            "discovered_at": "2026-09-03T00:00:00+00:00",
+            "search_url": "https://www.indeed.com/jobs?q=python",
+            "platform": "indeed",
+            "title": "Python Backend Developer",
+            "company": f"Synthetic Company {index + 1}",
+            "url": f"https://www.indeed.com/viewjob?jk=admit{index + 1:04d}",
+            "location": "Synthetic City",
+            "work_mode": "hybrid",
+            "posted_at": None,
+            "score": 85,
+            "decision": "recommended",
+            "minimum_profile_fit_score": 85,
+            "threshold_met": True,
+            "reasons": ["verified professional Python evidence"],
+            "gaps": [],
+            "evidence_explanations": ["professional backend evidence"],
+            "score_explanation": "Synthetic deterministic score explanation.",
+            "human_action_required": "Candidate reviews the listing manually.",
+        }
+        for index in range(row_count)
+    ]
+    export_path = private_test_dir / "discovery.jsonl"
+    write_admission_export(export_path, rows)
+    return (
+        discover,
+        intake_path,
+        export_path,
+        private_test_dir / "smart-queue.sqlite3",
+        private_test_dir / "candidate-memory.sqlite3",
+        rows,
+    )
+
+
+def write_admission_export(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+
+
+def admission_database_counts(database_path: Path) -> tuple[int, int]:
+    """Return durable recommendation/event totals without exposing row contents."""
+
+    if not database_path.exists():
+        return (0, 0)
+    with sqlite3.connect(database_path) as connection:
+        return tuple(
+            int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("smart_queue_jobs", "smart_queue_events")
+        )
+
+
+def run_admit_queue_cli(
+    intake_path: Path,
+    export_path: Path,
+    queue_path: Path,
+    memory_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DISCOVER_SCRIPT),
+            "admit-queue",
+            "--candidate-intake",
+            str(intake_path),
+            "--discovery-export",
+            str(export_path),
+            "--queue-db",
+            str(queue_path),
+            "--memory-db",
+            str(memory_path),
+        ],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_admit_queue_accepts_a_valid_current_five_row_batch(private_test_dir: Path):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(private_test_dir)
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+
+
+@pytest.mark.parametrize(
+    "invalid_row",
+    (
+        pytest.param(lambda rows: {**rows[-1], "schema_version": 1}, id="invalid-contract"),
+        pytest.param(lambda rows: {**rows[-1], "profile_revision": "0" * 64}, id="stale-profile"),
+        pytest.param(lambda rows: {**rows[-1], "matcher_policy_revision": "0" * 64}, id="stale-policy"),
+        pytest.param(lambda rows: {**rows[-1], "platform": "unsupported"}, id="unsupported-platform"),
+        pytest.param(
+            lambda rows: {**rows[-1], "url": rows[-1]["url"] + "&unexpected=1"},
+            id="noncanonical-url",
+        ),
+        pytest.param(lambda rows: {**rows[-1], "is_test_fixture": True}, id="fixture-flag"),
+        pytest.param(lambda rows: {**rows[-1], "application_actions": 1}, id="application-actions"),
+        pytest.param(lambda rows: {**rows[-1], "decision": "review"}, id="wrong-decision"),
+        pytest.param(lambda rows: {**rows[-1], "threshold_met": False}, id="threshold-mismatch"),
+        pytest.param(lambda rows: {**rows[-1], "score": 84}, id="below-score-threshold"),
+        pytest.param(lambda rows: {**rows[-1], "evidence_explanations": []}, id="missing-evidence"),
+        pytest.param(lambda rows: {**rows[-1], "fingerprint": rows[0]["fingerprint"]}, id="duplicate-fingerprint"),
+        pytest.param(lambda rows: {**rows[-1], "url": rows[0]["url"]}, id="duplicate-canonical-url"),
+    ),
+)
+def test_admit_queue_rejects_one_invalid_row_without_durable_mutation(
+    private_test_dir: Path,
+    invalid_row,
+):
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(private_test_dir)
+    rows[-1] = invalid_row(rows)
+    write_admission_export(export_path, rows)
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert admission_database_counts(queue_path) == (0, 0)
+    assert not memory_path.exists()
+
+
+def test_admit_queue_cli_keeps_success_and_failure_output_redacted_and_count_only(
+    private_test_dir: Path,
+):
+    _discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(private_test_dir)
+
+    success = run_admit_queue_cli(intake_path, export_path, queue_path, memory_path)
+
+    assert success.returncode == 0
+    assert success.stderr == ""
+    assert json.loads(success.stdout) == {
+        "admitted_count": 5,
+        "suppressed_count": 0,
+        "validated_count": 5,
+    }
+    for secret in (str(intake_path), str(export_path), rows[0]["url"], rows[0]["fingerprint"], rows[0]["title"]):
+        assert secret not in success.stdout + success.stderr
+
+    rows[-1]["application_actions"] = 1
+    write_admission_export(export_path, rows)
+    failed = run_admit_queue_cli(intake_path, export_path, queue_path, memory_path)
+
+    assert failed.returncode == 2
+    assert failed.stdout == ""
+    assert json.loads(failed.stderr) == {"error": "admission_failed"}
+    for secret in (str(intake_path), str(export_path), rows[0]["url"], rows[0]["fingerprint"], rows[0]["title"]):
+        assert secret not in failed.stdout + failed.stderr
+
+
+def test_documented_admission_path_with_staged_export_end_to_end(
+    private_test_dir: Path, tmp_path: Path
+):
+    """Prove the documented producer-stage-admit path works against temp DBs.
+
+    Discovery's default ``--output-dir`` writes ``recommended_jobs.jsonl``;
+    the documented handoff stages it to ``jobapply_agent/private/discovery.jsonl``
+    and runs the exact documented ``admit-queue`` flag spelling as a subprocess.
+    """
+    discover, intake_path, staged_export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    assert staged_export_path.name == "discovery.jsonl"
+
+    producer_export = tmp_path / "recommended_jobs.jsonl"
+    write_admission_export(producer_export, rows)
+    staged_export_path.unlink()
+    shutil.copy(producer_export, staged_export_path)
+
+    completed = run_admit_queue_cli(intake_path, staged_export_path, queue_path, memory_path)
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "admitted_count": 5,
+        "suppressed_count": 0,
+        "validated_count": 5,
+    }
+    assert admission_database_counts(queue_path) == (5, 5)
+
+
+def test_admit_queue_rejects_nonprivate_paths_symlinks_and_database_collisions(
+    private_test_dir: Path,
+    tmp_path: Path,
+):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(private_test_dir)
+    outside_queue = tmp_path / "outside-queue.sqlite3"
+    outside_memory = tmp_path / "outside-memory.sqlite3"
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, outside_queue, memory_path
+        )
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, outside_memory
+        )
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, queue_path
+        )
+
+    linked_queue = private_test_dir / "linked-queue.sqlite3"
+    try:
+        linked_queue.symlink_to(outside_queue)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, linked_queue, memory_path
+        )
+
+    assert not outside_queue.exists()
+    assert not outside_memory.exists()
+    assert not memory_path.exists()
+
+
+def test_admit_queue_identical_rerun_is_idempotent(private_test_dir: Path):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(private_test_dir)
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    before_rerun = admission_database_counts(queue_path)
+    second = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert second == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=0)
+    assert admission_database_counts(queue_path) == before_rerun == (5, 5)
+def _memory_scope_queue_ids(memory_path: Path) -> list[str]:
+    with sqlite3.connect(memory_path) as connection:
+        return [
+            row[0]
+            for row in connection.execute(
+                "SELECT queue_id FROM candidate_memory_queue_scope ORDER BY scope_id"
+            ).fetchall()
+        ]
+
+
+def test_admit_queue_rolls_back_newly_bound_revisions_when_suppression_fails(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
+    from jobapply_agent.smart_queue import SmartJobQueue
+
+    def failing_suppression(self, candidates, *, queue):
+        raise CandidateMemoryPolicyError("synthetic suppression failure after binding")
+
+    with monkeypatch.context() as patch_scope:
+        patch_scope.setattr(CandidateMemory, "filter_unsuppressed_candidates", failing_suppression)
+        with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path, export_path, queue_path, memory_path
+            )
+
+    assert SmartJobQueue(queue_path).active_revisions == (None, None)
+    assert admission_database_counts(queue_path) == (0, 0)
+    if memory_path.exists():
+        assert _memory_scope_queue_ids(memory_path) == []
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+    assert SmartJobQueue(queue_path).active_revisions != (None, None)
+    assert _memory_scope_queue_ids(memory_path) == [SmartJobQueue(queue_path).queue_id]
+
+
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
+def test_admit_queue_restores_newly_bound_state_then_reraises_control_flow_interruption(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+):
+    """Cleanup preserves user/system interruption while discarding new queue state."""
+
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.candidate_memory import CandidateMemory
+    from jobapply_agent.smart_queue import SmartJobQueue
+
+    def interrupt_suppression(self, candidates, *, queue):
+        raise interruption()
+
+    monkeypatch.setattr(CandidateMemory, "filter_unsuppressed_candidates", interrupt_suppression)
+
+    with pytest.raises(interruption):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert SmartJobQueue(queue_path).active_revisions == (None, None)
+    assert admission_database_counts(queue_path) == (0, 0)
+    if memory_path.exists():
+        assert _memory_scope_queue_ids(memory_path) == []
+
+
+def test_admit_queue_rolls_back_newly_bound_state_when_queue_insertion_fails(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.smart_queue import QueueStorageError, SmartJobQueue
+
+    def failing_insertion(self, candidates):
+        raise QueueStorageError("smart queue storage operation failed")
+
+    monkeypatch.setattr(SmartJobQueue, "add_recommendations", failing_insertion)
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert SmartJobQueue(queue_path).active_revisions == (None, None)
+    assert admission_database_counts(queue_path) == (0, 0)
+    assert _memory_scope_queue_ids(memory_path) == []
+
+
+def test_admit_queue_failure_after_prior_binding_keeps_preexisting_pair_and_scope(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.smart_queue import QueueStorageError, SmartJobQueue
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    bound_pair = SmartJobQueue(queue_path).active_revisions
+    assert bound_pair != (None, None)
+    scope_before = _memory_scope_queue_ids(memory_path)
+    assert scope_before != []
+
+    def failing_insertion(self, candidates):
+        raise QueueStorageError("smart queue storage operation failed")
+
+    monkeypatch.setattr(SmartJobQueue, "add_recommendations", failing_insertion)
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert SmartJobQueue(queue_path).active_revisions == bound_pair
+    assert admission_database_counts(queue_path) == (5, 5)
+    assert _memory_scope_queue_ids(memory_path) == scope_before
+
+
+@pytest.mark.parametrize("failure_stage", ("suppression", "insertion"))
+def test_changed_revision_admission_failure_restores_prior_pair_history_scope_and_jobs(
+    private_test_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+):
+    """A failed advance compensates append-only; a later valid advance succeeds."""
+
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    from jobapply_agent.candidate_memory import CandidateMemory, CandidateMemoryPolicyError
+    from jobapply_agent.intake import activate_candidate_profile, validate_candidate_intake
+    from jobapply_agent.smart_queue import QueueStorageError, SmartJobQueue
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+    prior_queue = SmartJobQueue(queue_path)
+    prior_pair = prior_queue.active_revisions
+    prior_history = prior_queue.revision_history()
+    prior_jobs = admission_database_counts(queue_path)
+    prior_scope = _memory_scope_queue_ids(memory_path)
+    assert prior_pair != (None, None)
+    assert prior_scope == [prior_queue.queue_id]
+
+    active_intake = json.loads(intake_path.read_text(encoding="utf-8"))
+    revised_draft = {
+        key: active_intake[key]
+        for key in (
+            "schema_version",
+            "documents",
+            "approved_facts",
+            "unknown_fields",
+            "contradictions",
+            "pending_facts",
+        )
+    }
+    revised_draft["approved_facts"] = {
+        **revised_draft["approved_facts"],
+        "experience": {"total_years": 4},
+    }
+    intake_path.write_text(
+        json.dumps(
+            activate_candidate_profile(
+                validate_candidate_intake(revised_draft),
+                actor="user",
+            )
+        ),
+        encoding="utf-8",
+    )
+    revised_profile = discover.active_candidate_profile(intake_path)
+    revised_profile_revision = discover.candidate_profile_revision(revised_profile)
+    revised_policy_revision = "b" * 64
+    monkeypatch.setattr(discover, "matcher_policy_revision", lambda: revised_policy_revision)
+    revised_rows = [
+        {
+            **row,
+            "fingerprint": f"{100 + index:064x}",
+            "profile_revision": revised_profile_revision,
+            "matcher_policy_revision": revised_policy_revision,
+            "url": f"https://www.indeed.com/viewjob?jk=advance{100 + index:04d}",
+        }
+        for index, row in enumerate(rows)
+    ]
+    write_admission_export(export_path, revised_rows)
+
+    with monkeypatch.context() as failure_patch:
+        if failure_stage == "suppression":
+            def fail_suppression(self, candidates, *, queue):
+                raise CandidateMemoryPolicyError("synthetic suppression failure after revision advance")
+
+            failure_patch.setattr(CandidateMemory, "filter_unsuppressed_candidates", fail_suppression)
+        else:
+            def fail_insertion(self, candidates):
+                raise QueueStorageError("synthetic insertion failure after revision advance")
+
+            failure_patch.setattr(SmartJobQueue, "add_recommendations", fail_insertion)
+
+        with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path, export_path, queue_path, memory_path
+            )
+
+    restored = SmartJobQueue(queue_path)
+    assert restored.active_revisions == prior_pair
+    restored_history = restored.revision_history()
+    assert restored_history[: len(prior_history)] == prior_history
+    assert len(restored_history) == len(prior_history) + 2
+    provisional_advance, compensation = restored_history[len(prior_history) :]
+    assert provisional_advance.prior_profile_revision == prior_pair[0]
+    assert provisional_advance.prior_matcher_policy_revision == prior_pair[1]
+    assert provisional_advance.profile_revision == revised_profile_revision
+    assert provisional_advance.matcher_policy_revision == revised_policy_revision
+    assert provisional_advance.actor == "host"
+    assert compensation.prior_profile_revision == revised_profile_revision
+    assert compensation.prior_matcher_policy_revision == revised_policy_revision
+    assert compensation.profile_revision == prior_pair[0]
+    assert compensation.matcher_policy_revision == prior_pair[1]
+    assert compensation.actor == "admission-rollback"
+    assert compensation.event_id == provisional_advance.event_id + 1
+    assert admission_database_counts(queue_path) == prior_jobs
+    assert _memory_scope_queue_ids(memory_path) == prior_scope
+
+    successful_advance = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert successful_advance == discover.AdmissionStatus(
+        validated_count=5,
+        suppressed_count=0,
+        admitted_count=5,
+    )
+    advanced = SmartJobQueue(queue_path)
+    assert advanced.active_revisions == (revised_profile_revision, revised_policy_revision)
+    advanced_history = advanced.revision_history()
+    assert advanced_history[:-1] == restored_history
+    assert advanced_history[-1].prior_profile_revision == prior_pair[0]
+    assert advanced_history[-1].prior_matcher_policy_revision == prior_pair[1]
+    assert advanced_history[-1].profile_revision == revised_profile_revision
+    assert advanced_history[-1].matcher_policy_revision == revised_policy_revision
+    assert advanced_history[-1].actor == "host"
+    assert admission_database_counts(queue_path) == (10, 10)
+    assert _memory_scope_queue_ids(memory_path) == prior_scope
+
+
+def test_admit_queue_skips_blank_lines_like_scheduler(private_test_dir: Path):
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    export_path.write_text(
+        "\n".join(["", *[json.dumps(row, sort_keys=True) for row in rows], "", ""]),
+        encoding="utf-8",
+    )
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+
+
+def test_admission_export_root_lstat_rejects_links(tmp_path: Path):
+    discover = load_discover_module()
+
+    assert discover._validate_admission_export_root(tmp_path / "missing-root") is None
+    assert discover._validate_admission_export_root(tmp_path) == tmp_path.absolute()
+
+    target = tmp_path / "target"
+    target.mkdir()
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(target, target_is_directory=True)
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover._validate_admission_export_root(linked_dir)
+
+    regular_file = tmp_path / "regular-file"
+    regular_file.write_text("x", encoding="utf-8")
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover._validate_admission_export_root(regular_file)
+
+
+def test_admit_queue_rejects_malformed_jsonl_export_without_durable_mutation(
+    private_test_dir: Path,
+):
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    lines = export_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines[1] = '{"record_type": "recommended_job_for_human_review"\n'
+    export_path.write_text("".join(lines), encoding="utf-8")
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert admission_database_counts(queue_path) == (0, 0)
+    assert not memory_path.exists()
+
+
+def test_admit_queue_accepts_tracking_tagged_indeed_urls_and_stores_strict_form(
+    private_test_dir: Path,
+):
+    """Loose-but-strict-canonicalizable export URLs admit in strict form.
+
+    Discovery exports may carry harmless tracking query data such as an
+    Indeed ``from=search`` tag. Admission re-canonicalizes each row URL
+    with the strict canonicalizer, compares canonical-to-canonical for
+    duplicates, and stores only the strict form that suppression keys use.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+    for row in rows:
+        assert row["platform"] == "indeed"
+        row["url"] = f"{row['url']}&from=search"
+    write_admission_export(export_path, rows)
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+    assert admission_database_counts(queue_path) == (5, 5)
+    with sqlite3.connect(queue_path) as connection:
+        stored_urls = [
+            row[0]
+            for row in connection.execute("SELECT source_url FROM smart_queue_jobs ORDER BY rowid").fetchall()
+        ]
+    assert len(stored_urls) == 5
+    assert all("from=" not in url for url in stored_urls)
+    assert stored_urls == [f"https://www.indeed.com/viewjob?jk=admit{index + 1:04d}" for index in range(5)]
+
+
+def test_admit_queue_contending_lease_holder_fails_closed_without_mutation(
+    private_test_dir: Path,
+):
+    """Admission is single-admitter via the monitor's sibling-file lease.
+
+    While another holder owns the lease for the same queue database, the
+    whole admission operation fails closed before reading intake/export
+    state into durable queue or memory rows.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, _rows = admission_fixture(
+        private_test_dir
+    )
+
+    with discover._monitor_database_lease(queue_path):
+        with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+            discover.admit_current_recommendations_for_active_queue(
+                intake_path, export_path, queue_path, memory_path
+            )
+
+    assert not queue_path.exists()
+    assert not memory_path.exists()
+
+    status = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert status == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+
+def test_admit_queue_title_edited_reexport_of_known_url_fails_whole_batch_closed(
+    private_test_dir: Path,
+):
+    """Re-exports of URL-known rows must be byte-identical or fail closed.
+
+    A title edit changes the discovery fingerprint, so the re-exported row
+    carries a new job identity for an already-known listing URL. Admission
+    keeps failing the whole batch closed rather than rewriting the
+    immutable recommendation history. No output-field changes are involved.
+    """
+    discover, intake_path, export_path, queue_path, memory_path, rows = admission_fixture(
+        private_test_dir
+    )
+
+    first = discover.admit_current_recommendations_for_active_queue(
+        intake_path, export_path, queue_path, memory_path
+    )
+    assert first == discover.AdmissionStatus(validated_count=5, suppressed_count=0, admitted_count=5)
+
+    edited = [dict(row) for row in rows]
+    edited[0] = {
+        **edited[0],
+        "title": "Senior Python Backend Developer",
+        "fingerprint": f"{0xED17ED:064x}",
+    }
+    write_admission_export(export_path, edited)
+
+    with pytest.raises(discover.AdmissionError, match="^queue admission failed$"):
+        discover.admit_current_recommendations_for_active_queue(
+            intake_path, export_path, queue_path, memory_path
+        )
+
+    assert admission_database_counts(queue_path) == (5, 5)

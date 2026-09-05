@@ -2,16 +2,24 @@
 
 import assert from "node:assert/strict";
 import { spawn as spawnChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 
-import { startCodexChromeExtensionHost } from "../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs";
+import { startCodexChromeExtensionHost, canonicalListingUrl } from "../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs";
 import {
   startCodexSmartQueueDaemonHost,
   startOrGetCodexSmartQueueDaemonHost,
 } from "../skills/easy-apply-tab-monitor/scripts/codex_smart_queue_daemon_host.mjs";
+import {
+  startSmartQueueDaemonHost,
+  startOrGetSmartQueueDaemonHost,
+  toBridgeBinding,
+} from "../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs";
 
 const LINKEDIN = "https://www.linkedin.com/jobs/view/123456";
 const INDEED = "https://in.indeed.com/viewjob?jk=abc_123";
@@ -20,7 +28,7 @@ function tab(url = "https://in.indeed.com/jobs?q=private") {
   return { url };
 }
 
-function chromeBinding({ tabs = [tab()], delay = null, openTabsError = null } = {}) {
+function chromeBinding({ tabs = [tab()], delay = null, newDelay = null, openTabsError = null } = {}) {
   const events = [];
   return {
     events,
@@ -36,6 +44,7 @@ function chromeBinding({ tabs = [tab()], delay = null, openTabsError = null } = 
       tabs: {
         async new() {
           events.push(["new"]);
+          if (newDelay !== null) await newDelay;
           return {
             async goto(url) { events.push(["goto", url]); },
             async markHandoff() { events.push(["markHandoff"]); },
@@ -152,6 +161,68 @@ test("oversized ID-bearing frames echo their bounded opaque ID", async () => {
   assert.deepEqual(events, []);
 });
 
+test("an oversized split frame recovers only its root opaque ID", async () => {
+  const { binding, events } = chromeBinding();
+  const frame = JSON.stringify({
+    nested: { id: "nested-id" },
+    id: "root-id",
+    ignored: "x".repeat(16 * 1024),
+  });
+  const rootIdOffset = frame.indexOf('"root-id"') + '"root-id"'.length;
+  assert.ok(rootIdOffset > 0);
+
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const received = [];
+  output.on("data", (chunk) => received.push(Buffer.from(chunk)));
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+  input.write(frame.slice(0, rootIdOffset));
+  await new Promise((resolve) => setImmediate(resolve));
+  input.end(`${frame.slice(rootIdOffset)}\n`);
+  await service.finished;
+
+  assert.deepEqual(
+    Buffer.concat(received).toString("utf8").trim().split("\n").map((line) => JSON.parse(line)),
+    [{ id: "root-id", ok: false, error: "request_failed" }],
+  );
+  assert.deepEqual(events, []);
+});
+
+test("an over-1MiB valid tab snapshot returns one fixed failure and the next frame remains usable", async () => {
+  // Each URL is individually permitted (and already canonical), but the
+  // aggregate response exceeds Python's one-frame 1MiB response boundary.
+  const nearMaxListing = `https://www.linkedin.com/jobs/view/${"a".repeat(8192 - "https://www.linkedin.com/jobs/view/".length)}`;
+  assert.equal(nearMaxListing.length, 8192);
+  const snapshots = [
+    Array.from({ length: 512 }, () => tab(nearMaxListing)),
+    [tab(LINKEDIN)],
+  ];
+  const { binding, events } = chromeBinding();
+  binding.user.openTabs = async () => {
+    events.push(["openTabs"]);
+    return snapshots.shift();
+  };
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const responses = [];
+  output.on("data", (chunk) => responses.push(Buffer.from(chunk)));
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+
+  input.end([
+    JSON.stringify({ id: "oversized", operation: "list_tab_urls" }),
+    JSON.stringify({ id: "recovered", operation: "list_tab_urls" }),
+  ].join("\n") + "\n");
+  await service.finished;
+
+  const raw = Buffer.concat(responses).toString("utf8");
+  assert.equal(raw.includes(nearMaxListing), false);
+  assert.deepEqual(raw.trim().split("\n").map((line) => JSON.parse(line)), [
+    { id: "oversized", ok: false, error: "request_failed" },
+    { id: "recovered", ok: true, urls: [LINKEDIN] },
+  ]);
+  assert.deepEqual(events, [["openTabs"], ["openTabs"]]);
+});
+
 test("request handling is serialized", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -169,6 +240,26 @@ test("request handling is serialized", async () => {
   assert.deepEqual(events, [["openTabs"], ["openTabs"], ["new"], ["goto", LINKEDIN], ["markHandoff"]]);
 });
 
+test("direct bridge close fences a read-only openTabs wait before any mutation", async () => {
+  let releaseOpenTabs;
+  const stalledOpenTabs = new Promise((resolve) => { releaseOpenTabs = resolve; });
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], delay: stalledOpenTabs });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const service = startCodexChromeExtensionHost(binding, { input, output });
+
+  input.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+
+  service.close();
+  await bounded(service.finished, "fenced direct bridge completion");
+  assert.equal(service.mutationPending, false);
+  releaseOpenTabs();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+});
+
 function daemonChild() {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
@@ -182,6 +273,7 @@ function daemonChild() {
     child.signalCode = signal;
     queueMicrotask(() => {
       child.stdout.end();
+      child.stderr.end();
       child.emit("close", null, signal);
     });
     return true;
@@ -247,6 +339,32 @@ function bounded(promise, label, timeoutMilliseconds = 2000) {
       timeout = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMilliseconds);
     }),
   ]).finally(() => clearTimeout(timeout));
+}
+
+function syntheticActiveIntake() {
+  const approvedFacts = { "targets.smart_queue_capacity": 5 };
+  const revisionInput = {
+    activated_by: "user",
+    approved_facts: approvedFacts,
+    contradictions: [],
+    documents: [],
+    pending_facts: [],
+    schema_version: 1,
+    state: "active",
+    unknown_fields: [],
+  };
+  return {
+    schema_version: 1,
+    documents: [],
+    approved_facts: approvedFacts,
+    unknown_fields: [],
+    contradictions: [],
+    pending_facts: [],
+    state: "active",
+    activated_by: "user",
+    confirmed_at: "2026-01-01T00:00:00+00:00",
+    revision_hash: createHash("sha256").update(JSON.stringify(revisionInput)).digest("hex"),
+  };
 }
 
 function realDaemonFixture(source) {
@@ -327,6 +445,7 @@ sys.path.insert(0, str(root / "skills" / "easy-apply-tab-monitor" / "scripts"))
 
 from codex_chrome_extension_adapter import CodexChromeExtensionAdapter
 from smart_queue_coordinator import SmartQueueCoordinator
+from jobapply_agent.candidate_memory import CandidateMemory
 from jobapply_agent.smart_queue import QueueCandidate, QueuePolicyError, SmartJobQueue
 
 private_root = root / "jobapply_agent" / "private"
@@ -343,7 +462,15 @@ with TemporaryDirectory(prefix="node-coordinator-duplicate-", dir=private_root) 
         profile_revision="duplicate-probe-profile",
         matcher_policy_revision="duplicate-probe-policy",
     )
-    coordinator = SmartQueueCoordinator(queue, CodexChromeExtensionAdapter())
+    memory = CandidateMemory(
+        Path(temporary) / "candidate-memory.sqlite3",
+        private_root=Path(temporary),
+    )
+    coordinator = SmartQueueCoordinator(
+        queue,
+        CodexChromeExtensionAdapter(),
+        candidate_memory=memory,
+    )
     try:
         coordinator.cycle((candidate,))
     except QueuePolicyError as error:
@@ -379,6 +506,73 @@ test("the real Node host preserves duplicate managed URLs through the Python coo
     signalCode: null,
   });
   assert.deepEqual(duplicateTabs.events, [["openTabs"]]);
+});
+
+test("the real Node parent runs one actual daemon tick through a strict private stdio bridge", { timeout: 10000 }, async () => {
+  const privateRoot = fileURLToPath(new URL("../jobapply_agent/private/", import.meta.url));
+  await mkdir(privateRoot, { recursive: true });
+  const runtime = await mkdtemp(join(privateRoot, "node-actual-daemon-"));
+  const intakePath = join(runtime, "synthetic-active-intake.json");
+  const databasePath = join(runtime, "synthetic-queue.sqlite3");
+  await writeFile(intakePath, JSON.stringify(syntheticActiveIntake()), "utf8");
+
+  const session = chromeBinding({ tabs: [tab(LINKEDIN)] });
+  const rawChildStdout = [];
+  const host = startCodexSmartQueueDaemonHost(session.binding, {
+    daemonArgs: [
+      "--candidate-intake", intakePath,
+      "--database", databasePath,
+      "--max-ticks", "1",
+      "--bridge-stdio",
+    ],
+    daemonPath: fileURLToPath(new URL("../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py", import.meta.url)),
+    pythonExecutable: "python",
+    spawn(executable, args, options) {
+      const child = spawnChildProcess(executable, args, options);
+      child.stdout.on("data", (chunk) => rawChildStdout.push(Buffer.from(chunk)));
+      return child;
+    },
+  });
+  const statuses = collectedLines(host.status);
+
+  try {
+    assert.deepEqual(await bounded(host.finished, "actual smart queue daemon exit", 5000), {
+      exitCode: 0,
+      signalCode: null,
+    });
+    await statuses.ended;
+    assert.deepEqual(statuses.parse(), [
+      {
+        ticks_completed: 1,
+        requested_open_count: 0,
+        opened_count: 0,
+        open_failed_count: 0,
+        search_needed: 5,
+        degraded_tick_count: 0,
+      },
+      { terminal: "exited" },
+    ]);
+    assert.deepEqual(session.events, [["openTabs"], ["openTabs"], ["openTabs"]]);
+    assert.equal(host.health.running, false);
+    assert.equal(host.health.ready, false);
+    assert.equal(host.health.healthy, false);
+    assert.doesNotMatch(JSON.stringify(statuses.parse()), /https:|synthetic-active-intake|sqlite|candidate/);
+    const rawFrames = Buffer.concat(rawChildStdout).toString("utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+    assert.ok(rawFrames.length > 0);
+    for (const frame of rawFrames) {
+      const keys = Object.keys(frame).sort((left, right) => left.localeCompare(right));
+      const finiteKeys = ["degraded_tick_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed", "ticks_completed"];
+      const unboundedKeys = ["degraded_count", "open_failed_count", "opened_count", "requested_open_count", "search_needed"];
+      assert.ok(
+        JSON.stringify(keys) === JSON.stringify(finiteKeys) || JSON.stringify(keys) === JSON.stringify(unboundedKeys),
+        "raw child stdout must use a count-only status schema",
+      );
+      for (const value of Object.values(frame)) assert.ok(Number.isSafeInteger(value) && value >= 0);
+    }
+    assert.doesNotMatch(Buffer.concat(rawChildStdout).toString("utf8"), /https:\/\//);
+  } finally {
+    await rm(runtime, { recursive: true, force: true });
+  }
 });
 
 test("the daemon parent uses only piped stdio, drains stdout, and publishes bounded count-only status", async () => {
@@ -478,6 +672,7 @@ test("the daemon host exposes redacted terminal status for an early exit or spaw
   exited.exitCode = 2;
   exited.emit("exit", 2, null);
   exited.stdout.end();
+  exited.stderr.end();
   assert.deepEqual(await exitedHost.finished, { exitCode: 2, signalCode: null });
   await exitedStatuses.ended;
   assert.deepEqual(exitedStatuses.parse(), [{ terminal: "exited" }]);
@@ -492,6 +687,7 @@ test("the daemon host exposes redacted terminal status for an early exit or spaw
   const failedStatuses = collectedLines(failedHost.status);
   failed.emit("error", new Error("private launch failure"));
   failed.stdout.end();
+  failed.stderr.end();
   assert.deepEqual(await failedHost.finished, { exitCode: null, signalCode: null, terminalError: "spawn_error" });
   await failedStatuses.ended;
   assert.deepEqual(failedStatuses.parse(), [{ terminal: "spawn_error" }]);
@@ -650,12 +846,99 @@ test("startOrGet retains a terminating daemon until finished and then restarts",
   assert.equal(spawnCalls, 1);
 
   terminating.stdout.end();
+  terminating.stderr.end();
   assert.deepEqual(await initial.finished, { exitCode: 1, signalCode: null });
 
   const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
   assert.notEqual(replacement, initial);
   assert.equal(spawnCalls, 2);
   assert.equal(startOrGetCodexSmartQueueDaemonHost(binding, options), replacement);
+  assert.equal(spawnCalls, 2);
+  await replacement.stop();
+});
+
+test("child exit fences a stalled read-only openTabs request so a replacement starts safely", async () => {
+  const terminating = daemonChild();
+  const replacementChild = daemonChild();
+  const children = [terminating, replacementChild];
+  let releaseOpen;
+  const delayedOpen = new Promise((resolve) => { releaseOpen = resolve; });
+  let spawnCalls = 0;
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], delay: delayedOpen });
+  const options = {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/in-flight-bridge-daemon.py",
+    spawn() {
+      spawnCalls += 1;
+      return children.shift();
+    },
+  };
+
+  const initial = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  terminating.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+
+  terminating.exitCode = 0;
+  terminating.emit("exit", 0, null);
+  terminating.stdout.end();
+  terminating.stderr.end();
+  assert.deepEqual(await bounded(initial.finished, "fenced read-only host completion"), { exitCode: 0, signalCode: null });
+  assert.equal(initial.health.quarantined, false);
+  assert.deepEqual(events, [["openTabs"]]);
+
+  const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  assert.notEqual(replacement, initial);
+  assert.equal(spawnCalls, 2);
+  releaseOpen();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"]]);
+  await replacement.stop();
+});
+
+test("child exit quarantines a dispatched mutation until it settles before replacement", async () => {
+  const terminating = daemonChild();
+  const replacementChild = daemonChild();
+  const children = [terminating, replacementChild];
+  let releaseNew;
+  const stalledNew = new Promise((resolve) => { releaseNew = resolve; });
+  let spawnCalls = 0;
+  const { binding, events } = chromeBinding({ tabs: [tab(LINKEDIN)], newDelay: stalledNew });
+  const options = {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/quarantined-bridge-daemon.py",
+    spawn() {
+      spawnCalls += 1;
+      return children.shift();
+    },
+  };
+
+  const initial = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  terminating.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [["openTabs"], ["new"]]);
+
+  terminating.exitCode = 0;
+  terminating.emit("exit", 0, null);
+  terminating.stdout.end();
+  terminating.stderr.end();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(initial.health.running, false);
+  assert.equal(initial.health.healthy, false);
+  assert.equal(initial.health.quarantined, true);
+  assert.equal(initial.health.terminal, "quarantined");
+  assert.doesNotMatch(JSON.stringify(initial.health), /https:|open_listing|\"open\"/);
+  assert.equal(startOrGetCodexSmartQueueDaemonHost(binding, options), initial);
+  assert.equal(spawnCalls, 1);
+
+  releaseNew();
+  assert.deepEqual(await bounded(initial.finished, "quarantined mutation settlement"), { exitCode: 0, signalCode: null });
+  assert.deepEqual(events, [["openTabs"], ["new"]]);
+  assert.equal(initial.health.quarantined, false);
+  assert.notEqual(initial.health.terminal, "quarantined");
+
+  const replacement = startOrGetCodexSmartQueueDaemonHost(binding, options);
+  assert.notEqual(replacement, initial);
   assert.equal(spawnCalls, 2);
   await replacement.stop();
 });
@@ -673,6 +956,7 @@ test("the daemon host rejects a partial final status frame after child exit", as
   child.emit("exit", 0, null);
   child.stdout.write(`${JSON.stringify({ ticks_completed: 2, opened_count: 1 })}\n`);
   child.stdout.end();
+  child.stderr.end();
 
   assert.deepEqual(await host.finished, { exitCode: 0, signalCode: null });
   await statuses.ended;
@@ -934,18 +1218,18 @@ test("authoritative startup docs require the singleton daemon host entry point",
     const source = await readFile(new URL(relativePath, import.meta.url), "utf8");
     assert.match(
       source,
-      /\bstartOrGetCodexSmartQueueDaemonHost\b/,
-      `${relativePath} must name startOrGetCodexSmartQueueDaemonHost`,
+      /\bstartOrGetSmartQueueDaemonHost\b/,
+      `${relativePath} must name startOrGetSmartQueueDaemonHost`,
     );
     assert.doesNotMatch(
       source,
-      /\bstartCodexSmartQueueDaemonHost\s*\(/,
-      `${relativePath} must not invoke startCodexSmartQueueDaemonHost`,
+      /\bstartSmartQueueDaemonHost\s*\(/,
+      `${relativePath} must not invoke startSmartQueueDaemonHost`,
     );
     assert.doesNotMatch(
       source,
-      /\bimport\s*\{[^}]*\bstartCodexSmartQueueDaemonHost\b[^}]*\}\s*from\b/s,
-      `${relativePath} must not import startCodexSmartQueueDaemonHost for operational use`,
+      /\bimport\s*\{[^}]*\bstartSmartQueueDaemonHost\b[^}]*\}\s*from\b/s,
+      `${relativePath} must not import startSmartQueueDaemonHost for operational use`,
     );
   }
 });
@@ -953,4 +1237,310 @@ test("authoritative startup docs require the singleton daemon host entry point",
 test("has no HTTP listener dependency", async () => {
   const source = await readFile(new URL("../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /node:http|createServer|\.listen\s*\(/);
+});
+
+test("the direct bridge parent admits no admission payload, recommendation JSON, or browser authority", async () => {
+  const parentSource = await readFile(
+    new URL("../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon_host.mjs", import.meta.url),
+    "utf8",
+  );
+  // The parent accepts daemon arguments only from the caller and enforces
+  // exactly one bridge flag; documented intake/database paths stay caller-owned
+  // and no admission command, discovery export, or memory flag ever reaches it.
+  assert.match(parentSource, /exactly one --bridge-stdio/);
+  assert.doesNotMatch(parentSource, /admit-queue|discover\.py|--discovery-export|--memory-db|record_candidate_outcome/);
+  assert.doesNotMatch(parentSource, /recommend|admission/i);
+  assert.doesNotMatch(parentSource, /node:http|node:https|createServer|\.listen\s*\(|puppeteer|playwright|webdriver/i);
+
+  // The bounded bridge performs only the two URL operations; no application
+  // action exists because the candidate owns every application action.
+  const bridgeSource = await readFile(
+    new URL("../skills/easy-apply-tab-monitor/scripts/codex_chrome_extension_host.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(bridgeSource, /operation === "list_tab_urls"/);
+  assert.match(bridgeSource, /operation === "open_listing"/);
+  assert.doesNotMatch(bridgeSource, /operation === "(?!list_tab_urls|open_listing)/);
+  assert.doesNotMatch(bridgeSource, /\bfill\b|\bupload\b|\bsubmit\b|\bclick\b/i);
+});
+
+test("agent handoff docs route search_needed through the private agent-only admit-queue CLI", async () => {
+  const handoffDocs = [
+    "../README.md",
+    "../skills/easy-apply-tab-monitor/SKILL.md",
+  ];
+
+  for (const relativePath of handoffDocs) {
+    const source = await readFile(new URL(relativePath, import.meta.url), "utf8");
+    assert.match(source, /discover\.py admit-queue/, `${relativePath} must document the admit-queue command`);
+    assert.match(source, /jobapply_agent\/private\/candidate_intake\.json/, `${relativePath} must keep intake under jobapply_agent/private/`);
+    assert.match(source, /jobapply_agent\/private\/discovery\.jsonl/, `${relativePath} must keep the discovery export an ignored local runtime file`);
+    assert.match(source, /jobapply_agent\/private\/smart-queue\.sqlite3/, `${relativePath} must keep the queue database under jobapply_agent/private/`);
+    assert.match(source, /jobapply_agent\/private\/candidate-memory\.sqlite3/, `${relativePath} must keep candidate memory under jobapply_agent/private/`);
+    assert.match(source, /filter_unsuppressed_candidates/, `${relativePath} must document suppression before admission`);
+    assert.match(source, /mkdir -p jobapply_agent\/private && cp jobapply_agent\/data\/recommended_jobs\.jsonl jobapply_agent\/private\/discovery\.jsonl/, `${relativePath} must create the private runtime directory before staging the discovery export`);
+  }
+});
+
+test("an ambiguous dual-shape binding fails closed without exposing binding detail", () => {
+  const child = daemonChild();
+  const privateMarker = "dual-shape-private-marker";
+  const dual = {
+    listTabUrls: async () => [privateMarker],
+    openListing: async () => undefined,
+    user: { openTabs: async () => [{ url: privateMarker }] },
+    tabs: { new: async () => ({ goto: async () => undefined, markHandoff: async () => undefined }) },
+  };
+  assert.throws(
+    () => startSmartQueueDaemonHost(dual, { daemonArgs: ["--bridge-stdio"], spawn: () => child }),
+    (error) => {
+      assert.match(error.message, /ambiguous/);
+      assert.doesNotMatch(error.message, /dual-shape-private-marker/);
+      return true;
+    },
+  );
+  assert.deepEqual(child.killCalls, ["SIGTERM"]);
+});
+
+test("same bindingId reuses the live host while a different bindingId fails closed", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const first = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" }));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" })), first);
+  assert.equal(spawnCalls, 1);
+  // A second session must not silently reuse the first session's browser
+  // binding; the redacted error requires a distinct daemon configuration.
+  // The long IDs below must never be reflected in the failure.
+  const privateA = `queue-a-private-${"a".repeat(16)}`;
+  const privateB = `queue-b-private-${"b".repeat(16)}`;
+  const named = startOrGetSmartQueueDaemonHost(binding, {
+    ...optionsFor({}),
+    daemonPath: "/safe/binding-id-redaction-daemon.py",
+    bindingId: privateA,
+  });
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, {
+      ...optionsFor({}),
+      daemonPath: "/safe/binding-id-redaction-daemon.py",
+      bindingId: privateB,
+    }),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.match(error.message, /distinct daemon configuration/);
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    },
+  );
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b" })),
+    /distinct daemon configuration/,
+  );
+  assert.equal(spawnCalls, 2);
+  // A distinct daemon configuration still selects a distinct singleton slot.
+  const other = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-b", daemonPath: "/safe/binding-id-daemon-b.py" }));
+  assert.notEqual(other, first);
+  assert.equal(spawnCalls, 3);
+
+  await first.stop();
+  await named.stop();
+  await other.stop();
+});
+
+test("absent bindingId reuses the live host and empty normalizes to absent", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-absent-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const unnamed = startOrGetSmartQueueDaemonHost(binding, optionsFor({}));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({})), unnamed);
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "" })), unnamed);
+  assert.equal(spawnCalls, 1);
+  // A later named request against the unnamed live host fails closed rather
+  // than silently adopting the first session's browser binding.
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: "queue-a" })),
+    /distinct daemon configuration/,
+  );
+  assert.equal(spawnCalls, 1);
+
+  await unnamed.stop();
+});
+
+test("a named live host rejects a later unnamed request without echo or spawn", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-named-unnamed-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const privateId = `queue-named-private-${"n".repeat(16)}`;
+  const named = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: privateId }));
+  assert.equal(spawnCalls, 1);
+  // The reverse hijack: an unnamed request must not silently reuse the named
+  // session's host. The redacted error echoes neither the stored ID nor the
+  // request shape, and no second child is spawned.
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({})),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.match(error.message, /distinct daemon configuration/);
+      assert.doesNotMatch(error.message, /queue-named-private/);
+      assert.doesNotMatch(error.message, /nnnnnnnn/);
+      return true;
+    },
+  );
+  assert.equal(spawnCalls, 1);
+
+  await named.stop();
+});
+
+test("bindingId is capped at 128 characters with a redacted error", async () => {
+  let spawnCalls = 0;
+  const { binding } = chromeBinding();
+  const optionsFor = (extra) => ({
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/binding-id-length-daemon.py",
+    ...extra,
+    spawn() {
+      spawnCalls += 1;
+      return daemonChild();
+    },
+  });
+
+  const longest = `q-${"x".repeat(126)}`;
+  assert.equal(longest.length, 128);
+  const host = startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: longest }));
+  assert.equal(startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: longest })), host);
+  assert.equal(spawnCalls, 1);
+
+  const overlong = `q-${"y".repeat(127)}`;
+  assert.equal(overlong.length, 129);
+  assert.throws(
+    () => startOrGetSmartQueueDaemonHost(binding, optionsFor({ bindingId: overlong })),
+    (error) => {
+      assert.ok(error instanceof TypeError);
+      assert.doesNotMatch(error.message, /y{8}/);
+      return true;
+    },
+  );
+  assert.equal(spawnCalls, 1);
+
+  await host.stop();
+});
+
+test("the generic wrapper fails closed on malformed listTabUrls without echo", async () => {
+  const cases = [
+    { listTabUrls: async () => ({ urls: [] }) },
+    { listTabUrls: async () => [LINKEDIN, 3] },
+  ];
+  for (const { listTabUrls } of cases) {
+    const child = daemonChild();
+    const generic = { listTabUrls, openListing: async () => undefined };
+    const host = startSmartQueueDaemonHost(generic, {
+      daemonArgs: ["--bridge-stdio"],
+      spawn: () => child,
+    });
+    const replies = [];
+    child.stdin.on("data", (chunk) => replies.push(chunk.toString("utf8")));
+    child.stderr.write(`${JSON.stringify({ id: "list", operation: "list_tab_urls" })}\n`);
+    await bounded(
+      (async () => {
+        while (replies.join("").trim() === "") await new Promise((resolve) => setImmediate(resolve));
+      })(),
+      "malformed generic reply",
+    );
+    const frames = replies.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.deepEqual(frames, [{ id: "list", ok: false, error: "request_failed" }]);
+    assert.doesNotMatch(replies.join(""), /https:|\[object/);
+    await host.stop();
+  }
+});
+
+test("canonicalListingUrl matches the Python canonicalizer on parity vectors", () => {
+  // Whitespace padding is stripped and Indeed trailing slashes collapse,
+  // exactly like browser_tab_adapter.canonical_listing_url.
+  assert.equal(canonicalListingUrl("  https://www.linkedin.com/jobs/view/123456  "), LINKEDIN);
+  assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob/?jk=abc_123"), INDEED);
+  assert.equal(canonicalListingUrl("https://in.indeed.com/viewjob//?jk=abc_123"), INDEED);
+  // Doubly-dotted hosts strip all trailing dots like Python's rstrip(".").
+  assert.equal(canonicalListingUrl("https://www.linkedin.com../jobs/view/123456"), LINKEDIN);
+  // Doubly-slashed LinkedIn paths and inner whitespace stay rejected.
+  assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/123456//"), /listing URL is invalid/);
+  assert.throws(() => canonicalListingUrl("https://www.linkedin.com/jobs/view/12 3456"), /listing URL is invalid/);
+});
+
+test("the generic synthetic tab re-canonicalizes locally and fails closed without echo", async () => {
+  const opened = [];
+  const privateUrl = "https://mail.example.test/inbox?private=value";
+  const generic = {
+    listTabUrls: async () => [LINKEDIN],
+    openListing: async (url) => { opened.push(url); },
+  };
+  const synthetic = await toBridgeBinding(generic).tabs.new();
+  await assert.rejects(
+    synthetic.goto(privateUrl),
+    (error) => {
+      assert.match(error.message, /listing URL is invalid/);
+      assert.doesNotMatch(error.message, /mail\.example\.test|private=value/);
+      return true;
+    },
+  );
+  assert.deepEqual(opened, []);
+  // An already-canonical URL still opens exactly through the synthetic tab.
+  await synthetic.goto(LINKEDIN);
+  assert.deepEqual(opened, [LINKEDIN]);
+});
+
+test("the generic synthetic tab carries a harmless markHandoff no-op and opens stay exact-URL-only", async () => {
+  const child = daemonChild();
+  const opened = [];
+  const generic = {
+    listTabUrls: async () => [LINKEDIN],
+    openListing: async (url) => { opened.push(url); },
+  };
+  const host = startSmartQueueDaemonHost(generic, {
+    daemonArgs: ["--bridge-stdio"],
+    daemonPath: "/safe/synthetic-handoff-daemon.py",
+    spawn: () => child,
+  });
+  const replies = [];
+  child.stdin.on("data", (chunk) => replies.push(chunk.toString("utf8")));
+  // The strict bridge demands an already-canonical URL; the generic binding
+  // has no handoff-marking of its own, so the synthetic tab's markHandoff
+  // must be a harmless no-op for the open to succeed.
+  child.stderr.write(`${JSON.stringify({ id: "open", operation: "open_listing", url: LINKEDIN })}\n`);
+  await bounded(
+    (async () => {
+      while (replies.join("").trim() === "") await new Promise((resolve) => setImmediate(resolve));
+    })(),
+    "generic open reply",
+  );
+  const frames = replies.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(frames, [{ id: "open", ok: true }]);
+  assert.deepEqual(opened, [LINKEDIN]);
+  await host.stop();
 });

@@ -4,6 +4,10 @@
  */
 
 const MAX_REQUEST_BYTES = 16 * 1024;
+// This is deliberately identical to browser_bridge_adapter.py.  The Python
+// stdio client reads one complete response frame and must never receive a
+// response which it cannot retain as a single bounded envelope.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_TAB_URLS = 512;
 const MAX_TAB_URL_LENGTH = 8192;
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -23,14 +27,24 @@ function safeTrackingKey(key) {
 
 /** Return a canonical supported listing URL, or throw without exposing input. */
 export function canonicalListingUrl(value) {
-  if (typeof value !== "string" || value.length === 0 || value.length > MAX_TAB_URL_LENGTH) fail("listing URL is invalid");
+  if (typeof value !== "string") fail("listing URL is invalid");
+  // Match the Python canonicalizer, which strips surrounding whitespace: the
+  // WHATWG URL parser would also drop it, but trim explicitly so both sides
+  // accept the same padded inputs.
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_TAB_URL_LENGTH) fail("listing URL is invalid");
   let parsed;
   try {
-    parsed = new URL(value);
+    parsed = new URL(trimmed);
   } catch {
     fail("listing URL is invalid");
   }
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  // Accepted divergence: host case uses toLowerCase here while Python uses
+  // casefold. The allowlist below is ASCII-only and both agree on ASCII, so
+  // every non-listing is still rejected identically on both sides.
+  // Match Python's host.rstrip("."): strip ALL trailing dots so a
+  // doubly-dotted host canonicalizes identically on both sides.
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   if (
     parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.hash || !host ||
     [...parsed.searchParams.keys()].some((key) => !key || (key.toLowerCase() !== "jk" && !safeTrackingKey(key)))
@@ -41,7 +55,9 @@ export function canonicalListingUrl(value) {
   }
   if (host === "indeed.com" || host.endsWith(".indeed.com")) {
     const jobIds = parsed.searchParams.getAll("jk");
-    if (parsed.pathname.replace(/\/$/, "") !== "/viewjob" || jobIds.length !== 1 || !INDEED_JOB_ID.test(jobIds[0])) {
+    // Strip all trailing slashes like Python's path.rstrip("/"), so
+    // "/viewjob//" canonicalizes identically on both sides.
+    if (parsed.pathname.replace(/\/+$/, "") !== "/viewjob" || jobIds.length !== 1 || !INDEED_JOB_ID.test(jobIds[0])) {
       fail("listing URL is invalid");
     }
     return `https://${host}/viewjob?jk=${encodeURIComponent(jobIds[0])}`;
@@ -113,59 +129,63 @@ class OversizedRequestIdScanner {
     if (this.value !== null) return;
     for (const byte of bytes) {
       if (this.inString) {
-        if (this.escaped) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          this.escaped = false;
-          continue;
-        }
-        if (byte === 0x5c) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          this.escaped = true;
-          continue;
-        }
-        if (byte !== 0x22) {
-          if (this.captureId || this.depth === 1) this.#append(byte);
-          continue;
-        }
-        this.inString = false;
-        if (this.captureId) {
-          this.#finishId();
-          this.captureId = false;
-        } else if (this.depth === 1) {
-          this.lastRootString = this.current;
-        }
-        this.current = "";
-        continue;
+        this.#consumeStringByte(byte);
+      } else {
+        this.#consumeStructuralByte(byte);
       }
-      if (byte === 0x22) {
-        this.inString = true;
-        this.current = "";
-        this.captureId = this.depth === 1 && this.pendingRootKey === "id";
-        continue;
-      }
-      if (byte === 0x7b || byte === 0x5b) {
-        this.depth += 1;
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x7d || byte === 0x5d) {
-        this.depth = Math.max(0, this.depth - 1);
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x3a && this.depth === 1 && this.lastRootString !== null) {
-        this.pendingRootKey = this.lastRootString;
-        this.lastRootString = null;
-        continue;
-      }
-      if (byte === 0x2c) {
-        this.pendingRootKey = null;
-        this.lastRootString = null;
-      } else if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d && byte !== 0x0a) {
-        this.lastRootString = null;
-      }
+    }
+  }
+
+  #consumeStringByte(byte) {
+    if (this.escaped) {
+      this.#appendStringByte(byte);
+      this.escaped = false;
+    } else if (byte === 0x5c) {
+      this.#appendStringByte(byte);
+      this.escaped = true;
+    } else if (byte !== 0x22) {
+      this.#appendStringByte(byte);
+    } else {
+      this.#finishString();
+    }
+  }
+
+  #appendStringByte(byte) {
+    if (this.captureId || this.depth === 1) this.#append(byte);
+  }
+
+  #finishString() {
+    this.inString = false;
+    if (this.captureId) {
+      this.#finishId();
+      this.captureId = false;
+    } else if (this.depth === 1) {
+      this.lastRootString = this.current;
+    }
+    this.current = "";
+  }
+
+  #consumeStructuralByte(byte) {
+    if (byte === 0x22) {
+      this.inString = true;
+      this.current = "";
+      this.captureId = this.depth === 1 && this.pendingRootKey === "id";
+    } else if (byte === 0x7b || byte === 0x5b) {
+      this.depth += 1;
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte === 0x7d || byte === 0x5d) {
+      this.depth = Math.max(0, this.depth - 1);
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte === 0x3a && this.depth === 1 && this.lastRootString !== null) {
+      this.pendingRootKey = this.lastRootString;
+      this.lastRootString = null;
+    } else if (byte === 0x2c) {
+      this.pendingRootKey = null;
+      this.lastRootString = null;
+    } else if (byte !== 0x20 && byte !== 0x09 && byte !== 0x0d && byte !== 0x0a) {
+      this.lastRootString = null;
     }
   }
 
@@ -218,14 +238,18 @@ async function listTabUrls(chrome) {
   return urls;
 }
 
-async function openListing(chrome, url) {
+async function openListing(chrome, url, fence) {
   // Existing-session check is intentionally before tabs.new().
   const tabs = await chrome.user.openTabs();
+  if (fence.closed()) return false;
   if (!Array.isArray(tabs) || tabs.length === 0) fail("existing session is required");
-  const tab = await chrome.tabs.new();
+  const tab = await fence.mutate(() => chrome.tabs.new());
+  if (fence.closed()) return false;
   if (tab == null || typeof tab.goto !== "function" || typeof tab.markHandoff !== "function") fail("invalid handoff tab");
-  await tab.goto(url);
-  await tab.markHandoff();
+  await fence.mutate(() => tab.goto(url));
+  if (fence.closed()) return false;
+  await fence.mutate(() => tab.markHandoff());
+  return !fence.closed();
 }
 
 function failure(id = null) {
@@ -234,7 +258,7 @@ function failure(id = null) {
 
 async function writeJson(output, payload) {
   const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
-  if (bytes.length > MAX_TAB_URLS * (MAX_TAB_URL_LENGTH + 4) + 256) fail("response is invalid");
+  if (bytes.length > MAX_RESPONSE_BYTES) fail("response is invalid");
   if (output.write(bytes)) return;
   await new Promise((resolve, reject) => {
     const drain = () => { output.off("error", error); resolve(); };
@@ -244,16 +268,28 @@ async function writeJson(output, payload) {
   });
 }
 
-async function handle(chrome, line) {
+function boundedResponse(payload, id) {
+  // A full tab snapshot can be syntactically valid while exceeding the shared
+  // stdio response envelope.  Return the fixed failure envelope instead of
+  // emitting a prefix that would desynchronize the Python client.
+  const bytes = Buffer.byteLength(`${JSON.stringify(payload)}\n`, "utf8");
+  return bytes <= MAX_RESPONSE_BYTES ? payload : failure(id);
+}
+
+async function handle(chrome, line, fence) {
   const requestId = requestIdFromLine(line);
   try {
     const request = parseRequest(line);
-    if (request.operation === "list_tab_urls") return { id: request.id, ok: true, urls: await listTabUrls(chrome) };
-    await openListing(chrome, request.url);
-    return { id: request.id, ok: true };
+    if (fence.closed()) return null;
+    if (request.operation === "list_tab_urls") {
+      const urls = await listTabUrls(chrome);
+      return fence.closed() ? null : boundedResponse({ id: request.id, ok: true, urls }, request.id);
+    }
+    const opened = await openListing(chrome, request.url, fence);
+    return opened ? boundedResponse({ id: request.id, ok: true }, request.id) : null;
   } catch {
     // Never reflect URLs, browser state, or binding exceptions.
-    return failure(requestId);
+    return fence.closed() ? null : failure(requestId);
   }
 }
 
@@ -267,7 +303,40 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
   const chrome = requireChromeBinding(chromeBinding);
   const { input, output } = requireStreams(options);
   let closed = false;
-  const finished = (async () => {
+  let pendingMutations = 0;
+  let finishedResolved = false;
+  let quiescentResolved = false;
+  let resolveFinished;
+  let rejectFinished;
+  let resolveQuiescent;
+  const finished = new Promise((resolve, reject) => {
+    resolveFinished = resolve;
+    rejectFinished = reject;
+  });
+  const quiescent = new Promise((resolve) => { resolveQuiescent = resolve; });
+  const settle = () => {
+    if (!closed || pendingMutations !== 0 || quiescentResolved) return;
+    quiescentResolved = true;
+    resolveQuiescent();
+    if (!finishedResolved) {
+      finishedResolved = true;
+      resolveFinished();
+    }
+  };
+  const fence = Object.freeze({
+    closed: () => closed,
+    async mutate(operation) {
+      if (closed) return null;
+      pendingMutations += 1;
+      try {
+        return await operation();
+      } finally {
+        pendingMutations -= 1;
+        settle();
+      }
+    },
+  });
+  void (async () => {
     let parts = [];
     let length = 0;
     let oversized = false;
@@ -288,7 +357,8 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
           } else {
             parts.push(final);
             length += final.length;
-            await writeJson(output, await handle(chrome, Buffer.concat(parts, length)));
+            const response = await handle(chrome, Buffer.concat(parts, length), fence);
+            if (response !== null && !closed) await writeJson(output, response);
           }
         } else {
           oversizedId.push(bytes.subarray(start, index));
@@ -315,12 +385,26 @@ export function startCodexChromeExtensionHost(chromeBinding, options) {
       }
     }
     if (!closed && (length > 0 || oversized)) await writeJson(output, failure(oversized ? oversizedId.value : null));
-  })();
+    if (!closed && !finishedResolved) {
+      finishedResolved = true;
+      resolveFinished();
+    }
+  })().catch(() => {
+    // Stream failures are observed by the daemon host; no untrusted error is exposed here.
+    if (closed) settle();
+    else if (!finishedResolved) {
+      finishedResolved = true;
+      rejectFinished(new Error("bridge failed"));
+    }
+  });
   return Object.freeze({
     finished,
+    quiescent,
+    get mutationPending() { return pendingMutations !== 0; },
     close() {
       closed = true;
       if (typeof input.destroy === "function") input.destroy();
+      settle();
     },
   });
 }
