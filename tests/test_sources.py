@@ -64,9 +64,12 @@ def test_load_search_profiles_parses_quoted_keywords_and_ignores_comments(tmp_pa
 def test_load_search_profiles_returns_the_shipped_default_profiles():
     profiles = load_search_profiles()
 
-    assert profiles
+    assert len(profiles) >= 2
     assert all(isinstance(profile, SearchProfile) for profile in profiles)
     assert {profile.platform for profile in profiles} == {"linkedin", "indeed"}
+    assert ("linkedin", "Python Backend Developer") in {
+        (profile.platform, profile.keywords) for profile in profiles
+    }
 
 
 def test_load_search_profiles_ignores_schema_and_minimum_profile_fit_score_lines(tmp_path: Path):
@@ -335,6 +338,9 @@ def test_visible_payload_maps_supported_basic_fields_and_ignores_unknown_ones():
     assert listing.work_mode == "remote"
     assert listing.employment_type == "full_time"
     assert listing.posted_at == "2026-09-01"
+    assert listing.discovered_at == "2026-09-01T09:00:00+00:00"
+    # Cookie/session metadata must never leak into the listing object.
+    assert "secret-session" not in str(listing)
 
 
 # --- canonical listing URL validation edges ----------------------------------

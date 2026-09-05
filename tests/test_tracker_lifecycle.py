@@ -509,7 +509,12 @@ def test_legacy_reconciliation_rows_are_migrated_and_replay_is_fail_closed(tmp_p
         source_url=source_url,
         outcome="skipped",
     )
-    assert queue_event_id == 4
+    with sqlite3.connect(queue.database_path) as connection:
+        max_queue_event_id = connection.execute("SELECT MAX(event_id) FROM smart_queue_events").fetchone()[0]
+    assert queue_event_id == max_queue_event_id
+    # Derived collision: the fresh queue's latest event id numerically matches
+    # the migrated legacy row, but reconciliation still fails closed on scope.
+    assert queue_event_id == migrated[1]
     with pytest.raises(InvalidLifecycleTransition, match="unscoped legacy"):
         tracker.reconcile_queue_outcome(
             queue=queue,
@@ -908,7 +913,10 @@ def test_legacy_unscoped_reconciliation_fails_closed_before_reauthentication(tmp
         source_url=source_url,
         outcome="skipped",
     )
-    assert queue_event_id == 4
+    with sqlite3.connect(queue.database_path) as connection:
+        max_queue_event_id = connection.execute("SELECT MAX(event_id) FROM smart_queue_events").fetchone()[0]
+    assert queue_event_id == max_queue_event_id
+    assert queue_event_id == queue.confirmed_outcome_events()[0].event_id
 
     with pytest.raises(InvalidLifecycleTransition, match="unscoped legacy"):
         tracker.reconcile_queue_outcome(

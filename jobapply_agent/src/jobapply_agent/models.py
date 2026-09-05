@@ -48,7 +48,7 @@ def _excluded_title_terms(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        return _as_strings(value)
+        return _as_strings(value) or DEFAULT_EXCLUDED_TITLE_TERMS
     return DEFAULT_EXCLUDED_TITLE_TERMS
 
 

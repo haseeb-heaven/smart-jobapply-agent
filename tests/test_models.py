@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import pytest
 
-from jobapply_agent.models import CandidateProfile, _as_strings, _normalized_strings
+from jobapply_agent.models import (
+    CandidateProfile,
+    DEFAULT_EXCLUDED_TITLE_TERMS,
+    _as_strings,
+    _normalized_strings,
+)
 
 
 # --- post-init validation ----------------------------------------------------
@@ -130,6 +135,10 @@ def test_from_mapping_tolerates_malformed_non_mapping_sections():
     assert profile.work_authorizations == ()
     assert profile.mandatory_excluded_requirements == ()
     assert dict(profile.evidence_by_skill) == {}
+    # Malformed sections must preserve fail-closed matching defaults.
+    assert profile.excluded_title_terms == DEFAULT_EXCLUDED_TITLE_TERMS
+    assert profile.location_preferences == ()
+    assert profile.employment_type_preferences == ()
 
 
 def test_from_mapping_populates_missing_evidence_labels_from_skill_groups():
@@ -215,35 +224,30 @@ def test_from_mapping_still_validates_evidence_label_conflicts():
         )
 
 
-_SENIORITY_DEFAULT = (
-    "senior",
-    "staff",
-    "principal",
-    "lead",
-    "architect",
-    "manager",
-    "head",
-    "director",
-)
+# Seniority-guard default is derived from the production constant so the test
+# cannot drift from the shipped policy.
+_SENIORITY_DEFAULT = DEFAULT_EXCLUDED_TITLE_TERMS
 
 
 @pytest.mark.parametrize(
     ("data", "expected"),
     (
         # Omitted exclusions fall back to the documented seniority default.
-        ({}, _SENIORITY_DEFAULT),
-        ({"roles": {"include": ["Backend Developer"]}}, _SENIORITY_DEFAULT),
+        ({}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        ({"roles": {"include": ["Backend Developer"]}}, DEFAULT_EXCLUDED_TITLE_TERMS),
         ({"roles": {"exclude_title_terms": ["junior"]}}, ("junior",)),
         ({"exclude_title_terms": ["Junior Backend Developer"]}, ("Junior Backend Developer",)),
         # YAML ``null`` decodes to None and means the default has not been overridden.
-        ({"exclude_title_terms": None}, _SENIORITY_DEFAULT),
-        ({"roles": {"exclude_title_terms": None}}, _SENIORITY_DEFAULT),
+        ({"exclude_title_terms": None}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        ({"roles": {"exclude_title_terms": None}}, DEFAULT_EXCLUDED_TITLE_TERMS),
         # Malformed scalar values must not silently disable the seniority guard.
-        ({"exclude_title_terms": 42}, _SENIORITY_DEFAULT),
-        ({"roles": {"exclude_title_terms": 42}}, _SENIORITY_DEFAULT),
-        # An explicit empty list is a deliberate override and wins over the default.
-        ({"exclude_title_terms": []}, ()),
-        ({"roles": {"exclude_title_terms": []}}, ()),
+        ({"exclude_title_terms": 42}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        ({"roles": {"exclude_title_terms": 42}}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        # An explicitly empty sequence keeps the fail-closed seniority guard ON:
+        # silently disabling it would change matching outcomes for existing intakes.
+        ({"exclude_title_terms": []}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        ({"roles": {"exclude_title_terms": []}}, DEFAULT_EXCLUDED_TITLE_TERMS),
+        ({"exclude_title_terms": [None]}, DEFAULT_EXCLUDED_TITLE_TERMS),
     ),
 )
 def test_from_mapping_excluded_title_terms_default_and_explicit_override(
@@ -252,4 +256,4 @@ def test_from_mapping_excluded_title_terms_default_and_explicit_override(
     profile = CandidateProfile.from_mapping(data)
 
     assert profile.excluded_title_terms == expected
-    assert CandidateProfile().excluded_title_terms == _SENIORITY_DEFAULT
+    assert CandidateProfile().excluded_title_terms == DEFAULT_EXCLUDED_TITLE_TERMS
