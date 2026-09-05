@@ -21,7 +21,7 @@ from pathlib import Path
 import signal
 import sys
 import threading
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Callable, Mapping, NoReturn, Protocol, Sequence
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -32,6 +32,8 @@ _DAEMON_VALUE_FLAGS = frozenset({
     "--candidate-intake", "--database", "--adapter", "--adapter-command",
     "--interval-seconds", "--max-backoff-seconds", "--max-ticks",
 })
+_ADAPTER_COMMAND_FLAG = "--adapter-command"
+_ADAPTER_COMMAND_EQUALS_PREFIX = "--adapter-command="
 
 if str(PACKAGE_SOURCE) not in sys.path:
     sys.path.insert(0, str(PACKAGE_SOURCE))
@@ -71,7 +73,7 @@ class DaemonConfigurationError(ValueError):
     """Raised without reflecting sensitive configuration values."""
 
 
-def _invalid_configuration() -> None:
+def _invalid_configuration() -> NoReturn:
     raise DaemonConfigurationError("daemon configuration is invalid")
 
 
@@ -455,7 +457,7 @@ def _adapter_command_marker(raw_args: Sequence[str]) -> int | None:
         (
             index
             for index, token in enumerate(raw_args)
-            if token == "--adapter-command" or token.startswith("--adapter-command=")
+            if token == _ADAPTER_COMMAND_FLAG or token.startswith(_ADAPTER_COMMAND_EQUALS_PREFIX)
         ),
         None,
     )
@@ -493,7 +495,7 @@ def _reject_extras_before_bridge_marker(raw_args: Sequence[str], marker: int, ex
     index = 0
     while index < marker:
         token = raw_args[index]
-        if token in _DAEMON_VALUE_FLAGS and not token.startswith("--adapter-command="):
+        if token in _DAEMON_VALUE_FLAGS and not token.startswith(_ADAPTER_COMMAND_EQUALS_PREFIX):
             index += 2
             continue
         if token in extra_strings:

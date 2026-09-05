@@ -5,4 +5,5 @@ private/
 data/*.sqlite3
 data/logs/
 output/*.xlsx
+output/*.csv
 output/agent-runs/

@@ -1115,10 +1115,7 @@ class SmartJobQueue:
                 )
             resolved_provenance = _CAPACITY_PROVENANCE_DEFAULT
             resolved_intake_revision = None
-        elif requested_provenance is None:
-            resolved_provenance = _CAPACITY_PROVENANCE_HOST_CONFIGURED
-            resolved_intake_revision = None
-        elif requested_provenance == _CAPACITY_PROVENANCE_HOST_CONFIGURED:
+        elif requested_provenance is None or requested_provenance == _CAPACITY_PROVENANCE_HOST_CONFIGURED:
             resolved_provenance = _CAPACITY_PROVENANCE_HOST_CONFIGURED
             resolved_intake_revision = None
         elif requested_provenance == _CAPACITY_PROVENANCE_ACTIVE_INTAKE:

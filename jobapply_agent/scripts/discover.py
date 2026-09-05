@@ -20,7 +20,7 @@ import re
 import stat
 import sys
 from tempfile import NamedTemporaryFile
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if (SCRIPT_DIR / "src" / "jobapply_agent").exists():
@@ -1502,7 +1502,7 @@ def export_current_profile_recommendation_queue(
     return len(rows)
 
 
-def _admission_path_error() -> None:
+def _admission_path_error() -> NoReturn:
     raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
 
 
@@ -1659,10 +1659,7 @@ def _admission_text(value: object, *, allow_empty: bool = False) -> str:
 def _admission_text_list(value: object, *, require_items: bool) -> tuple[str, ...]:
     if not isinstance(value, list) or (require_items and not value):
         raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
-    try:
-        values = tuple(_admission_text(item) for item in value)
-    except AdmissionError:
-        raise
+    values = tuple(_admission_text(item) for item in value)
     if len(values) != len(set(values)):
         raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
     return values
@@ -1709,10 +1706,10 @@ def _validated_admission_candidates(
             or row.get("profile_revision") != profile_revision
             or row.get("matcher_policy_revision") != matcher_revision
             or row.get("platform") not in {"linkedin", "indeed"}
-            or type(row.get("score")) is not int
-            or row.get("score") < MINIMUM_RECOMMENDED_SCORE
-            or row.get("score") > 100
         ):
+            raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
+        score = row.get("score")
+        if type(score) is not int or score < MINIMUM_RECOMMENDED_SCORE or score > 100:
             raise AdmissionError(_ADMISSION_FAILURE_MESSAGE)
         fingerprint = row.get("fingerprint")
         if not isinstance(fingerprint, str) or _ADMISSION_FINGERPRINT.fullmatch(fingerprint) is None:
@@ -1747,7 +1744,7 @@ def _validated_admission_candidates(
             candidate = QueueCandidate(
                 job_id=fingerprint,
                 source_url=canonical_url,
-                fit_score=row.get("score"),
+                fit_score=score,
                 eligible=True,
                 decision="recommended",
                 evidence=evidence,
@@ -1982,9 +1979,8 @@ def admit_current_recommendations_for_active_queue(
         QueuePolicyError,
         QueueStorageError,
         ValueError,
+        Exception,
     ):
-        raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
-    except Exception:
         raise AdmissionError(_ADMISSION_FAILURE_MESSAGE) from None
 
 

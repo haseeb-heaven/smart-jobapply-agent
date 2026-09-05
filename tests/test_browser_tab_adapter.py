@@ -484,6 +484,29 @@ def test_process_tree_killer_swallows_unexpected_group_resolution_errors(monkeyp
     _MODULE._kill_bridge_process_tree(_BrokenPidChild())
 
 
+def test_process_tree_killer_with_unset_pid_still_kills_direct_child(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A bridge child without a pid skips group lookup but still kills direct child."""
+
+    class _NonePidChild:
+        pid = None
+        kill_calls = 0
+
+        def kill(self) -> None:
+            type(self).kill_calls += 1
+
+    _NonePidChild.kill_calls = 0
+    getpgid_calls: list[object] = []
+    monkeypatch.setattr(_MODULE.os, "name", "posix")
+    monkeypatch.setattr(_MODULE.os, "getpgid", lambda pid: getpgid_calls.append(pid))
+
+    _MODULE._kill_bridge_process_tree(_NonePidChild())
+
+    assert getpgid_calls == []
+    assert _NonePidChild.kill_calls == 1
+
+
 def test_invoke_enforces_byte_cap_on_injected_stdout_before_parse():
     """An injected runner's over-cap stdout fails closed inside _invoke."""
 
