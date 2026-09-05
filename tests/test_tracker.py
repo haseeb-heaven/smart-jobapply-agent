@@ -160,3 +160,28 @@ def test_csv_export_contains_auditable_tracker_columns(tmp_path: Path):
 def test_xlsx_export_reports_the_required_workbook_dependency_blocker(tmp_path: Path):
     with pytest.raises(WorkbookDependencyError, match="XLSX"):
         export_tracker(tmp_path / "jobs.sqlite3", tmp_path / "Job_Application_Tracker.xlsx")
+
+
+@pytest.mark.parametrize("prefix", ("=", "+", "-", "@"))
+def test_csv_export_apostrophe_prefixes_visible_text_that_could_be_a_spreadsheet_formula(
+    tmp_path: Path, prefix: str
+):
+    tracker = Tracker(tmp_path / "jobs.sqlite3")
+    tracker.record_listing(
+        JobListing(
+            platform="linkedin",
+            title=f"{prefix}SUM(A1)",
+            company=f"{prefix}3+3",
+            url="https://www.linkedin.com/jobs/view/456",
+            description="Maintain FastAPI APIs and add tested features.",
+        ),
+        _match(),
+    )
+    output = tmp_path / "injection_export.csv"
+
+    export_tracker(tmp_path / "jobs.sqlite3", output)
+
+    with output.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["title"] == f"'{prefix}SUM(A1)"
+    assert rows[0]["company"] == f"'{prefix}3+3"
