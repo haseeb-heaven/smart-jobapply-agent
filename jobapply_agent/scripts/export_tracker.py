@@ -27,7 +27,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "output" / "Job_Application_Tracker.csv",
         help=(
-            "Output CSV tracker file (default: %(default)s). Explicit .xlsx paths stay blocked "
+            "Output CSV tracker file (default: %(default)s; an existing file at the "
+            "resolved path is overwritten). Explicit .xlsx paths stay blocked "
             "until the approved workbook dependency is available."
         ),
     )

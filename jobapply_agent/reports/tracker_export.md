@@ -31,9 +31,9 @@ Use the supported interim command instead:
 python3 jobapply_agent/scripts/export_tracker.py
 ```
 
-The CLI's default now writes `jobapply_agent/output/Job_Application_Tracker.csv`;
-passing an explicit `.xlsx` path remains blocked until the approved workbook
-dependency is available.
+The CLI's default now writes `jobapply_agent/output/Job_Application_Tracker.csv`
+(overwriting any existing file at that path); passing an explicit `.xlsx`
+path remains blocked until the approved workbook dependency is available.
 
 Open that CSV in Google Sheets or Microsoft Excel and save it as an XLSX file
 manually. The CSV is a complete, filterable all-jobs view and includes source
