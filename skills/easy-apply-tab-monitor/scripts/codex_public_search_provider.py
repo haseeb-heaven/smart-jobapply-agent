@@ -11,6 +11,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -204,7 +205,7 @@ def bounded_worker(args: list[str]) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        cwd="/private/tmp",
+        cwd=tempfile.gettempdir(),
     )
     output = bytearray()
     total = 0
