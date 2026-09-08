@@ -54,7 +54,7 @@ def prepare(runtime: Path) -> dict[str, str]:
     package_source = Path(__file__).parents[2] / "jobapply_agent" / "src"
     if str(package_source) not in sys.path:
         sys.path.insert(0, str(package_source))
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=False)
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
     intake = runtime / "candidate-intake.json"
     export = runtime / "discovery.jsonl"
     queue = runtime / "smart-queue.sqlite3"
