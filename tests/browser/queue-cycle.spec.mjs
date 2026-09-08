@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,6 +54,7 @@ test("synthetic capacity-two cycle refills a vacated listing without inferring a
 test("real Node stdio host, Python daemon, and SQLite queue refill a synthetic browser vacancy", { timeout: 30_000 }, async ({ context }) => {
   const repository = fileURLToPath(new URL("../..", import.meta.url));
   const fixtureRoot = fileURLToPath(new URL("../../jobapply_agent/private/browser-tests/", import.meta.url));
+  await mkdir(fixtureRoot, { recursive: true });
   const runtime = await mkdtemp(join(fixtureRoot, "playwright-daemon-"));
   let completed = false;
   try {
