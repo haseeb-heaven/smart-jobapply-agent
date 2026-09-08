@@ -1,0 +1,8 @@
+{
+  "name": "smart-jobapply-browser-contract-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "1.55.0"
+  }
+}
