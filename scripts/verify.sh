@@ -22,7 +22,12 @@ if ! command -v node >/dev/null 2>&1; then
   echo "validation error: node is required for the bounded Codex Chrome host contract" >&2
   exit 127
 fi
-node --test tests/test_codex_chrome_extension_host.mjs
+node --test \
+  tests/test_codex_chrome_extension_host.mjs \
+  tests/test_browser_capabilities.mjs \
+  tests/test_playwright_listing_binding.mjs \
+  tests/test_runtime_ownership_control.mjs \
+  tests/test_system_chrome_listing_bridge.mjs
 
 echo "[3/9] Python lint"
 # Keep the repository gate independent from a runner's user-level Ruff config

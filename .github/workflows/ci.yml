@@ -35,3 +35,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes shellcheck
       - name: Run the authoritative agent validation gate
         run: ./scripts/verify.sh
+
+  browser-contract:
+    name: Playwright browser contract (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # MVP validation runs Chromium only. Firefox/WebKit remain supported
+        # by the checked-in Playwright configuration but are deferred until a
+        # browser-capable runner and explicit compatibility evidence exist.
+        browser: [chromium]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - name: Install locked browser test dependencies
+        working-directory: tests/browser
+        run: npm ci
+      - name: Install ${{ matrix.browser }} engine
+        working-directory: tests/browser
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+      - name: Run ${{ matrix.browser }} synthetic browser contract
+        working-directory: tests/browser
+        run: npx playwright test --config playwright.config.mjs --project=${{ matrix.browser }}
