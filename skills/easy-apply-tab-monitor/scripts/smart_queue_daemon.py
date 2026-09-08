@@ -56,12 +56,16 @@ def _load_sibling_module(filename: str) -> object:
 _adapter_module = _load_sibling_module("browser_bridge_adapter.py")
 _tab_adapter_module = _load_sibling_module("browser_tab_adapter.py")
 _monitor_module = _load_sibling_module("persistent_smart_queue_monitor.py")
+_ownership_module = _load_sibling_module("runtime_ownership.py")
 BrowserAdapterError = _adapter_module.BrowserAdapterError
 StdioBridgeAdapter = _adapter_module.StdioBridgeAdapter
 # Historical import path; the generic stdio bridge is the implementation.
 CodexChromeExtensionAdapter = _adapter_module.StdioBridgeAdapter
 ExternalCommandAdapter = _tab_adapter_module.ExternalCommandAdapter
 PersistentSmartQueueMonitor = _monitor_module.PersistentSmartQueueMonitor
+DatabaseLease = _monitor_module.DatabaseLease
+BrokeredLease = _ownership_module.BrokeredLease
+RuntimeOwnershipError = _ownership_module.RuntimeOwnershipError
 # Construct the exact coordinator class whose exception identity the monitor
 # catches, including when this daemon is imported directly from its file path.
 SmartQueueCoordinator = _monitor_module.SmartQueueCoordinator
@@ -221,11 +225,13 @@ def _tick_count(tick: object, count_name: str, ids_name: str) -> int:
 class SmartQueueDaemon:
     """A durable monitor host with no recommendation or outcome interface."""
 
-    def __init__(self, monitor: object, *, adapter: ListingAdapter | None = None) -> None:
+    def __init__(self, monitor: object, *, adapter: ListingAdapter | None = None, ownership_lease: object | None = None, monitor_releases_ownership: bool = False) -> None:
         if not callable(getattr(monitor, "run", None)):
             raise TypeError("monitor must provide run")
         self._monitor = monitor
         self._adapter = adapter
+        self._ownership_lease = ownership_lease
+        self._monitor_releases_ownership = monitor_releases_ownership
 
     @classmethod
     def from_config(
@@ -246,22 +252,37 @@ class SmartQueueDaemon:
             raise DaemonConfigurationError("daemon configuration is invalid")
         intake = _private_path(config.active_intake_path, must_exist=True)
         database = _private_path(config.database_path, must_exist=False)
-        # This preflight happens before the active-intake factory can create a
-        # SQLite database or mutate queue state.
+        # A brokered daemon has no command-line escape hatch from locking.  It
+        # receives a one-shot inherited ownership pipe from the broker; normal
+        # and standalone launches continue to acquire the durable sibling lease
+        # before preflight or queue construction.
+        ownership_lease = BrokeredLease.from_environment(database) or DatabaseLease(database)
+        ownership_lease.acquire()
         try:
+            # This preflight happens before the active-intake factory can create a
+            # SQLite database or mutate queue state.
             adapter.list_tab_urls()
-        except Exception:
-            raise DaemonConfigurationError("existing browser bridge is unavailable") from None
-        factory = queue_factory or _load_queue_factory()
-        try:
+            factory = queue_factory or _load_queue_factory()
             queue = factory(intake, database)
             coordinator = SmartQueueCoordinator(queue, adapter)
-            monitor = monitor_factory(coordinator)
+            try:
+                accepts_lease = "lease" in inspect.signature(monitor_factory).parameters
+            except (TypeError, ValueError):
+                accepts_lease = False
+            monitor = monitor_factory(coordinator, lease=ownership_lease) if accepts_lease else monitor_factory(coordinator)
         except DaemonConfigurationError:
+            ownership_lease.release()
             raise
         except Exception:
+            ownership_lease.release()
             raise DaemonConfigurationError("daemon initialization failed") from None
-        return cls(monitor, adapter=adapter)
+        return cls(monitor, adapter=adapter, ownership_lease=ownership_lease, monitor_releases_ownership=accepts_lease)
+
+    def _release_ownership(self) -> None:
+        if self._ownership_lease is not None and not self._monitor_releases_ownership:
+            release = getattr(self._ownership_lease, "release", None)
+            if callable(release):
+                release()
 
     @staticmethod
     def _status(ticks: Sequence[object]) -> DaemonStatus:
@@ -288,25 +309,24 @@ class SmartQueueDaemon:
             parameter.name == "result_sink" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
-        if supports_result_sink:
-            cancellation = threading.Event()
+        try:
+            if supports_result_sink:
+                cancellation = threading.Event()
 
-            def stop_after_terminal_adapter(_status: object) -> None:
-                # A timed-out stdio read makes the response boundary unsafe.
-                # Stop a finite monitor at that completed degraded tick so the
-                # monitor releases its lease before the child exits.
-                if getattr(self._adapter, "terminal", False) is True:
-                    cancellation.set()
+                def stop_after_terminal_adapter(_status: object) -> None:
+                    # A timed-out stdio read makes the response boundary unsafe.
+                    # Stop a finite monitor at that completed degraded tick so the
+                    # monitor releases its lease before the child exits.
+                    if getattr(self._adapter, "terminal", False) is True:
+                        cancellation.set()
 
-            ticks = monitor_run(
-                cancellation,
-                max_ticks=max_ticks,
-                result_sink=stop_after_terminal_adapter,
-            )
-        else:
-            # Retain the original narrow test-double contract for monitors
-            # that only expose finite tuple runs.
-            ticks = monitor_run(max_ticks=max_ticks)
+                ticks = monitor_run(cancellation, max_ticks=max_ticks, result_sink=stop_after_terminal_adapter)
+            else:
+                # Retain the original narrow test-double contract for monitors
+                # that only expose finite tuple runs.
+                ticks = monitor_run(max_ticks=max_ticks)
+        finally:
+            self._release_ownership()
         if not isinstance(ticks, tuple):
             raise RuntimeError("monitor returned invalid status")
         return self._status(ticks)
@@ -323,7 +343,10 @@ class SmartQueueDaemon:
             if getattr(self._adapter, "terminal", False) is True:
                 cancellation.set()
 
-        self._monitor.run(cancellation, max_ticks=None, result_sink=emit_and_stop_after_terminal_adapter)
+        try:
+            self._monitor.run(cancellation, max_ticks=None, result_sink=emit_and_stop_after_terminal_adapter)
+        finally:
+            self._release_ownership()
 
 
 def _emit_status(status: object) -> None:
@@ -511,8 +534,8 @@ def _parse_arguments(parser: argparse.ArgumentParser, argv: Sequence[str] | None
 
 
 def _monitor_factory(interval: float, maximum: float) -> Callable[[object], object]:
-    return lambda coordinator: PersistentSmartQueueMonitor(
-        coordinator, interval_seconds=interval, max_backoff_seconds=maximum
+    return lambda coordinator, *, lease=None: PersistentSmartQueueMonitor(
+        coordinator, lease=lease, interval_seconds=interval, max_backoff_seconds=maximum
     )
 
 

@@ -22,6 +22,9 @@ from jobapply_agent.smart_queue import QueueCandidate, SmartJobQueue
 _PROJECT_ROOT = Path(__file__).parents[1]
 _PRIVATE_ROOT = _PROJECT_ROOT / "jobapply_agent" / "private"
 _SCRIPT_PATH = _PROJECT_ROOT / "jobapply_agent" / "scripts" / "record_candidate_outcome.py"
+_MONITOR_SCRIPT_PATH = (
+    _PROJECT_ROOT / "skills" / "easy-apply-tab-monitor" / "scripts" / "persistent_smart_queue_monitor.py"
+)
 _PROFILE_REVISION = "record-outcome-profile-v1"
 _POLICY_REVISION = "record-outcome-policy-v1"
 _URL = "https://www.linkedin.com/jobs/view/920001?utm_source=synthetic"
@@ -34,6 +37,17 @@ def _load_cli_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _database_lease_class():
+    spec = importlib.util.spec_from_file_location(
+        "persistent_smart_queue_monitor_for_record_outcome_test", _MONITOR_SCRIPT_PATH
+    )
+    assert spec and spec.loader, "persistent monitor lease must be loadable"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.DatabaseLease
 
 
 def _private_paths(tmp_path: Path) -> tuple[Path, Path]:
@@ -260,6 +274,36 @@ def test_cli_blocks_wal_candidate_memory_without_mutating_queue_or_memory(
     assert _URL not in (captured.out + captured.err)
     assert SmartJobQueue(queue_path).get("cli-queue-job").state == "open"
     assert CandidateMemory(memory_path).is_suppressed(_URL) is False
+
+
+def test_cli_outcome_waits_for_the_existing_queue_lease_before_mutating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queue_path, memory_path = _private_paths(tmp_path)
+    _seed_open_queue_job(queue_path)
+    cli = _load_cli_module()
+    database_lease = _database_lease_class()
+
+    assert memory_path.exists() is False
+    with database_lease(queue_path):
+        blocked_exit_code = _run_cli(monkeypatch, cli, _arguments(queue_path, memory_path, "--vacated"))
+
+    blocked = capsys.readouterr()
+    assert blocked_exit_code == 2
+    assert json.loads(blocked.out) == {"status": "blocked", "reconciled": 0}
+    assert _URL not in (blocked.out + blocked.err)
+    assert SmartJobQueue(queue_path).get("cli-queue-job").state == "open"
+    assert SmartJobQueue(queue_path).confirmed_outcome_events() == ()
+    assert memory_path.exists() is False
+
+    success_exit_code = _run_cli(monkeypatch, cli, _arguments(queue_path, memory_path, "--vacated"))
+
+    success = capsys.readouterr()
+    assert success_exit_code == 0
+    assert json.loads(success.out) == {"status": "ok", "reconciled": 1}
+    assert _URL not in (success.out + success.err)
+    assert SmartJobQueue(queue_path).get("cli-queue-job").state == "submitted"
+    assert CandidateMemory(memory_path).is_suppressed(_URL) is True
 
 
 def test_cli_rejects_cross_candidate_queue_and_memory_pairing_atomically(
