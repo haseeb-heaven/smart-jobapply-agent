@@ -78,7 +78,10 @@ test("real Node stdio host, Python daemon, and SQLite queue refill a synthetic b
     ];
     const daemonPath = fileURLToPath(new URL("../../skills/easy-apply-tab-monitor/scripts/smart_queue_daemon.py", import.meta.url));
 
+    await context.newPage(); // Existing selected session so the initial snapshot is available.
     const first = startSmartQueueDaemonHost(binding, { daemonArgs: daemonArgs(1), daemonPath });
+    await expect.poll(() => first.latestStatus?.ticks_completed ?? 0, { timeout: 20_000 }).toBeGreaterThan(0);
+    await first.stop();
     expect(await first.finished).toMatchObject({ exitCode: 0, signalCode: null });
     expect(await binding.listTabUrls()).toEqual(expect.arrayContaining(LISTINGS.slice(0, 2)));
     const vacated = context.pages().find((candidate) => candidate.url() === LISTINGS[0]);
@@ -86,6 +89,8 @@ test("real Node stdio host, Python daemon, and SQLite queue refill a synthetic b
     await vacated.close(); // Test-only simulated candidate vacancy.
 
     const second = startSmartQueueDaemonHost(binding, { daemonArgs: daemonArgs(1), daemonPath });
+    await expect.poll(() => second.latestStatus?.ticks_completed ?? 0, { timeout: 20_000 }).toBeGreaterThan(0);
+    await second.stop();
     expect(await second.finished).toMatchObject({ exitCode: 0, signalCode: null });
     const urls = await binding.listTabUrls();
     expect(urls).toEqual(expect.arrayContaining([LISTINGS[1], LISTINGS[2]]));
