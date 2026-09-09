@@ -307,10 +307,27 @@ def _run_broker(database: Path, daemon: list[str]) -> int:
                     # browser promise settled.  It is now safe to interrupt
                     # the daemon's blocking bridge read before relinquishing
                     # the cross-process lease.
-                    if ownership_write is not None:
-                        os.write(ownership_write, b"R")
-                    if child.poll() is None:
-                        child.terminate()
+                    # Poll first: a finite-run daemon may already have exited
+                    # cleanly on its own, leaving no pipe reader. Writing R
+                    # unconditionally would raise BrokenPipeError and take the
+                    # ambiguous fail-closed path even though shutdown is clean.
+                    returncode = child.poll()
+                    if returncode is None:
+                        try:
+                            if ownership_write is not None:
+                                os.write(ownership_write, b"R")
+                        except OSError:
+                            returncode = child.poll()
+                            if returncode is None:
+                                raise RuntimeOwnershipError("runtime ownership unavailable")
+                            if returncode != 0:
+                                raise RuntimeOwnershipError("runtime ownership unavailable")
+                        else:
+                            if child.poll() is None:
+                                child.terminate()
+                    else:
+                        if returncode != 0:
+                            raise RuntimeOwnershipError("runtime ownership unavailable")
                     child.wait()
                 lease.release()
                 acquired = False
