@@ -11,8 +11,10 @@ import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { startCodexChromeExtensionHost, canonicalListingUrl } from "./codex_chrome_extension_host.mjs";
+import { startRuntimeOwnershipControl } from "./runtime_ownership_host.mjs";
 
 const DEFAULT_DAEMON_PATH = fileURLToPath(new URL("./smart_queue_daemon.py", import.meta.url));
+const DEFAULT_OWNERSHIP_BROKER_PATH = fileURLToPath(new URL("./runtime_ownership.py", import.meta.url));
 const BRIDGE_CLOSE_EXIT_GRACE_MS = 100;
 const MAX_STATUS_LINE_BYTES = 4096;
 const MAX_STATUS_FAILURES = 1024;
@@ -51,6 +53,14 @@ function daemonArguments(value) {
   return [...value];
 }
 
+function privateDatabaseArgument(args) {
+  const index = args.indexOf("--database");
+  if (index < 0 || index + 1 >= args.length || typeof args[index + 1] !== "string" || args[index + 1].length === 0) {
+    return null;
+  }
+  return args[index + 1];
+}
+
 const MAX_BINDING_ID_LENGTH = 128;
 
 function optionalBindingId(value) {
@@ -72,6 +82,10 @@ function daemonHostConfiguration(options) {
     daemonPath: command(options.daemonPath ?? DEFAULT_DAEMON_PATH, "daemonPath"),
     daemonArgs: daemonArguments(options.daemonArgs),
     bindingId: optionalBindingId(options.bindingId),
+    // Injected spawn functions are a narrow test seam. Production uses the
+    // broker by default; mocks retain direct-child behaviour so they cannot
+    // accidentally become a substitute ownership implementation.
+    useOwnershipBroker: spawn === nodeSpawn && (options.daemonPath ?? DEFAULT_DAEMON_PATH) === DEFAULT_DAEMON_PATH,
   });
 }
 
@@ -378,12 +392,16 @@ function runtimeKey(configuration) {
  */
 export function startSmartQueueDaemonHost(browserBinding, options) {
   const configuration = daemonHostConfiguration(options);
+  const database = privateDatabaseArgument(configuration.daemonArgs);
+  const brokered = configuration.useOwnershipBroker && database !== null;
   let child;
   try {
     child = requireChild(configuration.spawn(
       configuration.executable,
-      [configuration.daemonPath, ...configuration.daemonArgs],
-      { shell: false, stdio: ["pipe", "pipe", "pipe"] },
+      brokered
+        ? [DEFAULT_OWNERSHIP_BROKER_PATH, "--database", database, "--", configuration.daemonPath, ...configuration.daemonArgs]
+        : [configuration.daemonPath, ...configuration.daemonArgs],
+      { shell: false, stdio: brokered ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"] },
     ));
   } catch {
     throw new Error("smart queue daemon failed to start");
@@ -396,12 +414,25 @@ export function startSmartQueueDaemonHost(browserBinding, options) {
   let bridgeEnded = false;
   let bridgeCloseTimer = null;
   let bridge;
+  let ownership = null;
   try {
+    if (brokered) {
+      ownership = startRuntimeOwnershipControl(child.stdio?.[3]);
+      // Queue construction is impossible until this request has acquired the
+      // sibling lease. The broker's response carries only a fixed state.
+      void ownership.request("acquire").then((state) => {
+        if (state !== "acquired") terminateForOwnership();
+      }, () => terminateForOwnership());
+    }
     bridge = startCodexChromeExtensionHost(toBridgeBinding(browserBinding), { input: child.stderr, output: child.stdin });
   } catch (error) {
     child.kill("SIGTERM");
     throw error;
   }
+  const terminateForOwnership = () => {
+    if (exitObserver.exit() !== null) return;
+    try { child.kill("SIGTERM"); } catch { /* redacted terminal state */ }
+  };
   const finished = exitObserver.finished.then(async (terminal) => {
     // Closing the logical bridge fences every browser operation that has not
     // yet been dispatched. A dispatched mutation cannot be cancelled through
@@ -493,8 +524,25 @@ export function startSmartQueueDaemonHost(browserBinding, options) {
       stopping = (async () => {
         cancelBridgeCloseWait();
         bridge.close();
-        if (typeof child.stdin.end === "function") child.stdin.end();
-        if (exitObserver.exit() === null) child.kill("SIGTERM");
+        // A normal brokered shutdown is ordered: no new bridge dispatch,
+        // every previously dispatched browser promise settled, then the
+        // broker interrupts the daemon and releases its durable lease. Never
+        // treat child exit as evidence that a `goto` was cancelled.
+        await bridge.quiescent.catch(() => undefined);
+        if (ownership !== null) {
+          try {
+            if (await ownership.request("quiesce") !== "quiesced") throw new Error("ownership unavailable");
+            if (await ownership.request("drained") !== "drained") throw new Error("ownership unavailable");
+            if (await ownership.request("release") !== "released") throw new Error("ownership unavailable");
+          } catch {
+            // An ambiguous control failure must retain broker ownership; the
+            // redacted marker blocks a later independent replacement.
+            terminateForOwnership();
+          }
+        } else {
+          if (typeof child.stdin.end === "function") child.stdin.end();
+          if (exitObserver.exit() === null) child.kill("SIGTERM");
+        }
         await finished;
         await bridge.finished.catch(() => undefined);
       })();

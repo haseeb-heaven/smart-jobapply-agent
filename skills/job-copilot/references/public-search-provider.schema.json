@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smart-jobapply-agent.local/schemas/public-search-provider.schema.json",
+  "title": "Public search-provider batch",
+  "description": "Strict, public-only input/output contract for an external job-search provider. It contains neither candidate facts nor scores, eligibility decisions, browser state, or local paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "listings"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "listings": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query_id", "platform", "url", "title", "company", "description"],
+        "properties": {
+          "query_id": {"type": "string", "pattern": "^q[0-9]+$", "maxLength": 32},
+          "platform": {"enum": ["linkedin", "indeed"]},
+          "url": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "title": {"type": "string", "minLength": 1, "maxLength": 512},
+          "company": {"type": "string", "maxLength": 512},
+          "description": {"type": "string", "maxLength": 12000},
+          "location": {"type": "string", "maxLength": 512},
+          "work_mode": {"type": "string", "maxLength": 128},
+          "employment_type": {"type": "string", "maxLength": 128},
+          "posted_at": {"type": ["string", "null"], "maxLength": 128},
+          "source_job_id": {"type": ["string", "null"], "maxLength": 256},
+          "discovered_at": {"type": ["string", "null"], "maxLength": 128}
+        }
+      }
+    }
+  }
+}

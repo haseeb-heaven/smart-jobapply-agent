@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Smart JobApply browser validation evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "case_id", "agent", "transport", "environment",
+    "browser", "runtime_versions", "automated", "live", "human_manual",
+    "human_signoff_ref", "opened_count", "inferred_outcome_count", "artifact_ref"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "case_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"},
+    "agent": {"enum": ["codex", "playwright", "other"]},
+    "transport": {"enum": ["playwright-context", "codex-session", "external-bridge"]},
+    "environment": {"enum": ["local", "cloud", "ci"]},
+    "browser": {"enum": ["chromium", "chrome", "edge", "firefox", "webkit", "other"]},
+    "runtime_versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "browser"],
+      "properties": {
+        "agent": {"type": "string", "pattern": "^[A-Za-z0-9._+ -]{1,128}$"},
+        "browser": {"type": "string", "pattern": "^[A-Za-z0-9._+ -]{1,128}$"}
+      }
+    },
+    "automated": {"enum": ["passed", "failed", "blocked", "not_run"]},
+    "live": {"enum": ["passed", "failed", "blocked", "not_run"]},
+    "human_manual": {"enum": ["passed", "failed", "blocked", "not_run"]},
+    "human_signoff_ref": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{1,128}$"},
+    "opened_count": {"type": "integer", "minimum": 0, "maximum": 10},
+    "inferred_outcome_count": {"const": 0},
+    "artifact_ref": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}
+  },
+  "allOf": [
+    {"if": {"properties": {"live": {"const": "passed"}}}, "then": {"properties": {"automated": {"const": "passed"}}}},
+    {"if": {"properties": {"human_manual": {"const": "passed"}}}, "then": {"properties": {"automated": {"const": "passed"}, "live": {"const": "passed"}, "human_signoff_ref": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, "required": ["human_signoff_ref"]}}
+  ]
+}

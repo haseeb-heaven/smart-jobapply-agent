@@ -273,6 +273,61 @@ an agent browser tool, or native desktop automation. The bundled macOS Chrome
 AppleScript path is optional compatibility only. See
 `skills/job-copilot/references/browser-capabilities.md`.
 
+For an already-connected host-selected Playwright context, the bounded
+`playwright_listing_binding.mjs` adapter provides the same generic URL-listing
+and exact-listing-open contract as the Codex bridge. It never launches or
+selects a browser context, reads page content, accesses browser state, or
+performs application actions. The setup and capability requirements for Codex,
+Playwright, external bridges, and cloud hosts are in
+[`docs/runtime/agent-browser-setup.md`](docs/runtime/agent-browser-setup.md).
+
+### Existing-session Chrome assistant
+
+The optional local Chrome assistant is a runtime integration, not a core
+package feature. It runs a bounded foreground host loop around an
+already-running Chrome session, the URL-only system Chrome bridge, and an
+optional public-search provider. Its only browser authority is to list URLs and
+open an exact, already-approved LinkedIn or Indeed listing URL. It never starts
+Chrome, reads page content or browser state, closes tabs, logs in, or interacts
+with an application; the candidate still controls every application action and
+must explicitly confirm an outcome and a vacated managed tab before it is
+recorded.
+
+Its supported launch shape is:
+
+```sh
+python3 skills/easy-apply-tab-monitor/scripts/external_smart_queue_assistant.py \
+  --candidate-intake <private-candidate-intake> \
+  --queue-db <private-queue-database> \
+  --memory-db <private-candidate-memory-database> \
+  --interval-seconds 15 \
+  --provider-timeout-seconds 310 \
+  --max-rounds 1 \
+  --bridge-command node skills/easy-apply-tab-monitor/scripts/system_chrome_listing_bridge.mjs <private-binding-file> \
+  --provider-command python3 skills/easy-apply-tab-monitor/scripts/codex_public_search_provider.py
+```
+
+Use the exact private-runtime command, setup requirements, stop procedure, and
+operational limits in
+[`docs/runtime/system-chrome-assistant.md`](docs/runtime/system-chrome-assistant.md).
+The host reconciles completed cycles at the configured interval, but a
+shortage-triggered public search can take up to its bounded timeout; it is not
+an always-on service. A source shortage, inaccessible evidence, unavailable
+browser session, unsupported redirect, or failed deterministic admission stays
+reported as a shortage rather than a successful refill. The public provider
+receives public search queries only, while deterministic eligibility, ranking,
+suppression, and admission remain local host responsibilities.
+
+The bridge keeps a per-queue private binding only for a target it created. A
+same-job LinkedIn or Indeed listing redirect may be represented as the exact
+approved URL for that target; application/login routes, different jobs,
+unsupported query parameters, fragments, malformed URLs, and unbound targets
+are never substituted. This does not alter core canonical URLs, candidate-memory
+suppression, queue records, or outcomes. Offline coverage includes the host
+loop and redirect-identity contracts; the authoritative repository gate runs
+those Node contracts through `./scripts/verify.sh`. A live session still needs
+its own observed verification before it can be claimed working.
+
 Candidate data is local to this repository only if the chosen agent, LLM, and
 tools also guarantee local processing. A cloud LLM may receive the specific
 context supplied to it; never promise a stronger privacy boundary than the

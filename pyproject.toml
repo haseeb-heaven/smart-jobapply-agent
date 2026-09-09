@@ -13,8 +13,8 @@ authors = [{ name = "Haseeb Mir" }]
 dependencies = []
 
 [project.optional-dependencies]
-test = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0"]
-dev = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0", "ruff==0.8.6"]
+test = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0", "jsonschema==4.26.0"]
+dev = ["coverage>=7.0,<8.0", "pytest>=8.0,<9.0", "jsonschema==4.26.0", "ruff==0.8.6"]
 
 [tool.setuptools.packages.find]
 where = ["jobapply_agent/src"]
