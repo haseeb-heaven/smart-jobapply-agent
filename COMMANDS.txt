@@ -1,0 +1,53 @@
+# ==============================================================================
+# SMART JOBAPPLY AGENT - COMMAND QUICK REFERENCE
+# ==============================================================================
+
+# 1. BROWSER SETUP (Choose Option A or Option B)
+# ------------------------------------------------------------------------------
+# Option A (Recommended): Use existing normal Google Chrome (Zero setup required)
+# Just make sure Google Chrome is running and you are logged into LinkedIn.
+# The AppleScript bridge connects directly without any debug flags or port needed.
+
+# Option B: Launch Google Chrome with Remote Debugging (Port 9222)
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins='*' \
+  --user-data-dir=/tmp/chrome-real-profile \
+  --no-first-run
+
+
+# 2. SMART QUEUE CLI COMMANDS (Run from project root directory)
+# ------------------------------------------------------------------------------
+
+# Check environment & browser connection (Doctor check):
+python3 jobapply_agent/scripts/jobapply_queue.py --bridge-command "python3 jobapply_agent/private/chrome_applescript_bridge.py" doctor
+
+# Check current queue status, open tabs count, and capacity:
+python3 jobapply_agent/scripts/jobapply_queue.py --bridge-command "python3 jobapply_agent/private/chrome_applescript_bridge.py" status
+
+# Set managed listing tabs capacity (e.g. 5 tabs).
+# Capacity must be authorized by your active candidate intake.
+# If you want 5 tabs, your intake must approve `"targets.smart_queue_capacity": 5`.
+python3 jobapply_agent/scripts/jobapply_queue.py --bridge-command "python3 jobapply_agent/private/chrome_applescript_bridge.py" tabs 5
+
+# Open all approved listing tabs in Chrome (single reconciliation cycle).
+# Requires capacity authorization from your active candidate intake.
+python3 jobapply_agent/scripts/jobapply_queue.py --bridge-command "python3 jobapply_agent/private/chrome_applescript_bridge.py" open
+
+# Run the live automatic monitoring and replenishment loop (monitors every 15s).
+# Requires capacity authorization from your active candidate intake.
+python3 jobapply_agent/scripts/jobapply_queue.py \
+  --bridge-command "python3 jobapply_agent/private/chrome_applescript_bridge.py" \
+  watch \
+  --interval-seconds 15 \
+  --search-command "python3 jobapply_agent/private/linkedin_search_refill.py"
+
+
+# 3. RECORDING APPLICATION OUTCOMES
+# ------------------------------------------------------------------------------
+# When you have manually applied and closed a tab, record the outcome:
+python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome submitted
+
+# Other outcome options:
+python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome skipped
+python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome rejected

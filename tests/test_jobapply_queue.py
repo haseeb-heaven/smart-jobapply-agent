@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -268,8 +269,6 @@ def test_outcome_recorded_rejects_bad_outcome():
 
 
 def test_resolve_repository_root_defaults_to_cwd(tmp_path, monkeypatch):
-    import os
-
     monkeypatch.chdir(tmp_path)
     marker = tmp_path / "jobapply_agent" / "src" / "jobapply_agent" / "smart_queue.py"
     marker.parent.mkdir(parents=True)
@@ -279,8 +278,6 @@ def test_resolve_repository_root_defaults_to_cwd(tmp_path, monkeypatch):
 
 
 def test_resolve_repository_root_prefers_explicit_over_cwd(tmp_path, monkeypatch):
-    import os
-
     repo = tmp_path / "repo-checkout"
     marker = repo / "jobapply_agent" / "src" / "jobapply_agent" / "smart_queue.py"
     marker.parent.mkdir(parents=True)
@@ -291,8 +288,589 @@ def test_resolve_repository_root_prefers_explicit_over_cwd(tmp_path, monkeypatch
 
 
 def test_resolve_repository_root_falls_back_to_script_checkout(tmp_path, monkeypatch):
-    import os
-
     monkeypatch.chdir(tmp_path)
     root = jq.resolve_repository_root(None)
     assert root == jq.SCRIPT_DIR.parent.parent
+
+
+# --- capacity authorization --------------------------------------------------
+
+_REVISION = "ab" * 32
+
+
+def _intake_file(tmp_path):
+    path = tmp_path / "candidate_intake.json"
+    path.write_text(json.dumps({"approved_facts": {}}), encoding="utf-8")
+    return path
+
+
+def _install_intake(monkeypatch, approved_facts, revision=_REVISION):
+    """Replace the intake boundary with a confirmed-revision stand-in."""
+
+    def loader(_root):
+        def validate(_payload):
+            return {"approved_facts": approved_facts, "revision_hash": revision}
+
+        return validate
+
+    monkeypatch.setattr(jq, "_load_intake_module", loader)
+
+
+def _install_failing_intake(monkeypatch):
+    def loader(_root):
+        def validate(_payload):
+            raise ValueError("candidate intake revision_hash does not match approved state")
+
+        return validate
+
+    monkeypatch.setattr(jq, "_load_intake_module", loader)
+
+
+def _write_metadata(path, *, target_size, provenance, revision):
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS smart_queue_metadata (metadata_id INTEGER PRIMARY KEY, "
+            "target_size INTEGER, capacity_provenance TEXT, capacity_intake_revision TEXT)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO smart_queue_metadata VALUES (1, ?, ?, ?)",
+            (target_size, provenance, revision),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+class _CapacityQueue:
+    """Record every capacity write, including provenance kwargs."""
+
+    def __init__(self, database, target_size=jq.DEFAULT_CAPACITY, provenance="default"):
+        self.database_path = database
+        self.target_size = target_size
+        self.capacity_provenance = provenance
+        self.calls = []
+
+    def set_target_size(
+        self, capacity, *, actor, capacity_provenance=None, intake_revision_hash=None
+    ):
+        self.calls.append(
+            {
+                "capacity": capacity,
+                "actor": actor,
+                "capacity_provenance": capacity_provenance,
+                "intake_revision_hash": intake_revision_hash,
+            }
+        )
+        self.target_size = capacity
+        self.capacity_provenance = capacity_provenance or (
+            "default" if capacity == jq.DEFAULT_CAPACITY else "host-configured"
+        )
+        # The real queue returns the resulting capacity, not the prior one.
+        return self.target_size
+
+
+def test_active_intake_capacity_reads_approved_fact(tmp_path, monkeypatch):
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+
+    assert jq.active_intake_capacity(tmp_path, _intake_file(tmp_path)) == (3, _REVISION)
+
+
+def test_active_intake_capacity_reads_nested_fact(tmp_path, monkeypatch):
+    _install_intake(monkeypatch, {"targets": {"smart_queue_capacity": 7}})
+
+    assert jq.active_intake_capacity(tmp_path, _intake_file(tmp_path)) == (7, _REVISION)
+
+
+def test_active_intake_capacity_defaults_when_fact_absent(tmp_path, monkeypatch):
+    _install_intake(monkeypatch, {"candidate_profile": {"headline": "Backend Engineer"}})
+
+    # The documented default needs no intake binding to stay live.
+    assert jq.active_intake_capacity(tmp_path, _intake_file(tmp_path)) == (
+        jq.DEFAULT_CAPACITY,
+        None,
+    )
+
+
+@pytest.mark.parametrize("capacity", [True, False, 0, 11, -1, "3", 3.0])
+def test_active_intake_capacity_rejects_invalid_value(tmp_path, monkeypatch, capacity):
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: capacity})
+
+    with pytest.raises(jq.CliUsageError):
+        jq.active_intake_capacity(tmp_path, _intake_file(tmp_path))
+
+
+def test_active_intake_capacity_requires_readable_confirmed_intake(tmp_path, monkeypatch):
+    with pytest.raises(jq.CliUsageError):
+        jq.active_intake_capacity(tmp_path, tmp_path / "absent.json")
+
+    _install_failing_intake(monkeypatch)
+    path = _intake_file(tmp_path)
+    with pytest.raises(jq.CliUsageError):
+        jq.active_intake_capacity(tmp_path, path)
+
+    path.write_text("not json", encoding="utf-8")
+    with pytest.raises(jq.CliUsageError):
+        jq.active_intake_capacity(tmp_path, path)
+
+
+def test_capacity_live_authorized_truth_table():
+    bound = (3, jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE, _REVISION)
+    assert jq.capacity_live_authorized(
+        intake_capacity=3, intake_revision=_REVISION, stored=bound
+    ) is True
+    # A stale digest is not the active intake's proof.
+    assert jq.capacity_live_authorized(
+        intake_capacity=3, intake_revision=_REVISION, stored=(3, "active-candidate-intake", "cd" * 32)
+    ) is False
+    # Host-configured non-default capacity is never live-authorized.
+    assert jq.capacity_live_authorized(
+        intake_capacity=3, intake_revision=_REVISION, stored=(3, "host-configured", None)
+    ) is False
+    assert jq.capacity_live_authorized(
+        intake_capacity=3, intake_revision=_REVISION, stored=(4, "active-candidate-intake", _REVISION)
+    ) is False
+    # The default carries no binding, so only the size must agree -- even a
+    # stale or unrelated intake digest cannot make the default unauthorized.
+    assert jq.capacity_live_authorized(
+        intake_capacity=5, intake_revision=None, stored=(5, "default", None)
+    ) is True
+    assert jq.capacity_live_authorized(
+        intake_capacity=5, intake_revision=_REVISION, stored=(5, "active-candidate-intake", "cd" * 32)
+    ) is True
+    assert jq.capacity_live_authorized(
+        intake_capacity=5, intake_revision=None, stored=(3, "default", None)
+    ) is False
+    # A non-default size can never be authorized without the intake's digest.
+    assert jq.capacity_live_authorized(
+        intake_capacity=3, intake_revision=None, stored=(3, "default", None)
+    ) is False
+
+
+def test_persisted_capacity_metadata_reads_and_fails_closed(tmp_path):
+    db = _write_metadata(
+        tmp_path / "q.sqlite3",
+        target_size=3,
+        provenance=jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+        revision=_REVISION,
+    )
+    assert jq.persisted_capacity_metadata(db) == (3, jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE, _REVISION)
+
+    with pytest.raises(jq.CliUsageError):
+        jq.persisted_capacity_metadata(tmp_path / "absent.sqlite3")
+
+    empty = tmp_path / "empty.sqlite3"
+    sqlite3.connect(empty).close()
+    with pytest.raises(jq.CliUsageError):
+        jq.persisted_capacity_metadata(empty)
+
+
+def test_capacity_authorization_reports_unknown_never_authorized(tmp_path, monkeypatch):
+    _install_failing_intake(monkeypatch)
+    paths = {"queue": _write_metadata(tmp_path / "q.sqlite3", target_size=3, provenance="default", revision=None), "intake": _intake_file(tmp_path)}
+
+    authorized, detail = jq.capacity_authorization(tmp_path, paths)
+
+    assert authorized is None
+    assert detail is not None
+
+
+def test_capacity_authorization_detects_stale_metadata(tmp_path, monkeypatch):
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue_db = _write_metadata(
+        tmp_path / "q.sqlite3", target_size=3, provenance="host-configured", revision=None
+    )
+    paths = {"queue": queue_db, "intake": _intake_file(tmp_path)}
+
+    assert jq.capacity_authorization(tmp_path, paths) == (False, None)
+
+    _write_metadata(
+        queue_db,
+        target_size=3,
+        provenance=jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+        revision=_REVISION,
+    )
+    assert jq.capacity_authorization(tmp_path, paths) == (True, None)
+
+
+def test_apply_managed_capacity_binds_approved_capacity(tmp_path):
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=3, intake_capacity=3, intake_revision=_REVISION
+    )
+
+    assert (resulting, warning) == (3, None)
+    assert queue.calls == [
+        {
+            "capacity": 3,
+            "actor": "user",
+            "capacity_provenance": jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+            "intake_revision_hash": _REVISION,
+        }
+    ]
+
+
+def test_apply_managed_capacity_binds_default_without_proof(tmp_path):
+    queue = _CapacityQueue(tmp_path / "q.sqlite3", target_size=3, provenance="host-configured")
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=5, intake_capacity=5, intake_revision=None
+    )
+
+    assert (resulting, warning) == (5, None)
+    assert queue.calls[-1]["capacity_provenance"] is None
+
+
+def test_apply_managed_capacity_never_binds_proof_at_default_size(tmp_path):
+    """An explicitly approved default size is live without any binding.
+
+    Binding intake proof at the default size is rejected by the queue, so the
+    default must always resolve to plain default provenance.
+    """
+
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=5, intake_capacity=5, intake_revision=_REVISION
+    )
+
+    assert (resulting, warning) == (5, None)
+    assert queue.calls == [
+        {
+            "capacity": 5,
+            "actor": "user",
+            "capacity_provenance": None,
+            "intake_revision_hash": None,
+        }
+    ]
+    assert queue.calls[-1]["intake_revision_hash"] is None
+
+
+def _real_queue(tmp_path):
+    """Build the repository's real queue so policy failures surface here."""
+
+    queue_class, _, _, _ = jq._load_queue_module(jq.SCRIPT_DIR.parent.parent)
+    return queue_class(tmp_path / "q.sqlite3")
+
+
+def test_apply_managed_capacity_default_size_is_accepted_by_the_real_queue(tmp_path):
+    """An approved default size must never be bound with intake proof.
+
+    The queue rejects non-default provenance at the default size, so binding
+    proof here would raise QueuePolicyError instead of authorizing capacity.
+    """
+
+    queue = _real_queue(tmp_path)
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=5, intake_capacity=5, intake_revision=_REVISION
+    )
+
+    assert (resulting, warning) == (5, None)
+    assert queue.target_size == 5
+    assert queue.capacity_provenance == "default"
+
+
+def test_apply_managed_capacity_non_default_reaches_the_live_construction_seam(tmp_path):
+    """An approved non-default size must survive the daemon's own constructor."""
+
+    queue = _real_queue(tmp_path)
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=3, intake_capacity=3, intake_revision=_REVISION
+    )
+
+    assert (resulting, warning) == (3, None)
+    assert queue.target_size == 3
+    assert queue.capacity_provenance == jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE
+    assert queue.has_active_intake_capacity_provenance is True
+    # The daemon constructs through this exact active-intake seam on every run.
+    queue_class, _, _, _ = jq._load_queue_module(jq.SCRIPT_DIR.parent.parent)
+    built = queue_class.for_active_candidate_intake(
+        tmp_path / "q.sqlite3", target_size=3, intake_revision_hash=_REVISION
+    )
+    assert built.target_size == 3
+    assert jq.capacity_live_authorized(
+        intake_capacity=3,
+        intake_revision=_REVISION,
+        stored=jq.persisted_capacity_metadata(tmp_path / "q.sqlite3"),
+    ) is True
+
+
+def test_apply_managed_capacity_warns_for_unapproved_capacity(tmp_path):
+    """An intake that approves the default still refuses any other size."""
+
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=3, intake_capacity=5, intake_revision=None
+    )
+
+    assert resulting == 3
+    assert warning is not None
+    assert jq.SMART_QUEUE_CAPACITY_FACT in warning
+    assert "approves 5" in warning
+    assert queue.calls[-1]["capacity_provenance"] is None
+    assert queue.calls[-1]["intake_revision_hash"] is None
+
+
+def test_apply_managed_capacity_warns_when_intake_unconfirmed(tmp_path):
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    resulting, warning = jq.apply_managed_capacity(
+        queue, requested=3, intake_capacity=None, intake_revision=None
+    )
+
+    assert resulting == 3
+    assert warning is not None
+    assert "could not be confirmed" in warning
+    assert jq.SMART_QUEUE_CAPACITY_FACT not in warning
+
+
+def test_set_managed_capacity_prints_authorized_write(tmp_path, monkeypatch, capsys):
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    previous = jq.set_managed_capacity(tmp_path, {"intake": intake}, queue, 3)
+    out = capsys.readouterr().out
+
+    assert previous == jq.DEFAULT_CAPACITY
+    assert "capacity 5 -> 3" in out
+    assert f"capacity_provenance: {jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE}" in out
+    assert "warning" not in out.lower()
+
+
+def test_set_managed_capacity_warns_for_unapproved_write(tmp_path, monkeypatch, capsys):
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue = _CapacityQueue(tmp_path / "q.sqlite3")
+
+    jq.set_managed_capacity(tmp_path, {"intake": intake}, queue, 4)
+    out = capsys.readouterr().out
+
+    assert "capacity 5 -> 4" in out
+    assert "capacity_provenance: host-configured" in out
+    assert "warning:" in out and jq.SMART_QUEUE_CAPACITY_FACT in out
+
+
+def test_status_payload_reports_capacity_authorization(tmp_path):
+    db = _queue_db(tmp_path, ["job-a"])
+    queue = _FakeQueue(db, {"job-a": "open"})
+
+    assert jq.status_payload(queue, bridge_command=None)["capacity_live_authorized"] is None
+    payload = jq.status_payload(queue, bridge_command=None, capacity_live_authorized=False)
+    assert payload["capacity_live_authorized"] is False
+
+
+def test_doctor_report_surfaces_capacity_authorization(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "skills" / "easy-apply-tab-monitor" / "scripts").mkdir(parents=True)
+    (repo / "skills" / "easy-apply-tab-monitor" / "scripts" / "smart_queue_daemon.py").write_text("x")
+    (repo / "jobapply_agent" / "scripts").mkdir(parents=True)
+    for name in ("discover.py", "record_candidate_outcome.py"):
+        (repo / "jobapply_agent" / "scripts" / name).write_text("x")
+
+    private = tmp_path / "private"
+    private.mkdir()
+    intake = private / "candidate_intake.json"
+    intake.write_text(json.dumps({"approved_facts": {}}), encoding="utf-8")
+    memory = private / "candidate-memory.sqlite3"
+    memory.write_text("x")
+    bridge = private / "bridge.mjs"
+    bridge.write_text("x")
+
+    paths = {
+        "queue": _write_metadata(
+            private / "q.sqlite3", target_size=3, provenance="host-configured", revision=None
+        ),
+        "memory": memory,
+        "intake": intake,
+        "bridge": bridge,
+    }
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    monkeypatch.setattr(jq, "listing_tab_urls", lambda *_args, **_kwargs: ())
+
+    report = jq.doctor_report(repo, paths, ["node", "bridge.mjs"])
+
+    # Every prerequisite is present, yet live cycles would still refuse capacity.
+    assert report["ready"] is True
+    assert report["capacity_live_authorized"] is False
+    assert report["capacity_detail"] is None
+
+
+def test_doctor_report_keeps_ready_true_when_capacity_is_unknown(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "skills" / "easy-apply-tab-monitor" / "scripts").mkdir(parents=True)
+    (repo / "skills" / "easy-apply-tab-monitor" / "scripts" / "smart_queue_daemon.py").write_text("x")
+    (repo / "jobapply_agent" / "scripts").mkdir(parents=True)
+    for name in ("discover.py", "record_candidate_outcome.py"):
+        (repo / "jobapply_agent" / "scripts" / name).write_text("x")
+
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "candidate-memory.sqlite3").write_text("x")
+    (private / "candidate_intake.json").write_text(json.dumps({"approved_facts": {}}), encoding="utf-8")
+    (private / "bridge.mjs").write_text("x")
+    (private / "q.sqlite3").write_text("x")
+
+    paths = {key: private / name for key, name in (
+        ("queue", "q.sqlite3"),
+        ("memory", "candidate-memory.sqlite3"),
+        ("intake", "candidate_intake.json"),
+        ("bridge", "bridge.mjs"),
+    )}
+    _install_failing_intake(monkeypatch)
+    monkeypatch.setattr(jq, "listing_tab_urls", lambda *_args, **_kwargs: ())
+
+    report = jq.doctor_report(repo, paths, ["node", "bridge.mjs"])
+
+    assert report["ready"] is True
+    assert report["capacity_live_authorized"] is None
+    assert report["capacity_detail"] is not None
+
+
+def test_active_intake_capacity_missing_error_string_sanitized(tmp_path):
+    absent = tmp_path / "secret_candidate_profile" / "candidate_intake.json"
+    with pytest.raises(jq.CliUsageError) as exc_info:
+        jq.active_intake_capacity(tmp_path, absent)
+    message = str(exc_info.value)
+    assert message == "the active candidate intake is missing"
+    assert str(absent) not in message
+    assert "secret_candidate_profile" not in message
+
+
+def test_require_authorized_capacity_unauthorized_raises_helpful_error(tmp_path, monkeypatch):
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue_db = _write_metadata(
+        tmp_path / "q.sqlite3", target_size=4, provenance="host-configured", revision=None
+    )
+    paths = {"intake": intake, "queue": queue_db}
+
+    with pytest.raises(jq.CliUsageError) as exc_info:
+        jq.require_authorized_capacity(tmp_path, paths)
+
+    message = str(exc_info.value)
+    assert "capacity is not authorized for live reconciliation cycles" in message
+    assert "active candidate intake approves 3" in message
+    assert "Run 'jobapply_queue.py tabs 3' to use the approved capacity" in message
+    assert "or approve targets.smart_queue_capacity in candidate_intake.json" in message
+
+
+def test_require_authorized_capacity_unknown_due_to_missing_or_unreadable_intake(tmp_path):
+    queue_db = _write_metadata(
+        tmp_path / "q.sqlite3", target_size=5, provenance="default", revision=None
+    )
+    # Missing intake
+    paths_missing = {"intake": tmp_path / "missing.json", "queue": queue_db}
+    with pytest.raises(jq.CliUsageError) as exc_missing:
+        jq.require_authorized_capacity(tmp_path, paths_missing)
+    assert "cannot verify capacity authorization for live cycles:" in str(exc_missing.value)
+    assert "the active candidate intake is missing" in str(exc_missing.value)
+
+    # Unreadable intake
+    unreadable = tmp_path / "corrupt.json"
+    unreadable.write_text("{corrupt json", encoding="utf-8")
+    paths_unreadable = {"intake": unreadable, "queue": queue_db}
+    with pytest.raises(jq.CliUsageError) as exc_unreadable:
+        jq.require_authorized_capacity(tmp_path, paths_unreadable)
+    assert "cannot verify capacity authorization for live cycles:" in str(exc_unreadable.value)
+    assert "the active candidate intake is unreadable" in str(exc_unreadable.value)
+
+
+def test_require_authorized_capacity_authorized_succeeds(tmp_path, monkeypatch):
+    # Approved non-default capacity (3)
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3}, revision=_REVISION)
+    queue_db_bound = _write_metadata(
+        tmp_path / "q_bound.sqlite3",
+        target_size=3,
+        provenance=jq.CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+        revision=_REVISION,
+    )
+    paths_bound = {"intake": intake, "queue": queue_db_bound}
+    assert jq.require_authorized_capacity(tmp_path, paths_bound) is None
+
+    # Approved default capacity (5)
+    _install_intake(monkeypatch, {})
+    queue_db_default = _write_metadata(
+        tmp_path / "q_default.sqlite3",
+        target_size=5,
+        provenance="default",
+        revision=None,
+    )
+    paths_default = {"intake": intake, "queue": queue_db_default}
+    assert jq.require_authorized_capacity(tmp_path, paths_default) is None
+
+
+def test_dispatch_open_guards_unauthorized_capacity_before_run_cycle(tmp_path, monkeypatch):
+    repo = jq.SCRIPT_DIR.parent.parent
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue_db = _write_metadata(
+        tmp_path / "q.sqlite3", target_size=4, provenance="host-configured", revision=None
+    )
+
+    cycle_called = False
+
+    def fake_run_cycle(*args, **kwargs):
+        nonlocal cycle_called
+        cycle_called = True
+        return {"opened_count": 0}
+
+    monkeypatch.setattr(jq, "run_cycle", fake_run_cycle)
+
+    parser = jq.build_parser()
+    args = parser.parse_args([
+        "--repo", str(repo),
+        "--intake", str(intake),
+        "--queue-db", str(queue_db),
+        "open",
+    ])
+
+    with pytest.raises(jq.CliUsageError) as exc_info:
+        jq.dispatch(args)
+
+    assert "capacity is not authorized for live reconciliation cycles" in str(exc_info.value)
+    assert not cycle_called
+
+
+def test_dispatch_watch_guards_unapproved_tabs_before_watch_starts(tmp_path, monkeypatch):
+    repo = jq.SCRIPT_DIR.parent.parent
+    intake = _intake_file(tmp_path)
+    _install_intake(monkeypatch, {jq.SMART_QUEUE_CAPACITY_FACT: 3})
+    queue = _real_queue(tmp_path)
+    jq.apply_managed_capacity(
+        queue, requested=3, intake_capacity=3, intake_revision=_REVISION
+    )
+    queue_db = queue.database_path
+
+    watch_called = False
+
+    def fake_watch(*args, **kwargs):
+        nonlocal watch_called
+        watch_called = True
+        return 0
+
+    monkeypatch.setattr(jq, "watch", fake_watch)
+
+    parser = jq.build_parser()
+    args = parser.parse_args([
+        "--repo", str(repo),
+        "--intake", str(intake),
+        "--queue-db", str(queue_db),
+        "watch",
+        "--tabs", "4",
+    ])
+
+    with pytest.raises(jq.CliUsageError) as exc_info:
+        jq.dispatch(args)
+
+    message = str(exc_info.value)
+    assert "capacity is not authorized for live reconciliation cycles" in message
+    assert "active candidate intake approves 3" in message
+    assert "Run 'jobapply_queue.py tabs 3'" in message
+    assert not watch_called

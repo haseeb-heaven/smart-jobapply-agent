@@ -55,6 +55,9 @@ DEFAULT_BRIDGE = "system_chrome_bridge.mjs"
 DEFAULT_STATUS_LOG = "smart_queue_watch.out"
 MINIMUM_CAPACITY = 1
 MAXIMUM_CAPACITY = 10
+DEFAULT_CAPACITY = 5
+CAPACITY_PROVENANCE_ACTIVE_INTAKE = "active-candidate-intake"
+SMART_QUEUE_CAPACITY_FACT = "targets.smart_queue_capacity"
 SUPPORTED_OUTCOMES = ("submitted", "rejected", "skipped")
 
 _DURATION = re.compile(r"(?P<value>[0-9]+)(?P<unit>s|m|h)?\Z")
@@ -90,6 +93,232 @@ def require_capacity(raw: object) -> int:
     if not MINIMUM_CAPACITY <= raw <= MAXIMUM_CAPACITY:
         raise CliUsageError("capacity must be an integer between 1 and 10")
     return raw
+
+
+def _dotted_fact(facts: Mapping[str, Any], dotted_path: str) -> Any:
+    """Read one approved fact by its exact dotted key or nested equivalent."""
+
+    if dotted_path in facts:
+        return facts[dotted_path]
+    current: Any = facts
+    for segment in dotted_path.split("."):
+        if not isinstance(current, Mapping) or segment not in current:
+            return None
+        current = current[segment]
+    return current
+
+
+def active_intake_capacity(root: Path, intake_path: Path) -> tuple[int, str | None]:
+    """Return the active candidate's approved capacity and intake revision.
+
+    Only the optional capacity preference, the integrity-checked revision
+    digest, and the validation outcome are read; no other candidate fact is
+    loaded or reported. An absent preference means the documented default,
+    which needs no intake proof to stay live. A revision of ``None`` means the
+    capacity is the default and therefore carries no intake binding.
+    """
+
+    if not intake_path.is_file():
+        raise CliUsageError("the active candidate intake is missing")
+    try:
+        payload = json.loads(intake_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise CliUsageError("the active candidate intake is unreadable") from error
+    validate_active = _load_intake_module(root)
+    try:
+        active = validate_active(payload)
+    except (ValueError, TypeError) as error:
+        raise CliUsageError("the active candidate intake is not a confirmed revision") from error
+    capacity = _dotted_fact(active["approved_facts"], SMART_QUEUE_CAPACITY_FACT)
+    if capacity is None:
+        return DEFAULT_CAPACITY, None
+    if (
+        isinstance(capacity, bool)
+        or not isinstance(capacity, int)
+        or not MINIMUM_CAPACITY <= capacity <= MAXIMUM_CAPACITY
+    ):
+        raise CliUsageError("the active candidate intake capacity is invalid")
+    return capacity, str(active["revision_hash"])
+
+
+def persisted_capacity_metadata(database: Path) -> tuple[int, str, str | None]:
+    """Read one queue's persisted capacity metadata without mutating it.
+
+    A read-only connection is used, matching the read-only projection this tool
+    already performs for job ids; the queue's own accessors remain the source
+    of truth wherever live state must be derived.
+    """
+
+    import sqlite3  # noqa: PLC0415 - keeps module import free of side effects
+
+    if not database.is_file():
+        raise CliUsageError("the queue database is missing")
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise CliUsageError("the queue database is unreadable") from error
+    try:
+        row = connection.execute(
+            "SELECT target_size, capacity_provenance, capacity_intake_revision "
+            "FROM smart_queue_metadata WHERE metadata_id = 1"
+        ).fetchone()
+    except sqlite3.Error as error:
+        raise CliUsageError("the queue capacity metadata is unreadable") from error
+    finally:
+        connection.close()
+    if row is None:
+        raise CliUsageError("the queue capacity metadata is unreadable")
+    raw_revision = row[2]
+    return int(row[0]), str(row[1]), (str(raw_revision) if raw_revision is not None else None)
+
+
+def capacity_live_authorized(
+    *,
+    intake_capacity: int,
+    intake_revision: str | None,
+    stored: tuple[int, str, str | None],
+) -> bool:
+    """Whether the live daemon will accept the persisted capacity.
+
+    Mirrors the queue's two documented admission checks: the persisted size
+    must equal the size the active intake resolves to, and a non-default size
+    must additionally carry the active intake's own revision digest. The
+    documented default carries no binding, so only its size must agree.
+    """
+
+    stored_size, stored_provenance, stored_revision = stored
+    if stored_size != intake_capacity:
+        return False
+    if intake_capacity == DEFAULT_CAPACITY:
+        return True
+    return (
+        intake_revision is not None
+        and stored_provenance == CAPACITY_PROVENANCE_ACTIVE_INTAKE
+        and stored_revision == intake_revision
+    )
+
+
+def capacity_authorization(
+    root: Path, paths: Mapping[str, Path], queue: Any = None
+) -> tuple[bool | None, str | None]:
+    """Return whether live cycles accept the persisted capacity, plus a detail.
+
+    ``None`` means unknown because the intake or the persisted metadata could
+    not be read read-only. Unknown is never reported as authorized.
+    """
+
+    database = Path(str(queue.database_path)) if queue is not None else Path(paths["queue"])
+    try:
+        intake_capacity, intake_revision = active_intake_capacity(root, paths["intake"])
+        stored = persisted_capacity_metadata(database)
+    except CliUsageError as error:
+        return None, str(error)
+    authorized = capacity_live_authorized(
+        intake_capacity=intake_capacity, intake_revision=intake_revision, stored=stored
+    )
+    return authorized, None
+
+
+def require_authorized_capacity(
+    root: Path, paths: Mapping[str, Path], queue: Any = None
+) -> None:
+    """Validate that managed capacity is authorized for live cycles.
+
+    Fails fast before launching a daemon cycle when capacity has not been
+    approved by the active candidate intake or cannot be verified.
+    """
+
+    authorized, detail = capacity_authorization(root, paths, queue)
+    if authorized is False:
+        try:
+            intake_capacity, _ = active_intake_capacity(root, paths["intake"])
+        except CliUsageError:
+            intake_capacity = DEFAULT_CAPACITY
+        raise CliUsageError(
+            f"capacity is not authorized for live reconciliation cycles; "
+            f"active candidate intake approves {intake_capacity}. "
+            f"Run 'jobapply_queue.py tabs {intake_capacity}' to use the approved capacity, "
+            f"or approve {SMART_QUEUE_CAPACITY_FACT} in candidate_intake.json."
+        )
+    if authorized is None:
+        raise CliUsageError(f"cannot verify capacity authorization for live cycles: {detail}")
+
+
+def apply_managed_capacity(
+    queue: Any,
+    *,
+    requested: int,
+    intake_capacity: int | None,
+    intake_revision: str | None,
+) -> tuple[int, str | None]:
+    """Persist the requested capacity and report whether live cycles accept it.
+
+    Returns the resulting durable capacity (the queue's own post-write value)
+    and an optional warning. A non-default capacity the active intake approves
+    is bound with that intake revision, so live reconciliation accepts it. The
+    documented default needs no binding at all. Any other capacity is recorded
+    honestly as host-configured, which the live coordinator refuses; the
+    warning says so plainly, so a later redacted cycle failure is never the
+    first sign that capacity was not authorized.
+    """
+
+    if (
+        requested == intake_capacity
+        and requested != DEFAULT_CAPACITY
+        and intake_revision is not None
+    ):
+        queue.set_target_size(
+            requested,
+            actor="user",
+            capacity_provenance=CAPACITY_PROVENANCE_ACTIVE_INTAKE,
+            intake_revision_hash=intake_revision,
+        )
+        return int(queue.target_size), None
+    queue.set_target_size(requested, actor="user")
+    resulting = int(queue.target_size)
+    # Only a live-authorized write needs no warning: the approved default here,
+    # or the non-default size bound to the intake digest handled above.
+    if requested == intake_capacity == DEFAULT_CAPACITY:
+        return resulting, None
+    if intake_capacity is None:
+        return resulting, (
+            f"warning: capacity {requested} is not approved by the active candidate intake, "
+            f"which could not be confirmed; live reconciliation cycles will refuse it"
+        )
+    return resulting, (
+        f"warning: capacity {requested} is not approved by the active candidate intake, "
+        f"which approves {intake_capacity}; live reconciliation cycles will refuse it "
+        f"until the intake approves "
+        f"approved_facts.{SMART_QUEUE_CAPACITY_FACT}: {requested}"
+    )
+
+
+def set_managed_capacity(
+    root: Path, paths: Mapping[str, Path], queue: Any, requested: int
+) -> int:
+    """Set managed capacity and print the outcome, including any warning.
+
+    Returns the prior capacity. An unconfirmable intake never blocks the
+    write; it downgrades to host-configured with an explicit warning instead.
+    """
+
+    # The queue returns the resulting capacity, so read the prior value first.
+    previous = int(queue.target_size)
+    try:
+        intake_capacity, intake_revision = active_intake_capacity(root, paths["intake"])
+    except CliUsageError:
+        intake_capacity, intake_revision = None, None
+    resulting, warning = apply_managed_capacity(
+        queue,
+        requested=requested,
+        intake_capacity=intake_capacity,
+        intake_revision=intake_revision,
+    )
+    print(f"capacity {previous} -> {resulting}")
+    print(f"capacity_provenance: {queue.capacity_provenance}")
+    if warning:
+        print(warning)
+    return previous
 
 
 def _has_repo_marker(candidate: Path) -> bool:
@@ -151,6 +380,19 @@ def _load_queue_module(root: Path):
     )
 
     return SmartJobQueue, QueueCandidate, QueuePolicyError, QueueStorageError
+
+
+def _load_intake_module(root: Path):
+    """Load the candidate-intake validation boundary from a checkout."""
+
+    source_root = root / "jobapply_agent" / "src"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from jobapply_agent.intake import (  # noqa: PLC0415 - resolved at runtime
+        validate_active_candidate_profile,
+    )
+
+    return validate_active_candidate_profile
 
 
 def queue_state_summary(states: Mapping[str, str]) -> dict[str, int]:
@@ -245,7 +487,12 @@ def default_bridge_command(root: Path, node: str = "node") -> list[str]:
     return [node, str(bridge)]
 
 
-def status_payload(queue: Any, bridge_command: Sequence[str] | None = None) -> dict[str, Any]:
+def status_payload(
+    queue: Any,
+    bridge_command: Sequence[str] | None = None,
+    *,
+    capacity_live_authorized: bool | None = None,
+) -> dict[str, Any]:
     """Build the redacted status document the ``status`` command prints.
 
     Counts and opaque IDs only: no listing URL, candidate fact, or page content.
@@ -256,6 +503,7 @@ def status_payload(queue: Any, bridge_command: Sequence[str] | None = None) -> d
         "queue_id": str(queue.queue_id),
         "capacity": int(queue.target_size),
         "capacity_provenance": str(queue.capacity_provenance),
+        "capacity_live_authorized": capacity_live_authorized,
         "jobs_total": len(states),
         "states": queue_state_summary(states),
         "confirmed_submitted": int(queue.confirmed_submitted_count()),
@@ -320,7 +568,13 @@ def parse_cycle_status(stdout: str) -> dict[str, Any]:
     return payload
 
 
-def run_cycle(command: Sequence[str], *, timeout: float = 420.0) -> dict[str, Any]:
+def run_cycle(
+    command: Sequence[str],
+    *,
+    timeout: float = 420.0,
+    root: Path | None = None,
+    paths: Mapping[str, Path] | None = None,
+) -> dict[str, Any]:
     """Run bounded reconciliation cycles and return the final status frame."""
 
     try:
@@ -328,6 +582,33 @@ def run_cycle(command: Sequence[str], *, timeout: float = 420.0) -> dict[str, An
     except subprocess.TimeoutExpired as error:
         raise CliUsageError("the reconciliation cycle timed out") from error
     if completed.returncode != 0:
+        check_root = root
+        check_paths = paths
+        if check_root is None or check_paths is None:
+            try:
+                check_root = check_root or resolve_repository_root()
+                if check_paths is None:
+                    inferred_intake = None
+                    inferred_queue = None
+                    for index, item in enumerate(command):
+                        if item == "--candidate-intake" and index + 1 < len(command):
+                            inferred_intake = Path(command[index + 1])
+                        elif item == "--database" and index + 1 < len(command):
+                            inferred_queue = Path(command[index + 1])
+                    if inferred_intake and inferred_queue:
+                        check_paths = {"intake": inferred_intake, "queue": inferred_queue}
+            except Exception:
+                check_root = None
+                check_paths = None
+        if (
+            check_root is not None
+            and check_paths is not None
+            and "intake" in check_paths
+            and "queue" in check_paths
+        ):
+            authorized, _ = capacity_authorization(check_root, check_paths)
+            if authorized is False:
+                require_authorized_capacity(check_root, check_paths)
         raise CliUsageError(
             "the reconciliation cycle failed closed (exit "
             f"{completed.returncode}); verify the session bridge and configuration"
@@ -445,7 +726,9 @@ def _one_cycle(
             bridge_command=bridge_command,
             ticks=1,
             interval_seconds=interval,
-        )
+        ),
+        root=root,
+        paths=paths,
     )
 
 
@@ -668,6 +951,12 @@ def doctor_report(
         "existing_session",
     )
     checks["ready"] = all(bool(checks[key]) for key in required)
+    # Prerequisite readiness and capacity authorization are separate: every
+    # dependency can be present while live cycles still refuse a
+    # host-configured capacity the active intake has not approved.
+    authorized, detail = capacity_authorization(root, paths)
+    checks["capacity_live_authorized"] = authorized
+    checks["capacity_detail"] = detail
     return checks
 
 
@@ -711,7 +1000,13 @@ def dispatch(arguments: argparse.Namespace) -> int:
     if arguments.command == "watch":
         if arguments.tabs is not None:
             queue_class, _, _, _ = _load_queue_module(root)
-            queue_class(paths["queue"]).set_target_size(require_capacity(arguments.tabs), actor="user")
+            set_managed_capacity(
+                root,
+                paths,
+                queue_class(paths["queue"]),
+                require_capacity(arguments.tabs),
+            )
+        require_authorized_capacity(root, paths)
         duration = parse_duration(arguments.duration) if arguments.duration else None
         if duration is not None and duration <= 0:
             raise CliUsageError("--duration must be greater than zero")
@@ -737,16 +1032,14 @@ def dispatch(arguments: argparse.Namespace) -> int:
         emit_json(outcome_recorded(root, paths=paths, job_id=arguments.job_id, outcome=arguments.outcome))
         return 0
 
-    queue_class, _, _, _ = _load_queue_module(root)
-    queue = queue_class(paths["queue"])
-
     if arguments.command == "tabs":
-        capacity = require_capacity(arguments.capacity)
-        previous = queue.set_target_size(capacity, actor="user")
-        print(f"capacity {previous} -> {capacity}")
+        queue_class, _, _, _ = _load_queue_module(root)
+        queue = queue_class(paths["queue"])
+        set_managed_capacity(root, paths, queue, require_capacity(arguments.capacity))
         return 0
 
     if arguments.command == "open":
+        require_authorized_capacity(root, paths)
         emit_json(
             run_cycle(
                 daemon_cycle_command(
@@ -756,18 +1049,27 @@ def dispatch(arguments: argparse.Namespace) -> int:
                     bridge_command=bridge_command,
                     ticks=arguments.ticks,
                     interval_seconds=arguments.interval_seconds,
-                )
+                ),
+                root=root,
+                paths=paths,
             )
         )
         return 0
 
     if arguments.command == "status":
-        payload = status_payload(queue, bridge_command)
+        queue_class, _, _, _ = _load_queue_module(root)
+        queue = queue_class(paths["queue"])
+        payload = status_payload(
+            queue,
+            bridge_command,
+            capacity_live_authorized=capacity_authorization(root, paths, queue)[0],
+        )
         if arguments.json:
             emit_json(payload)
         else:
             print(f"queue_id: {payload['queue_id']}")
             print(f"capacity: {payload['capacity']} ({payload['capacity_provenance']})")
+            print(f"capacity_live_authorized: {payload['capacity_live_authorized']}")
             print(f"jobs_total: {payload['jobs_total']}")
             print(f"listing_tabs_open: {payload['listing_tabs_open']}")
             print(f"confirmed_submitted: {payload['confirmed_submitted']}")
