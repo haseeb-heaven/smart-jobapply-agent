@@ -263,6 +263,7 @@ def _provider_listings(raw: str, query_urls: Mapping[str, tuple[str, str]], mana
     if package_source not in sys.path:
         sys.path.insert(0, package_source)
     from jobapply_agent.sources import canonical_listing_url
+    validated: list[tuple[dict[str, Any], str, str]] = []
     for listing in listings:
         if not isinstance(listing, dict) or set(listing) - allowed or not required <= set(listing):
             raise HostFailure("provider_schema_invalid")
@@ -274,10 +275,15 @@ def _provider_listings(raw: str, query_urls: Mapping[str, tuple[str, str]], mana
                 continue
             if not isinstance(value, str) or len(value) > limits[field] or field in {"url", "title"} and not value:
                 raise HostFailure("provider_schema_invalid")
+        validated.append((listing, query_id, platform))
+
+    # Schema and host-profile binding are batch-wide. Only after those checks
+    # may malformed listing routes be quarantined independently per row.
+    for listing, query_id, platform in validated:
         try:
             canonical = canonical_listing_url(listing["url"], platform)
         except ValueError:
-            raise HostFailure("provider_schema_invalid") from None
+            continue
         if canonical in seen:
             raise HostFailure("provider_duplicate")
         seen.add(canonical)
@@ -452,8 +458,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     state = "no_progress"
             _emit(state=state, cycle=cycle, rounds_attempted=(round_number if initial["search_needed"] else 0), provider_listing_count=provider_count, admitted_count=admitted_count, suppressed_count=suppressed_count, opened_count=final["opened_count"], search_needed=final["search_needed"])
             if arguments.max_cycles is not None and cycle >= arguments.max_cycles:
-                _emit(state="complete", cycle=cycle, rounds_attempted=0, provider_listing_count=0, admitted_count=0, suppressed_count=0, opened_count=0, search_needed=final["search_needed"])
-                return 0
+                terminal_state = "complete"
+                exit_status = 0
+                if final["search_needed"] or state in {"degraded", "no_progress"}:
+                    terminal_state = "incomplete"
+                    exit_status = 1
+                _emit(state=terminal_state, cycle=cycle, rounds_attempted=(round_number if initial["search_needed"] else 0), provider_listing_count=provider_count, admitted_count=admitted_count, suppressed_count=suppressed_count, opened_count=final["opened_count"], search_needed=final["search_needed"])
+                return exit_status
             _cycle_sleep((backoff or min(interval, 60)) if state in {"no_progress", "degraded"} else interval)
     except HostFailure as exc:
         _emit(state="shutdown" if str(exc) == "shutdown" else "failed", reason=str(exc))

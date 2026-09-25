@@ -28,7 +28,8 @@ PRIVATE = ROOT / "jobapply_agent/private"
 
 @pytest.mark.parametrize(("eligible", "failure"), [
     (True, "none"), (False, "none"), (True, "malformed"), (True, "timeout"),
-], ids=["five-refill", "all-ineligible", "malformed-recovery", "timeout-recovery"])
+    (True, "mixed-invalid-row"),
+], ids=["five-refill", "all-ineligible", "malformed-recovery", "timeout-recovery", "mixed-invalid-row"])
 def test_actual_host_discovers_admits_and_refills_five_without_inferred_outcomes(eligible: bool, failure: str) -> None:
     PRIVATE.mkdir(mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="synthetic-host-integration-", dir=PRIVATE) as directory:
@@ -87,7 +88,9 @@ listings = [{'query_id': query['query_id'], 'platform': 'linkedin',
     'location': '', 'work_mode': '', 'employment_type': '',
     'posted_at': None, 'source_job_id': str(990000+n)} for n in numbers]
 if len(calls) == 2 and sys.argv[3] == 'malformed':
-    listings[-1]['url'] = 'https://www.linkedin.com/jobs/view/synthetic%20slug-990006'
+    listings[-1]['unexpected_field'] = 'reject-entire-batch'
+if len(calls) == 2 and sys.argv[3] == 'mixed-invalid-row':
+    listings[-1]['url'] = 'https://www.linkedin.com/jobs/view/synthetic%20slug-990008'
 print(json.dumps({'schema_version': 1, 'listings': listings}))
 ''')
         command = [sys.executable, str(HOST), "--candidate-intake", str(intake),
@@ -99,13 +102,16 @@ print(json.dumps({'schema_version': 1, 'listings': listings}))
 
         def run_host() -> dict:
             result = subprocess.run(command, capture_output=True, text=True, timeout=20, cwd=ROOT)
-            assert result.returncode == 0, (result.stdout, result.stderr)
             assert result.stderr == ""
             assert "https://" not in result.stdout and str(runtime) not in result.stdout
             statuses = [json.loads(line) for line in result.stdout.splitlines()]
-            assert statuses[-1]["state"] == "complete"
-            assert statuses[-1]["search_needed"] == (0 if eligible else 5)
-            if len(statuses) == 3:
+            provider_invocations = len(json.loads(calls.read_text()))
+            expected_search_needed = (1 if failure == "mixed-invalid-row" and provider_invocations > 1 else 0) if eligible else 5
+            assert statuses[-1]["search_needed"] == expected_search_needed
+            expected_state = "complete" if expected_search_needed == 0 else "incomplete"
+            assert statuses[-1]["state"] == expected_state
+            assert result.returncode == (0 if expected_state == "complete" else 1), (result.stdout, result.stderr)
+            if statuses[0]["state"] == "degraded":
                 assert statuses[0] == {"state": "degraded", "cycle": 1, "rounds_attempted": 1,
                                        "provider_listing_count": 0, "admitted_count": 0,
                                        "suppressed_count": 0, "opened_count": 0, "search_needed": 3}
@@ -132,20 +138,29 @@ print(json.dumps({'schema_version': 1, 'listings': listings}))
         initial["tabs"] = [tab for tab in initial["tabs"] if tab["id"] not in removed]
         retained_ids = {tab["id"] for tab in initial["tabs"]}
         tabs.write_text(json.dumps(initial))  # Synthetic candidate closes three exact owned IDs.
-        if failure != "none":
+        if failure in {"malformed", "timeout"}:
             command[-1] = "2"  # One persistent process survives the failed first provider attempt.
         second = run_host()
-        assert (second["admitted_count"], second["opened_count"]) == (3, 3)
+        expected_refill = 2 if failure == "mixed-invalid-row" else 3
+        assert (second["admitted_count"], second["opened_count"]) == (expected_refill, expected_refill)
         final = json.loads(tabs.read_text())
-        assert len(final["tabs"]) == 5
+        assert len(final["tabs"]) == 2 + expected_refill
         assert retained_ids <= {tab["id"] for tab in final["tabs"]}
         assert not released_urls & {tab["url"] for tab in final["tabs"]}
-        assert len(final["opened"]) == len(set(final["opened"])) == 8
-        assert len(json.loads(calls.read_text())) == (2 if failure == "none" else 3)
+        assert len(final["opened"]) == len(set(final["opened"])) == 5 + expected_refill
+        if failure == "mixed-invalid-row":
+            rejected_url = "https://www.linkedin.com/jobs/view/synthetic%20slug-990008"
+            assert rejected_url not in final["opened"]
+            with sqlite3.connect(queue) as connection:
+                staged_urls = {row[0] for row in connection.execute("SELECT source_url FROM smart_queue_jobs")}
+            assert rejected_url not in staged_urls
+        expected_calls = 2 if failure in {"none", "mixed-invalid-row"} else 3
+        assert len(json.loads(calls.read_text())) == expected_calls
         with sqlite3.connect(queue) as connection:
             job_ids = [row[0] for row in connection.execute("SELECT job_id FROM smart_queue_jobs")]
         durable = SmartJobQueue(queue)
-        assert Counter(durable.get(job_id).state for job_id in job_ids) == {"open": 5, "released": 3}
+        expected_open = 2 + expected_refill
+        assert Counter(durable.get(job_id).state for job_id in job_ids) == {"open": expected_open, "released": 3}
         assert durable.confirmed_outcome_events() == ()
         with sqlite3.connect(memory) as connection:
             assert connection.execute("SELECT count(*) FROM candidate_memory_outcomes").fetchone()[0] == 0

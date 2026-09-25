@@ -13,6 +13,11 @@ closed public schema and query binding. The host separately validates canonical
 listing URLs, applies deterministic eligibility before ranking, checks durable
 candidate-memory suppression, and admits eligible results. A web snippet is
 only partial evidence and never establishes an unseen requirement or fit.
+After validating the provider batch schema and query binding, the host excludes
+leads whose URLs fail the canonical LinkedIn/Indeed listing check. The
+`provider_listing_count` status includes only leads with accepted listing URLs;
+unsupported URLs are never staged for discovery. Duplicate accepted canonical
+URLs still reject the batch, and queue admission remains atomic.
 The provider gathers multiple distinct listings per query when accessible,
 within the batch limit. Explicit work-mode synonyms are normalized to `on-site`,
 `hybrid`, or `remote`; an unstated mode remains empty. Location retains city,
@@ -43,10 +48,20 @@ process-group cleanup bound execution. The host timeout is 310 seconds.
 With an already-running Chrome session and an explicitly approved, existing-session
 external bridge, run the foreground host from the repository root. The tracked
 `system_chrome_listing_bridge.mjs` supports `list-tabs` and
-`open-listing <exact-approved-url>` through the fixed existing loopback Chrome
-endpoint. It never starts a browser, inspects page content, closes tabs, or acts
-on forms. The private directory must already exist with mode `0700`; the bridge
-creates its dedicated binding file with mode `0600` automatically:
+`open-listing <exact-approved-url>` through the selected existing loopback Chrome
+endpoint. Selection is a host-attested operational boundary, not cryptographic
+proof of the browser process or profile behind that endpoint: raw CDP over
+loopback does not authenticate that identity. For the initial `/json/list` snapshot,
+the bridge tries IPv4 loopback first and falls back to IPv6 loopback when the IPv4
+connection is unavailable or returns HTTP 404. A validated URL snapshot selects
+and pins that endpoint for the rest of the invocation; it does not switch
+endpoints after opening begins. An IPv4 404 can mean Chrome is listening on IPv6
+while a different local service is bound to IPv4 port 9222, so the bridge's
+URL-only protocol cannot prove which process supplied a valid-looking snapshot. The
+queue host is responsible for selecting and attesting the approved existing
+session. The bridge never starts a browser, inspects page content, closes tabs,
+or acts on forms. The private directory must already exist with mode `0700`; the
+bridge creates its dedicated binding file with mode `0600` automatically:
 
 ```sh
 python3 skills/easy-apply-tab-monitor/scripts/external_smart_queue_assistant.py \
@@ -56,14 +71,18 @@ python3 skills/easy-apply-tab-monitor/scripts/external_smart_queue_assistant.py 
   --interval-seconds 15 \
   --provider-timeout-seconds 310 \
   --max-rounds 1 \
+  --max-cycles 1 \
   --bridge-command node skills/easy-apply-tab-monitor/scripts/system_chrome_listing_bridge.mjs jobapply_agent/private/smart-queue-chrome-bindings.json \
   --provider-command python3 skills/easy-apply-tab-monitor/scripts/codex_public_search_provider.py
 ```
 
 Stop the foreground host with Ctrl-C. For a separately supervised host, send
 `kill -TERM <verified-host-pid>` to that exact host PID. It stops its owned
-children; it never closes the candidate's browser tabs. Add `--max-cycles 1`
-for a bounded single-cycle check.
+children; it never closes the candidate's browser tabs. A bounded run exits `0`
+with `state=complete` only when its final cycle has no `search_needed` shortage
+and is neither degraded nor stalled without progress. It exits `1` with the
+redacted state `incomplete` when the cycle bound is reached with either
+condition. Remove `--max-cycles 1` for continuous monitoring.
 
 The host invokes standalone external daemon ticks and sleeps 15 seconds between
 completed cycles. Public search runs synchronously when supply is short and
@@ -85,11 +104,14 @@ substituted. This mapping changes neither core canonicalization nor exact-URL
 candidate-memory suppression, queue records, or outcomes.
 
 Use a dedicated binding file for this queue under the host's existing queue
-lock; do not share it among independently running hosts. A reliable snapshot
-removes absent target bindings, while a failed snapshot preserves them for
-recovery. Browser restarts may invalidate target IDs: the bridge cannot assume
-that a restored tab retains its earlier binding. Private files must not be
-modified concurrently by an untrusted process running as the same user.
+lock; do not share it among independently running hosts. The queue host must
+serialize every direct bridge invocation for that queue, including invocations
+made outside this foreground host, so snapshot, target-binding updates, and opening
+cannot interleave. A reliable snapshot removes absent target bindings, while a
+failed snapshot preserves them for recovery. Browser restarts may invalidate
+target IDs: the bridge cannot assume that a restored tab retains its earlier
+binding. Private files must not be modified concurrently by an untrusted process
+running as the same user.
 
 Bridge requests have a shared seven-second deadline and bounded response sizes;
 only URL listing and exact approved listing opening are available. Offline tests

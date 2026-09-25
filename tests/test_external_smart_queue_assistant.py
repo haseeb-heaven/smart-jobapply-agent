@@ -78,7 +78,6 @@ def _daemon_status(*, shortage: int, opened: int = 0) -> dict[str, int]:
         ("not-json", "provider_schema_invalid"),
         (_batch(_listing(score=100)), "provider_schema_invalid"),
         (_batch(_listing(candidate_intake="/private/person.json")), "provider_schema_invalid"),
-        (_batch(_listing(url="https://example.com/jobs/1")), "provider_schema_invalid"),
         (_batch(_listing(), _listing()), "provider_duplicate"),
         (_batch(_listing(query_id="q99")), "provider_schema_invalid"),
     ],
@@ -97,6 +96,90 @@ def test_provider_filters_an_already_managed_canonical_url_without_mutating_hist
     )
     assert accepted == 0
     assert pages == {"https://www.indeed.com/jobs?q=python": []}
+
+
+def test_provider_quarantines_unsupported_hosts_and_invalid_listing_routes_per_row() -> None:
+    valid = _listing()
+    unsupported_host = _listing(url="https://example.invalid/jobs/one")
+    invalid_route = _listing(url="https://www.indeed.com/jobs?q=python")
+    invalid_query = _listing(url="https://www.indeed.com/viewjob?jk=synthetic001&apply=1")
+    pages, accepted = assistant._provider_listings(
+        _batch(valid, unsupported_host, invalid_route, invalid_query),
+        {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}, set(),
+    )
+    assert accepted == 1
+    assert pages == {
+        "https://www.indeed.com/jobs?q=python": [
+            {**{key: valid.get(key, "") for key in (
+                "title", "company", "description", "location", "work_mode",
+                "employment_type", "posted_at", "source_job_id", "discovered_at",
+            )}, "url": "https://www.indeed.com/viewjob?jk=synthetic001"}
+        ]
+    }
+
+
+@pytest.mark.parametrize("bad", [
+    _listing(query_id="q9"),
+    _listing(platform="linkedin"),
+])
+def test_provider_schema_query_or_platform_binding_still_rejects_the_whole_batch(
+    bad: dict[str, object],
+) -> None:
+    with pytest.raises(assistant.HostFailure, match="^provider_schema_invalid$"):
+        assistant._provider_listings(
+            _batch(_listing(), bad),
+            {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}, set(),
+        )
+
+
+def test_provider_schema_version_error_still_rejects_batch_with_valid_row() -> None:
+    malformed_schema = json.dumps({"schema_version": 2, "listings": [_listing()]})
+    with pytest.raises(assistant.HostFailure, match="^provider_schema_invalid$"):
+        assistant._provider_listings(
+            malformed_schema,
+            {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}, set(),
+        )
+
+
+def test_provider_duplicate_supported_identity_fails_even_when_managed() -> None:
+    url = "https://www.indeed.com/viewjob?jk=synthetic001"
+    with pytest.raises(assistant.HostFailure, match="^provider_duplicate$"):
+        assistant._provider_listings(
+            _batch(_listing(url=url), _listing(url=url)),
+            {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}, {url},
+        )
+
+
+def test_host_admits_only_supported_rows_and_does_not_tick_browser_for_quarantined_rows(
+    runtime: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    query_urls = {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}
+    invalid_rows = [
+        _listing(url="https://outside.invalid/job/1"),
+        _listing(url="https://www.indeed.com/jobs?q=python"),
+        _listing(url="https://www.indeed.com/viewjob?jk=synthetic002&application=1"),
+    ]
+    events: list[str] = []
+    monkeypatch.setattr(assistant, "_queries", lambda location: ([{"query_id": "q0", "platform": "indeed", "keywords": "python", "location": location}], query_urls))
+    monkeypatch.setattr(assistant, "_managed_urls", lambda queue: set())
+    monkeypatch.setattr(assistant, "_daemon", lambda *a, **k: events.append("daemon") or _daemon_status(shortage=1))
+    monkeypatch.setattr(assistant, "_run", lambda *a, **k: events.append("provider") or _batch(_listing(), *invalid_rows))
+
+    def admit(intake, queue, memory, pages, timeout):
+        events.append("admit")
+        rows = pages[query_urls["q0"][0]]
+        assert [row["url"] for row in rows] == [_listing()["url"]]
+        return {"validated_count": 1, "admitted_count": 0, "suppressed_count": 0}
+
+    monkeypatch.setattr(assistant, "_admit", admit)
+    assert assistant.main(_args(runtime)) == 1
+    frames = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events == ["daemon", "provider", "admit"]
+    assert frames[0]["provider_listing_count"] == 1
+    assert frames[0]["admitted_count"] == 0
+    assert frames[1]["state"] == "incomplete"
+    assert frames[1]["search_needed"] == 1
 
 
 def test_provider_platform_must_match_the_host_owned_query_profile() -> None:
@@ -220,11 +303,51 @@ def test_empty_provider_rounds_report_no_progress_not_success(
     monkeypatch.setattr(assistant, "_queries", lambda location: ([], {}))
     monkeypatch.setattr(assistant, "_run", lambda *a, **k: _batch())
     monkeypatch.setattr(assistant, "_managed_urls", lambda queue: set())
-    assert assistant.main(_args(runtime, "--max-rounds", "2", "--backoff-seconds", "0")) == 0
+    assert assistant.main(_args(runtime, "--max-rounds", "2", "--backoff-seconds", "0")) == 1
     statuses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert statuses[0]["state"] == "no_progress"
-    assert statuses[0]["search_needed"] == 2
+    assert [status["state"] for status in statuses] == ["no_progress", "incomplete"]
+    assert statuses[-1]["search_needed"] == 2
 
+
+
+
+def test_bounded_unresolved_search_need_is_terminal_incomplete_not_complete(
+    runtime: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(assistant, "_queries", lambda location: ([], {}))
+    monkeypatch.setattr(assistant, "_daemon", lambda *a, **k: _daemon_status(shortage=2))
+    monkeypatch.setattr(assistant, "_run", lambda *a, **k: _batch())
+    monkeypatch.setattr(assistant, "_managed_urls", lambda queue: set())
+    monkeypatch.setattr(assistant, "_cycle_sleep", lambda seconds: None)
+
+    assert assistant.main(_args(runtime, "--max-cycles", "2", "--max-rounds", "1", "--backoff-seconds", "0")) == 1
+    frames = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [frame["state"] for frame in frames] == ["no_progress", "no_progress", "incomplete"]
+    assert all(frame["search_needed"] == 2 for frame in frames)
+    assert all("complete" != frame["state"] for frame in frames)
+    assert frames[-1]["provider_listing_count"] == 0
+    assert frames[-1]["admitted_count"] == 0
+
+
+def test_bounded_recovered_search_need_is_terminal_complete_and_zero(
+    runtime: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    query_urls = {"q0": ("https://www.indeed.com/jobs?q=python", "indeed")}
+    monkeypatch.setattr(assistant, "_queries", lambda location: ([], query_urls))
+    monkeypatch.setattr(assistant, "_managed_urls", lambda queue: set())
+    statuses = iter([_daemon_status(shortage=1), _daemon_status(shortage=0, opened=1), _daemon_status(shortage=0, opened=0)])
+    monkeypatch.setattr(assistant, "_daemon", lambda *a, **k: next(statuses))
+    monkeypatch.setattr(assistant, "_run", lambda *a, **k: _batch(_listing()))
+    monkeypatch.setattr(assistant, "_admit", lambda *a, **k: {"validated_count": 1, "admitted_count": 1, "suppressed_count": 0})
+    monkeypatch.setattr(assistant, "_cycle_sleep", lambda seconds: None)
+
+    assert assistant.main(_args(runtime, "--max-cycles", "2", "--max-rounds", "1", "--backoff-seconds", "0")) == 0
+    frames = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert frames[0]["opened_count"] == 1
+    assert frames[-1]["state"] == "complete"
+    assert frames[-1]["search_needed"] == 0
 
 def test_explicit_shutdown_is_redacted_and_releases_singleton(
     runtime: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -383,10 +506,10 @@ def test_provider_failure_retains_lock_and_reconciles_before_retry(
 
     monkeypatch.setattr(assistant, "_run", provider)
     monkeypatch.setattr(assistant, "_cycle_sleep", wait)
-    assert assistant.main(_args(runtime, "--max-cycles", "2", "--backoff-seconds", "0")) == 0
+    assert assistant.main(_args(runtime, "--max-cycles", "2", "--backoff-seconds", "0")) == 1
     statuses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events == ["daemon", "provider", "backoff", "daemon", "provider"]
-    assert [status["state"] for status in statuses] == ["degraded", "degraded", "complete"]
+    assert [status["state"] for status in statuses] == ["degraded", "degraded", "incomplete"]
     assert all(status["search_needed"] == 3 for status in statuses)
     assert all(status["admitted_count"] == status["provider_listing_count"] == 0 for status in statuses)
     assert not runtime[1].exists() and not runtime[2].exists()

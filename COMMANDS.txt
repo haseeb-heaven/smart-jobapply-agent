@@ -45,9 +45,15 @@ python3 jobapply_agent/scripts/jobapply_queue.py \
 
 # 3. RECORDING APPLICATION OUTCOMES
 # ------------------------------------------------------------------------------
-# When you have manually applied and closed a tab, record the outcome:
-python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome submitted
+# Only after the candidate explicitly confirms BOTH the outcome and that the
+# managed listing tab is vacated, run the canonical recorder with --vacated.
+# Closing a tab alone does not record or imply an outcome.
+python3 jobapply_agent/scripts/record_candidate_outcome.py \
+  --queue-db jobapply_agent/private/smart-queue.sqlite3 \
+  --memory-db jobapply_agent/private/candidate-memory.sqlite3 \
+  --job-id '<managed-queue-job-id>' \
+  --outcome submitted \
+  --vacated
 
-# Other outcome options:
-python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome skipped
-python3 jobapply_agent/scripts/jobapply_queue.py outcome <JOB_ID> --outcome rejected
+# Other explicit candidate-confirmed outcomes: skipped or rejected.
+# Each requires the same explicit vacancy confirmation and --vacated.

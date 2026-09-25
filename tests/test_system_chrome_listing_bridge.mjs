@@ -21,7 +21,7 @@ async function fixture(t, responses) {
     assert.ok(responses.length, "unexpected browser request");
     const value = responses.shift();
     if (value instanceof Error) throw value;
-    return new Response(JSON.stringify(value));
+    return value instanceof Response ? value : new Response(JSON.stringify(value));
   } };
   return { root, state, calls, options, run: (...args) => runBridge([state, ...args], options) };
 }
@@ -37,11 +37,138 @@ test("opens exact approved URL, persists returned target, confirms redirect and 
   assert.equal(f.calls[1].url, `http://127.0.0.1:9222/json/new?${encodeURIComponent(approved)}`);
   assert.equal(f.calls[1].method, "PUT");
   assert.ok(f.calls.every((call) => call.redirect === "error" && call.signal instanceof AbortSignal));
+  assert.ok(f.calls.every((call) => call.url.startsWith("http://127.0.0.1:9222/")));
   assert.deepEqual(JSON.parse(await fs.readFile(f.state, "utf8")), {
     version: 1, bindings: [{ targetId: "created", approvedUrl: approved }],
   });
   assert.equal((await fs.stat(f.state)).mode & 0o777, 0o600);
   assert.deepEqual(await f.run("list-tabs"), [unrelated.url, approved]);
+});
+
+test("uses IPv4 when the existing Chrome debug endpoint responds", async (t) => {
+  const f = await fixture(t, [[unrelated]]);
+  assert.deepEqual(await f.run("list-tabs"), [unrelated.url]);
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+});
+
+test("falls back to IPv6 loopback after IPv4 connection refusal", async (t) => {
+  const refused = Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+  const f = await fixture(t, [refused, [unrelated]]);
+  assert.deepEqual(await f.run("list-tabs"), [unrelated.url]);
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+});
+
+test("falls back to IPv6 for a nested Undici connection cause", async (t) => {
+  const cause = Object.assign(new Error("socket unavailable"), { code: "ECONNREFUSED" });
+  const undiciError = Object.assign(new TypeError("fetch failed"), { cause });
+  const f = await fixture(t, [undiciError, [unrelated]]);
+  assert.deepEqual(await f.run("list-tabs"), [unrelated.url]);
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+});
+
+test("does not fall back to IPv6 for HTTP or non-connection failures", async (t) => {
+  for (const [label, first] of [
+    ["HTTP failure", new Response("unavailable", { status: 503 })],
+    ["non-connection failure", new TypeError("invalid fetch request")],
+    ["invalid response body", new Response("not json")],
+  ]) {
+    await t.test(label, async (subtest) => {
+      const f = await fixture(subtest, [first]);
+      await assert.rejects(f.run("list-tabs"));
+      assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+        { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+      ]);
+    });
+  }
+});
+
+test("does not fall back to IPv6 for timeout errors", async (t) => {
+  const timeout = Object.assign(new Error("request timed out"), { name: "TimeoutError", code: "ETIMEDOUT" });
+  const f = await fixture(t, [timeout]);
+  await assert.rejects(f.run("list-tabs"));
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+});
+
+
+
+test("does not fall back after an HTTP-success initial response is not CDP-shaped", async (t) => {
+  const malformed = new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/synthetic" }), { status: 200 });
+  const f = await fixture(t, [malformed]);
+  await assert.rejects(f.run("open-listing", approved), (error) => {
+    assert.equal(error.message, "existing Chrome listing bridge unavailable");
+    return true;
+  });
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+  await assert.rejects(f.run("list-tabs"));
+  assert.deepEqual(f.calls.map(({ url }) => url), [
+    "http://127.0.0.1:9222/json/list",
+    "http://127.0.0.1:9222/json/list",
+  ]);
+});
+
+test("opens the exact approved URL through IPv6 and confirms its redirect", async (t) => {
+  const f = await fixture(t, [new Response("not found", { status: 404 }), [unrelated],
+    page("created", "about:blank"), [unrelated, page("created", "about:blank")],
+    [unrelated, page("created", redirected)]]);
+  assert.equal(await f.run("open-listing", approved), null);
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/new?" + encodeURIComponent(approved), method: "PUT", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+  assert.ok(f.calls.every((call) => call.redirect === "error" && call.signal instanceof AbortSignal));
+  assert.deepEqual(JSON.parse(await fs.readFile(f.state, "utf8")), {
+    version: 1, bindings: [{ targetId: "created", approvedUrl: approved }],
+  });
+});
+
+test("does not retry IPv6 after a pinned IPv4 PUT fails", async (t) => {
+  const refused = Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+  const f = await fixture(t, [[unrelated], refused]);
+  await assert.rejects(f.run("open-listing", approved));
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://127.0.0.1:9222/json/new?" + encodeURIComponent(approved), method: "PUT", redirect: "error" },
+  ]);
+});
+
+test("does not switch endpoints when a pinned IPv4 follow-up snapshot fails", async (t) => {
+  const f = await fixture(t, [[unrelated], page("created", "about:blank"),
+    [unrelated, page("created", "about:blank")], new Response("not found", { status: 404 })]);
+  await assert.rejects(f.run("open-listing", approved));
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://127.0.0.1:9222/json/new?" + encodeURIComponent(approved), method: "PUT", redirect: "error" },
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+  ]);
+});
+
+test("fails closed with a generic error when both loopback endpoints are unavailable", async (t) => {
+  const refused = () => Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+  const f = await fixture(t, [refused(), refused()]);
+  await assert.rejects(f.run("list-tabs"), (error) => {
+    assert.equal(error.message, "existing Chrome listing bridge unavailable");
+    return true;
+  });
+  assert.deepEqual(f.calls.map(({ url, method, redirect }) => ({ url, method, redirect })), [
+    { url: "http://127.0.0.1:9222/json/list", method: "GET", redirect: "error" },
+    { url: "http://[::1]:9222/json/list", method: "GET", redirect: "error" },
+  ]);
 });
 
 for (const current of [

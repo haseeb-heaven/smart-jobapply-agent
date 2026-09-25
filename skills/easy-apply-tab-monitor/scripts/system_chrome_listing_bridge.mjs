@@ -142,8 +142,8 @@ export async function runBridge(args, { fetchImpl = globalThis.fetch, privateRoo
   const file = await privatePath(statePath, privateRoot);
   const state = await loadState(file);
   const signal = AbortSignal.timeout(7000);
-  const request = async (route, method = "GET") => {
-    const response = await fetchImpl(`http://127.0.0.1:9222${route}`, { method, redirect: "error", signal });
+  let endpoint;
+  const readJson = async (response) => {
     if (!response.ok || !response.body) invalid();
     const chunks = [];
     let size = 0;
@@ -153,6 +153,44 @@ export async function runBridge(args, { fetchImpl = globalThis.fetch, privateRoo
       chunks.push(Buffer.from(chunk));
     }
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  };
+  const unavailableCodes = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL"]);
+  const isUnavailable = (error) => {
+    let cause = error;
+    while (cause && typeof cause === "object") {
+      if (unavailableCodes.has(cause.code)) return true;
+      cause = cause.cause;
+    }
+    return false;
+  };
+  const request = async (route, method = "GET") => {
+    if (endpoint) {
+      return readJson(await fetchImpl(`${endpoint}${route}`, { method, redirect: "error", signal }));
+    }
+    // The initial validated URL snapshot chooses one fixed loopback endpoint
+    // for this invocation. Never switch endpoints after a mutation begins.
+    if (route !== "/json/list" || method !== "GET") invalid();
+    let response;
+    let selectedEndpoint = "http://127.0.0.1:9222";
+    try {
+      response = await fetchImpl(`http://127.0.0.1:9222${route}`, { method, redirect: "error", signal });
+    } catch (error) {
+      if (!isUnavailable(error) || signal.aborted) throw error;
+      response = null;
+    }
+    if (response?.status === 404 || !response) {
+      if (response?.status === 404) {
+        try { await response.body?.cancel?.(); } catch { /* best-effort connection cleanup */ }
+      }
+      selectedEndpoint = "http://[::1]:9222";
+      try {
+        response = await fetchImpl(`${selectedEndpoint}${route}`, { method, redirect: "error", signal });
+      } catch { invalid(); }
+    }
+    const payload = await readJson(response);
+    pagesFrom(payload);
+    endpoint = selectedEndpoint;
+    return payload;
   };
   const pages = pagesFrom(await request("/json/list"));
   const present = new Set(pages.map((tab) => tab.id));

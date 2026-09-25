@@ -303,6 +303,7 @@ python3 skills/easy-apply-tab-monitor/scripts/external_smart_queue_assistant.py 
   --interval-seconds 15 \
   --provider-timeout-seconds 310 \
   --max-rounds 1 \
+  --max-cycles 1 \
   --bridge-command node skills/easy-apply-tab-monitor/scripts/system_chrome_listing_bridge.mjs <private-binding-file> \
   --provider-command python3 skills/easy-apply-tab-monitor/scripts/codex_public_search_provider.py
 ```
