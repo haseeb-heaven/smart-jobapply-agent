@@ -268,8 +268,6 @@ def test_outcome_recorded_rejects_bad_outcome():
 
 
 def test_resolve_repository_root_defaults_to_cwd(tmp_path, monkeypatch):
-    import os
-
     monkeypatch.chdir(tmp_path)
     marker = tmp_path / "jobapply_agent" / "src" / "jobapply_agent" / "smart_queue.py"
     marker.parent.mkdir(parents=True)
@@ -279,8 +277,6 @@ def test_resolve_repository_root_defaults_to_cwd(tmp_path, monkeypatch):
 
 
 def test_resolve_repository_root_prefers_explicit_over_cwd(tmp_path, monkeypatch):
-    import os
-
     repo = tmp_path / "repo-checkout"
     marker = repo / "jobapply_agent" / "src" / "jobapply_agent" / "smart_queue.py"
     marker.parent.mkdir(parents=True)
@@ -291,8 +287,6 @@ def test_resolve_repository_root_prefers_explicit_over_cwd(tmp_path, monkeypatch
 
 
 def test_resolve_repository_root_falls_back_to_script_checkout(tmp_path, monkeypatch):
-    import os
-
     monkeypatch.chdir(tmp_path)
     root = jq.resolve_repository_root(None)
     assert root == jq.SCRIPT_DIR.parent.parent
